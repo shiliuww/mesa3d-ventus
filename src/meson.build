@@ -53,6 +53,7 @@ if with_gallium_or_lvp or with_gbm or with_platform_wayland
   subdir('loader')
 endif
 subdir('compiler')
+subdir('ventus')
 if with_poly
   subdir('poly')
 endif
