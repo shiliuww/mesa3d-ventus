@@ -8,7 +8,7 @@
 
 #include "compiler/glsl_types.h"
 #include "nir/nir.h"
-#include "nir/nir_builder.h"
+#include "spirv/nir_spirv.h"
 #include "ventus/compiler/vt_nir.h"
 
 struct intrinsic_counts {
@@ -57,50 +57,39 @@ count_intrinsics(nir_shader *shader, struct intrinsic_counts *counts)
 }
 
 static nir_shader *
-build_minimal_raygen(const nir_shader_compiler_options *options)
+load_raygen_spirv(const char *path, const nir_shader_compiler_options *options)
 {
-   nir_builder b =
-      nir_builder_init_simple_shader(MESA_SHADER_RAYGEN, options,
-                                     "vt_rt_minimal_raygen");
+   FILE *fp = fopen(path, "rb");
+   CHECK(fp != NULL);
 
-   nir_def *zero = nir_imm_int(&b, 0);
-   nir_def *one = nir_imm_int(&b, 1);
-   nir_def *accel = nir_imm_int64(&b, 0x1000);
-   nir_def *flags = zero;
-   nir_def *cull_mask = nir_imm_int(&b, 0xff);
-   nir_def *sbt_offset = zero;
-   nir_def *sbt_stride = one;
-   nir_def *miss_index = zero;
-   nir_def *origin =
-      nir_vec3(&b, nir_imm_float(&b, 0.0f),
-                  nir_imm_float(&b, 0.0f),
-                  nir_imm_float(&b, 0.0f));
-   nir_def *tmin = nir_imm_float(&b, 0.001f);
-   nir_def *direction =
-      nir_vec3(&b, nir_imm_float(&b, 0.0f),
-                  nir_imm_float(&b, 0.0f),
-                  nir_imm_float(&b, -1.0f));
-   nir_def *tmax = nir_imm_float(&b, 1000.0f);
-   nir_def *payload = nir_undef(&b, 1, 32);
+   CHECK(fseek(fp, 0, SEEK_END) == 0);
+   long size = ftell(fp);
+   CHECK(size > 0 && (size % 4) == 0);
+   CHECK(fseek(fp, 0, SEEK_SET) == 0);
 
-   CHECK(accel && flags && cull_mask && sbt_offset && sbt_stride &&
-         miss_index && origin && tmin && direction && tmax && payload);
+   uint32_t *words = malloc((size_t)size);
+   CHECK(words != NULL);
+   CHECK(fread(words, 1, (size_t)size, fp) == (size_t)size);
+   CHECK(fclose(fp) == 0);
 
-   nir_intrinsic_instr *trace =
-      nir_intrinsic_instr_create(b.shader, nir_intrinsic_trace_ray);
-   nir_def *srcs[] = {
-      accel, flags, cull_mask, sbt_offset, sbt_stride, miss_index,
-      origin, tmin, direction, tmax, payload,
+   const struct spirv_to_nir_options spirv_options = {
+      .environment = NIR_SPIRV_VULKAN,
+      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .phys_ssbo_addr_format = nir_address_format_64bit_global,
+      .push_const_addr_format = nir_address_format_logical,
+      .shared_addr_format = nir_address_format_32bit_offset,
+      .constant_addr_format = nir_address_format_64bit_global,
    };
-   CHECK(nir_intrinsic_infos[nir_intrinsic_trace_ray].num_srcs == 11);
-   for (unsigned i = 0; i < 11; i++) {
-      CHECK(srcs[i] != NULL);
-      trace->src[i] = nir_src_for_ssa(srcs[i]);
-      CHECK(trace->src[i].ssa != NULL);
-   }
-   nir_builder_instr_insert(&b, &trace->instr);
 
-   return b.shader;
+   nir_shader *shader =
+      spirv_to_nir(words, (size_t)size / 4, NULL, MESA_SHADER_RAYGEN, "main",
+                   &spirv_options, options);
+   free(words);
+
+   CHECK(shader != NULL);
+   CHECK(shader->info.stage == MESA_SHADER_RAYGEN);
+   return shader;
 }
 
 static nir_shader *
@@ -112,13 +101,14 @@ build_empty_shader(mesa_shader_stage stage, const nir_shader_compiler_options *o
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   CHECK(argc == 2);
    glsl_type_singleton_init_or_ref();
 
    const nir_shader_compiler_options options = {0};
    struct vt_nir_rt_config config = vt_nir_rt_default_config();
-   nir_shader *raygen = build_minimal_raygen(&options);
+   nir_shader *raygen = load_raygen_spirv(argv[1], &options);
    nir_shader *miss = build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
    nir_shader *closest_hit =
       build_empty_shader(MESA_SHADER_CLOSEST_HIT, &options, "vt_rt_minimal_closest_hit");
@@ -153,7 +143,7 @@ main(void)
    CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_MISS] == 16);
    CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
-   printf("PASS vt_rt_minimal_loop trace_ray_lowered=1 shared_store=%u "
+   printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 shared_store=%u "
           "shared_load=%u per_lane_scratch=%u\n",
           after.store_shared, after.load_shared, per_lane_scratch);
 

@@ -1,16 +1,31 @@
-vt_rt_minimal_loop_test = executable(
-  'vt_rt_minimal_loop_test',
-  [
-    'vt_rt_minimal_loop_test.c',
-    libventus_nir_files,
-  ],
-  include_directories : [inc_include, inc_src],
-  dependencies : [idep_nir, idep_mesautil],
-  build_by_default : false,
-)
+if prog_glslang.found()
+  vt_rt_minimal_raygen_spv = custom_target(
+    'vt_rt_minimal_raygen.spv',
+    input : 'vt_rt_minimal_raygen.rgen',
+    output : 'vt_rt_minimal_raygen.spv',
+    command : [
+      prog_glslang, '-V', '--target-env', 'vulkan1.2',
+      '-o', '@OUTPUT@', '@INPUT@',
+      glslang_quiet, glslang_depfile,
+    ],
+    depfile : 'vt_rt_minimal_raygen.spv.d',
+  )
 
-test(
-  'vt_rt_minimal_loop',
-  vt_rt_minimal_loop_test,
-  suite : ['ventus'],
-)
+  vt_rt_minimal_loop_test = executable(
+    'vt_rt_minimal_loop_test',
+    [
+      'vt_rt_minimal_loop_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_vtn, idep_nir, idep_mesautil],
+    build_by_default : false,
+  )
+
+  test(
+    'vt_rt_minimal_loop',
+    vt_rt_minimal_loop_test,
+    args : [vt_rt_minimal_raygen_spv],
+    suite : ['ventus'],
+  )
+endif
