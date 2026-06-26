@@ -9,8 +9,6 @@ bool
 vt_nir_lower_rt_abi(nir_shader *shader,
                     const struct vt_nir_rt_config *config)
 {
-   (void)config;
-
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    if (!impl)
       return false;
@@ -21,11 +19,9 @@ vt_nir_lower_rt_abi(nir_shader *shader,
       config = &default_config;
    }
 
-   enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
-   if (shader->scratch_size < config->scratchpad[layout].stride_bytes)
-      shader->scratch_size = config->scratchpad[layout].stride_bytes;
+   bool progress = vt_nir_lower_shader_scratch(shader, config);
 
    nir_shader_gather_info(shader, impl);
-   nir_progress(true, impl, nir_metadata_none);
-   return true;
+   nir_progress(progress, impl, progress ? nir_metadata_none : nir_metadata_all);
+   return progress;
 }

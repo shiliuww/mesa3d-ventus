@@ -101,6 +101,11 @@ struct vt_nir_rt_result {
    nir_def *sbt_index;
 };
 
+struct vt_nir_pipeline_scratch_info {
+   uint32_t per_lane_scratch_size;
+   uint32_t shader_scratch_size[VT_RT_LAYOUT_COUNT];
+};
+
 typedef void (*vt_nir_rt_emit_shader_cb)(nir_builder *b,
                                          const struct vt_nir_rt_trace_params *params,
                                          const struct vt_nir_rt_result *result,
@@ -156,6 +161,20 @@ bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
 
 bool vt_nir_lower_rt_abi(nir_shader *shader,
                          const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_shader_scratch(nir_shader *shader,
+                                 const struct vt_nir_rt_config *config);
+
+void vt_nir_pipeline_scratch_init(struct vt_nir_pipeline_scratch_info *info);
+
+void vt_nir_pipeline_scratch_include_shader(struct vt_nir_pipeline_scratch_info *info,
+                                            const nir_shader *shader);
+
+uint32_t vt_nir_pipeline_compute_scratch(nir_shader **shaders,
+                                         unsigned shader_count,
+                                         struct vt_nir_pipeline_scratch_info *info);
+
+uint32_t vt_nir_pipeline_scratch_size(const struct vt_nir_pipeline_scratch_info *info);
 
 #ifdef __cplusplus
 }
