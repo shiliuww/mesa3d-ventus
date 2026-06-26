@@ -17,6 +17,8 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    struct lower_rt_io_state *state = data;
    const struct vt_nir_rt_config *config = state->config;
+   if (config->execution_model != VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP)
+      return false;
 
    b->cursor = nir_after_instr(&intrin->instr);
 
