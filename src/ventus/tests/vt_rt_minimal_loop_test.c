@@ -5,6 +5,42 @@
 
 #include "vt_rt_test_common.h"
 
+static nir_shader *
+build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
+{
+   nir_builder b =
+      nir_builder_init_simple_shader(MESA_SHADER_CLOSEST_HIT, options,
+                                     "vt_rt_abi_probe_closest_hit");
+
+   nir_variable *payload =
+      nir_variable_create(b.shader, nir_var_shader_call_data,
+                          glsl_vec4_type(), "payload_in");
+   nir_def *payload_value = nir_load_var(&b, payload);
+   nir_store_var(&b, payload, payload_value, 0xf);
+
+   nir_def *record_ptr = nir_load_shader_record_ptr(&b);
+   nir_def *hit_t = nir_load_ray_t_max(&b);
+   nir_def *primitive_id = nir_load_primitive_id(&b);
+   nir_def *instance_id = nir_load_instance_id(&b);
+   nir_def *geometry_id = nir_load_ray_geometry_index(&b);
+   nir_def *hit_kind = nir_load_ray_hit_kind(&b);
+
+   nir_variable *sink =
+      nir_variable_create(b.shader, nir_var_shader_temp,
+                          glsl_uvec4_type(), "abi_probe_sink");
+   nir_store_var(&b, sink,
+                 nir_vec4(&b, nir_unpack_64_2x32_split_x(&b, record_ptr),
+                          primitive_id, instance_id,
+                          nir_iadd(&b, geometry_id, hit_kind)),
+                 0xf);
+   nir_store_var(&b, sink,
+                 nir_vec4(&b, nir_unpack_64_2x32_split_y(&b, record_ptr),
+                          hit_t, primitive_id, instance_id),
+                 0xf);
+
+   return b.shader;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -16,9 +52,16 @@ main(int argc, char **argv)
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *miss =
       vt_rt_build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
-   nir_shader *closest_hit =
-      vt_rt_build_empty_shader(MESA_SHADER_CLOSEST_HIT, &options,
-                               "vt_rt_minimal_closest_hit");
+   nir_shader *closest_hit = build_abi_probe_closest_hit(&options);
+
+   struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
+   VT_RT_CHECK(abi.payload_base_bytes >=
+               abi.ray_state_base_bytes + abi.ray_state_size_bytes);
+   VT_RT_CHECK(abi.hit_record_base_bytes >=
+               abi.payload_base_bytes + abi.payload_size_bytes);
+   VT_RT_CHECK(abi.continuation_base_bytes >=
+               abi.hit_record_base_bytes + abi.hit_record_size_bytes);
+   VT_RT_CHECK(abi.continuation_size_bytes == 0);
 
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
@@ -36,6 +79,31 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.store_shared > 0);
    VT_RT_CHECK(after.load_shared > 0);
 
+   struct vt_rt_intrinsic_counts closest_before;
+   vt_rt_count_intrinsics(closest_hit, &closest_before);
+   VT_RT_CHECK(closest_before.load_deref > 0);
+   VT_RT_CHECK(closest_before.store_deref > 0);
+   VT_RT_CHECK(closest_before.load_shader_record_ptr == 1);
+   VT_RT_CHECK(closest_before.load_ray_t_max == 1);
+   VT_RT_CHECK(closest_before.load_primitive_id == 1);
+   VT_RT_CHECK(closest_before.load_instance_id == 1);
+   VT_RT_CHECK(closest_before.load_ray_geometry_index == 1);
+   VT_RT_CHECK(closest_before.load_ray_hit_kind == 1);
+
+   progress = vt_nir_lower_rt_abi(closest_hit, &config);
+   VT_RT_CHECK(progress);
+
+   struct vt_rt_intrinsic_counts closest_after;
+   vt_rt_count_intrinsics(closest_hit, &closest_after);
+   VT_RT_CHECK(closest_after.load_shader_record_ptr == 0);
+   VT_RT_CHECK(closest_after.load_ray_t_max == 0);
+   VT_RT_CHECK(closest_after.load_primitive_id == 0);
+   VT_RT_CHECK(closest_after.load_instance_id == 0);
+   VT_RT_CHECK(closest_after.load_ray_geometry_index == 0);
+   VT_RT_CHECK(closest_after.load_ray_hit_kind == 0);
+   VT_RT_CHECK(closest_after.load_shared > closest_before.load_shared);
+   VT_RT_CHECK(closest_after.store_shared > closest_before.store_shared);
+
    raygen->scratch_size = 48;
    miss->scratch_size = 16;
    closest_hit->scratch_size = 80;
@@ -50,9 +118,10 @@ main(int argc, char **argv)
    VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_MISS] == 16);
    VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
-   printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 shared_store=%u "
-          "shared_load=%u per_lane_scratch=%u\n",
-          after.store_shared, after.load_shared, per_lane_scratch);
+   printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
+          "abi_hit_record=1 shared_store=%u shared_load=%u per_lane_scratch=%u\n",
+          after.store_shared + closest_after.store_shared,
+          after.load_shared + closest_after.load_shared, per_lane_scratch);
 
    ralloc_free(raygen);
    ralloc_free(miss);

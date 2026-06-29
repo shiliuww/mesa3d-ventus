@@ -19,7 +19,15 @@ vt_nir_lower_rt_abi(nir_shader *shader,
       config = &default_config;
    }
 
-   bool progress = vt_nir_lower_shader_scratch(shader, config);
+   bool progress = false;
+   progress |= vt_nir_lower_rt_payload(shader, config);
+   progress |= vt_nir_lower_rt_hit_record(shader, config);
+   progress |= vt_nir_lower_shader_record_ptr(shader, config);
+   progress |= vt_nir_lower_shader_scratch(shader, config);
+
+   enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
+   shader->scratch_size =
+      MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
 
    nir_shader_gather_info(shader, impl);
    nir_progress(progress, impl, progress ? nir_metadata_none : nir_metadata_all);

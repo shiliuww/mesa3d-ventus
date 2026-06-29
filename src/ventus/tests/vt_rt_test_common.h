@@ -29,6 +29,14 @@ struct vt_rt_intrinsic_counts {
    unsigned trace_ray;
    unsigned load_shared;
    unsigned store_shared;
+   unsigned load_deref;
+   unsigned store_deref;
+   unsigned load_shader_record_ptr;
+   unsigned load_ray_t_max;
+   unsigned load_primitive_id;
+   unsigned load_instance_id;
+   unsigned load_ray_geometry_index;
+   unsigned load_ray_hit_kind;
 };
 
 static inline void
@@ -52,6 +60,30 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_store_shared:
                counts->store_shared++;
+               break;
+            case nir_intrinsic_load_deref:
+               counts->load_deref++;
+               break;
+            case nir_intrinsic_store_deref:
+               counts->store_deref++;
+               break;
+            case nir_intrinsic_load_shader_record_ptr:
+               counts->load_shader_record_ptr++;
+               break;
+            case nir_intrinsic_load_ray_t_max:
+               counts->load_ray_t_max++;
+               break;
+            case nir_intrinsic_load_primitive_id:
+               counts->load_primitive_id++;
+               break;
+            case nir_intrinsic_load_instance_id:
+               counts->load_instance_id++;
+               break;
+            case nir_intrinsic_load_ray_geometry_index:
+               counts->load_ray_geometry_index++;
+               break;
+            case nir_intrinsic_load_ray_hit_kind:
+               counts->load_ray_hit_kind++;
                break;
             default:
                break;

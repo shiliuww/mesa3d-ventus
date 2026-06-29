@@ -8,26 +8,21 @@
 struct vt_nir_rt_config
 vt_nir_rt_default_config(void)
 {
+   struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    struct vt_nir_rt_config config = {
       .execution_model = VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP,
       .scratchpad = {
          [VT_RT_LAYOUT_RAYGEN] = {
             .base_bytes = 0,
             .stride_bytes = 256,
-            .ray_state_base_bytes = 0,
-            .payload_base_bytes = 128,
          },
          [VT_RT_LAYOUT_CLOSEST_HIT] = {
             .base_bytes = 0,
             .stride_bytes = 256,
-            .ray_state_base_bytes = 0,
-            .payload_base_bytes = 128,
          },
          [VT_RT_LAYOUT_MISS] = {
             .base_bytes = 0,
             .stride_bytes = 256,
-            .ray_state_base_bytes = 0,
-            .payload_base_bytes = 128,
          },
       },
       .miss_depth_value = 0x7fffffff,
@@ -36,6 +31,7 @@ vt_nir_rt_default_config(void)
       .emit_miss = NULL,
       .callback_data = NULL,
    };
+   vt_nir_rt_config_apply_abi_layout(&config, &abi);
    return config;
 }
 
@@ -91,6 +87,17 @@ vt_nir_payload_addr(nir_builder *b,
 }
 
 nir_def *
+vt_nir_hit_record_addr(nir_builder *b,
+                       const struct vt_nir_rt_config *config,
+                       enum vt_rt_shader_layout layout,
+                       enum vt_rt_hit_record_word word)
+{
+   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
+   return vt_nir_scratchpad_addr(b, config, layout,
+                                 sp->hit_record_base_bytes + word * 4);
+}
+
+nir_def *
 vt_nir_load_payload_word(nir_builder *b,
                          const struct vt_nir_rt_config *config,
                          enum vt_rt_shader_layout layout,
@@ -113,6 +120,29 @@ vt_nir_store_payload_word(nir_builder *b,
                     .align_mul = 4);
 }
 
+nir_def *
+vt_nir_load_hit_record_word(nir_builder *b,
+                            const struct vt_nir_rt_config *config,
+                            enum vt_rt_shader_layout layout,
+                            enum vt_rt_hit_record_word word,
+                            uint32_t bit_size)
+{
+   return nir_load_shared(b, 1, bit_size,
+                          vt_nir_hit_record_addr(b, config, layout, word),
+                          .align_mul = 4);
+}
+
+void
+vt_nir_store_hit_record_word(nir_builder *b,
+                             const struct vt_nir_rt_config *config,
+                             enum vt_rt_shader_layout layout,
+                             enum vt_rt_hit_record_word word,
+                             nir_def *value)
+{
+   nir_store_shared(b, value, vt_nir_hit_record_addr(b, config, layout, word),
+                    .align_mul = 4);
+}
+
 static nir_def *
 slot_offset(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
 {
@@ -126,6 +156,13 @@ store_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word, nir_def *va
       return;
 
    nir_store_shared(b, value, slot_offset(b, base, word), .align_mul = 4);
+}
+
+static nir_def *
+load_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
+{
+   return nir_load_shared(b, 1, 32, slot_offset(b, base, word),
+                          .align_mul = 4);
 }
 
 static void
@@ -186,19 +223,31 @@ vt_nir_build_traversal(nir_builder *b,
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
 
    nir_def *status =
-      nir_load_shared(b, 1, 32, slot_offset(b, base, VT_RT_SLOT_STATUS),
-                      .align_mul = 4);
-   nir_def *hit_t =
-      nir_load_shared(b, 1, 32, slot_offset(b, base, VT_RT_SLOT_HIT_T),
-                      .align_mul = 4);
-   nir_def *sbt_index =
-      nir_load_shared(b, 1, 32, slot_offset(b, base, VT_RT_SLOT_SBT_INDEX),
-                      .align_mul = 4);
+      load_word(b, base, VT_RT_SLOT_STATUS);
+   nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
+   nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
+   nir_def *shader_record_ptr =
+      nir_pack_64_2x32_split(b, load_word(b, base, VT_RT_SLOT_SBT_INDEX),
+                             nir_imm_int(b, 0));
+
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_STATUS, status);
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_HIT_T, hit_t);
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_SBT_INDEX, sbt_index);
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO,
+                                nir_unpack_64_2x32_split_x(b, shader_record_ptr));
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
+                                nir_unpack_64_2x32_split_y(b, shader_record_ptr));
 
    struct vt_nir_rt_result result = {
       .hit = nir_ieq_imm(b, status, VT_RT_STATUS_HIT),
       .hit_t = hit_t,
       .sbt_index = sbt_index,
+      .shader_record_ptr = shader_record_ptr,
    };
    return result;
 }

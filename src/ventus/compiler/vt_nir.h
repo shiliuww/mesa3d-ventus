@@ -72,11 +72,46 @@ enum vt_rt_payload_word {
    VT_RT_PAYLOAD_RAY_DIRECTION_Z = 10,
 };
 
+enum vt_rt_hit_record_word {
+   VT_RT_HIT_RECORD_STATUS = 0,
+   VT_RT_HIT_RECORD_HIT_T = 1,
+   VT_RT_HIT_RECORD_SBT_INDEX = 2,
+   VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO = 3,
+   VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI = 4,
+   VT_RT_HIT_RECORD_PRIMITIVE_ID = 5,
+   VT_RT_HIT_RECORD_INSTANCE_ID = 6,
+   VT_RT_HIT_RECORD_GEOMETRY_ID = 7,
+   VT_RT_HIT_RECORD_HIT_KIND = 8,
+   VT_RT_HIT_RECORD_BARYCENTRICS_X = 9,
+   VT_RT_HIT_RECORD_BARYCENTRICS_Y = 10,
+   VT_RT_HIT_RECORD_PRIMITIVE_ADDR_LO = 11,
+   VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI = 12,
+   VT_RT_HIT_RECORD_INSTANCE_ADDR_LO = 13,
+   VT_RT_HIT_RECORD_INSTANCE_ADDR_HI = 14,
+   VT_RT_HIT_RECORD_WORD_COUNT = 15,
+};
+
 struct vt_nir_scratchpad_layout {
    uint32_t base_bytes;
    uint32_t stride_bytes;
    uint32_t ray_state_base_bytes;
    uint32_t payload_base_bytes;
+   uint32_t hit_record_base_bytes;
+   uint32_t continuation_base_bytes;
+   uint32_t continuation_size_bytes;
+   uint32_t total_size_bytes;
+};
+
+struct vt_nir_rt_abi_layout {
+   uint32_t ray_state_base_bytes;
+   uint32_t ray_state_size_bytes;
+   uint32_t payload_base_bytes;
+   uint32_t payload_size_bytes;
+   uint32_t hit_record_base_bytes;
+   uint32_t hit_record_size_bytes;
+   uint32_t continuation_base_bytes;
+   uint32_t continuation_size_bytes;
+   uint32_t total_size_bytes;
 };
 
 struct vt_nir_rt_config;
@@ -99,6 +134,7 @@ struct vt_nir_rt_result {
    nir_def *hit;
    nir_def *hit_t;
    nir_def *sbt_index;
+   nir_def *shader_record_ptr;
 };
 
 struct vt_nir_pipeline_scratch_info {
@@ -123,6 +159,11 @@ struct vt_nir_rt_config {
 
 struct vt_nir_rt_config vt_nir_rt_default_config(void);
 
+struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
+
+void vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
+                                       const struct vt_nir_rt_abi_layout *layout);
+
 enum vt_rt_shader_layout vt_nir_layout_for_stage(mesa_shader_stage stage);
 
 nir_def *vt_nir_scratchpad_base(nir_builder *b,
@@ -139,6 +180,11 @@ nir_def *vt_nir_payload_addr(nir_builder *b,
                              enum vt_rt_shader_layout layout,
                              enum vt_rt_payload_word word);
 
+nir_def *vt_nir_hit_record_addr(nir_builder *b,
+                                const struct vt_nir_rt_config *config,
+                                enum vt_rt_shader_layout layout,
+                                enum vt_rt_hit_record_word word);
+
 nir_def *vt_nir_load_payload_word(nir_builder *b,
                                   const struct vt_nir_rt_config *config,
                                   enum vt_rt_shader_layout layout,
@@ -151,6 +197,18 @@ void vt_nir_store_payload_word(nir_builder *b,
                                enum vt_rt_payload_word word,
                                nir_def *value);
 
+nir_def *vt_nir_load_hit_record_word(nir_builder *b,
+                                     const struct vt_nir_rt_config *config,
+                                     enum vt_rt_shader_layout layout,
+                                     enum vt_rt_hit_record_word word,
+                                     uint32_t bit_size);
+
+void vt_nir_store_hit_record_word(nir_builder *b,
+                                  const struct vt_nir_rt_config *config,
+                                  enum vt_rt_shader_layout layout,
+                                  enum vt_rt_hit_record_word word,
+                                  nir_def *value);
+
 struct vt_nir_rt_result
 vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_trace_params *params,
@@ -161,6 +219,15 @@ bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
 
 bool vt_nir_lower_rt_abi(nir_shader *shader,
                          const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_rt_payload(nir_shader *shader,
+                             const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_rt_hit_record(nir_shader *shader,
+                                const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_shader_record_ptr(nir_shader *shader,
+                                    const struct vt_nir_rt_config *config);
 
 bool vt_nir_lower_shader_scratch(nir_shader *shader,
                                  const struct vt_nir_rt_config *config);
