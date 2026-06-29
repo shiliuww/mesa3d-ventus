@@ -37,6 +37,13 @@ struct vt_rt_intrinsic_counts {
    unsigned load_instance_id;
    unsigned load_ray_geometry_index;
    unsigned load_ray_hit_kind;
+   unsigned load_front_face;
+   unsigned load_ray_t_min;
+   unsigned load_ray_flags;
+   unsigned load_cull_mask;
+   unsigned report_ray_intersection;
+   unsigned ignore_ray_intersection;
+   unsigned terminate_ray;
 };
 
 static inline bool
@@ -109,6 +116,27 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_load_ray_hit_kind:
                counts->load_ray_hit_kind++;
+               break;
+            case nir_intrinsic_load_front_face:
+               counts->load_front_face++;
+               break;
+            case nir_intrinsic_load_ray_t_min:
+               counts->load_ray_t_min++;
+               break;
+            case nir_intrinsic_load_ray_flags:
+               counts->load_ray_flags++;
+               break;
+            case nir_intrinsic_load_cull_mask:
+               counts->load_cull_mask++;
+               break;
+            case nir_intrinsic_report_ray_intersection:
+               counts->report_ray_intersection++;
+               break;
+            case nir_intrinsic_ignore_ray_intersection:
+               counts->ignore_ray_intersection++;
+               break;
+            case nir_intrinsic_terminate_ray:
+               counts->terminate_ray++;
                break;
             default:
                break;

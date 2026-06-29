@@ -30,6 +30,15 @@ load_shared_word(nir_builder *b, const struct vt_nir_rt_config *config,
                           .align_mul = 4);
 }
 
+static nir_def *
+load_ray_state_word(nir_builder *b, const struct vt_nir_rt_config *config,
+                    enum vt_rt_shader_layout layout, enum vt_rt_slot_word word)
+{
+   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
+   return load_shared_word(b, config, layout,
+                           sp->ray_state_base_bytes + word * 4);
+}
+
 static void
 store_shared_word(nir_builder *b, const struct vt_nir_rt_config *config,
                   enum vt_rt_shader_layout layout, uint32_t byte_offset,
@@ -227,6 +236,26 @@ load_hit_record_u64(nir_builder *b, const struct vt_nir_rt_config *config,
 }
 
 static bool
+uses_candidate_hit_record(mesa_shader_stage stage)
+{
+   return stage == MESA_SHADER_ANY_HIT || stage == MESA_SHADER_INTERSECTION;
+}
+
+static nir_def *
+load_active_hit_record_word(nir_builder *b, const struct vt_nir_rt_config *config,
+                            enum vt_rt_shader_layout layout,
+                            enum vt_rt_hit_record_word word,
+                            uint32_t bit_size)
+{
+   if (uses_candidate_hit_record(b->shader->info.stage)) {
+      return vt_nir_load_candidate_hit_record_word(b, config, layout, word,
+                                                   bit_size);
+   }
+
+   return vt_nir_load_hit_record_word(b, config, layout, word, bit_size);
+}
+
+static bool
 lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
 {
@@ -238,24 +267,44 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_ray_t_max:
-      replacement = vt_nir_load_hit_record_word(b, config, layout,
+      replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_HIT_T, 32);
       break;
+   case nir_intrinsic_load_ray_t_min:
+      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
+      break;
+   case nir_intrinsic_load_ray_flags:
+      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_FLAGS);
+      break;
+   case nir_intrinsic_load_cull_mask:
+      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_CULL_MASK);
+      break;
    case nir_intrinsic_load_primitive_id:
-      replacement = vt_nir_load_hit_record_word(b, config, layout,
+      replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_PRIMITIVE_ID, 32);
       break;
    case nir_intrinsic_load_instance_id:
-      replacement = vt_nir_load_hit_record_word(b, config, layout,
+      replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_INSTANCE_ID, 32);
       break;
    case nir_intrinsic_load_ray_geometry_index:
-      replacement = vt_nir_load_hit_record_word(b, config, layout,
+      replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
       break;
    case nir_intrinsic_load_ray_hit_kind:
-      replacement = vt_nir_load_hit_record_word(b, config, layout,
+      replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_HIT_KIND, 32);
+      break;
+   case nir_intrinsic_load_front_face:
+      replacement =
+         nir_i2b(b, load_active_hit_record_word(b, config, layout,
+                                                VT_RT_HIT_RECORD_FRONT_FACE, 32));
+      break;
+   case nir_intrinsic_load_front_face_fsign:
+      replacement =
+         nir_bcsel(b, nir_i2b(b, load_active_hit_record_word(b, config, layout,
+                                                            VT_RT_HIT_RECORD_FRONT_FACE, 32)),
+                   nir_imm_float(b, 1.0f), nir_imm_float(b, -1.0f));
       break;
    default:
       return false;
@@ -279,6 +328,100 @@ vt_nir_lower_rt_hit_record(nir_shader *shader,
    return nir_shader_intrinsics_pass(shader, lower_hit_record_intrinsic,
                                      nir_metadata_control_flow,
                                      (void *)config);
+}
+
+static bool
+lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
+                           void *data)
+{
+   const struct vt_nir_rt_config *config = data;
+   enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(b->shader->info.stage);
+
+   b->cursor = nir_before_instr(&intrin->instr);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_ignore_ray_intersection:
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
+                                nir_imm_false(b));
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
+                                nir_imm_true(b));
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
+                                nir_imm_false(b));
+      nir_instr_remove(&intrin->instr);
+      return true;
+   case nir_intrinsic_terminate_ray:
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
+                                nir_imm_true(b));
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
+                                nir_imm_false(b));
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
+                                nir_imm_true(b));
+      nir_instr_remove(&intrin->instr);
+      return true;
+   case nir_intrinsic_report_ray_intersection: {
+      nir_def *hit_t = intrin->src[0].ssa;
+      nir_def *hit_kind = intrin->src[1].ssa;
+      nir_def *current_tmax =
+         vt_nir_load_hit_record_word(b, config, layout,
+                                     VT_RT_HIT_RECORD_HIT_T, 32);
+      nir_def *tmin = load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
+      nir_def *accepted =
+         nir_iand(b, nir_fge(b, current_tmax, hit_t),
+                  nir_fge(b, hit_t, tmin));
+
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
+                                accepted);
+      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
+                                nir_inot(b, accepted));
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_STATUS,
+                                             nir_bcsel(b, accepted,
+                                                       nir_imm_int(b, VT_RT_STATUS_HIT),
+                                                       nir_imm_int(b, VT_RT_STATUS_IDLE)));
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_HIT_T, hit_t);
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_FRONT_FACE,
+                                             nir_ieq_imm(b, hit_kind, 0xfe));
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_OPAQUE,
+                                             nir_imm_false(b));
+      vt_nir_store_candidate_hit_record_word(b, config, layout,
+                                             VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
+                                             nir_imm_true(b));
+
+      nir_def_rewrite_uses(&intrin->def, accepted);
+      nir_instr_remove(&intrin->instr);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+bool
+vt_nir_lower_rt_control(nir_shader *shader,
+                        const struct vt_nir_rt_config *config)
+{
+   struct vt_nir_rt_config default_config;
+   if (!config) {
+      default_config = vt_nir_rt_default_config();
+      config = &default_config;
+   }
+
+   bool progress = false;
+   enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
+   uint32_t hit_attrib_base =
+      config->scratchpad[layout].hit_attrib_base_bytes;
+
+   progress |= lower_rt_vars(shader, nir_var_ray_hit_attrib, config,
+                             hit_attrib_base, false);
+   progress |= nir_shader_intrinsics_pass(shader, lower_rt_control_intrinsic,
+                                          nir_metadata_control_flow,
+                                          (void *)config);
+   return progress;
 }
 
 static bool

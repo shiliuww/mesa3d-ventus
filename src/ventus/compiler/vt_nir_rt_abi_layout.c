@@ -34,9 +34,20 @@ vt_nir_rt_default_abi_layout(void)
       alloc_region(&alloc, (VT_RT_PAYLOAD_RAY_DIRECTION_Z + 1) * 4, 16);
    layout.payload_size_bytes = (VT_RT_PAYLOAD_RAY_DIRECTION_Z + 1) * 4;
 
+   layout.control_base_bytes =
+      alloc_region(&alloc, VT_RT_CONTROL_WORD_COUNT * 4, 16);
+   layout.control_size_bytes = VT_RT_CONTROL_WORD_COUNT * 4;
+
+   layout.candidate_hit_record_base_bytes =
+      alloc_region(&alloc, VT_RT_HIT_RECORD_WORD_COUNT * 4, 16);
+   layout.candidate_hit_record_size_bytes = VT_RT_HIT_RECORD_WORD_COUNT * 4;
+
    layout.hit_record_base_bytes =
       alloc_region(&alloc, VT_RT_HIT_RECORD_WORD_COUNT * 4, 16);
    layout.hit_record_size_bytes = VT_RT_HIT_RECORD_WORD_COUNT * 4;
+
+   layout.hit_attrib_base_bytes = alloc_region(&alloc, 32, 16);
+   layout.hit_attrib_size_bytes = 32;
 
    layout.continuation_base_bytes = alloc_region(&alloc, 0, 16);
    layout.continuation_size_bytes = 0;
@@ -63,8 +74,16 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
          layout->ray_state_base_bytes;
       config->scratchpad[i].payload_base_bytes =
          layout->payload_base_bytes;
+      config->scratchpad[i].control_base_bytes =
+         layout->control_base_bytes;
+      config->scratchpad[i].candidate_hit_record_base_bytes =
+         layout->candidate_hit_record_base_bytes;
       config->scratchpad[i].hit_record_base_bytes =
          layout->hit_record_base_bytes;
+      config->scratchpad[i].hit_attrib_base_bytes =
+         layout->hit_attrib_base_bytes;
+      config->scratchpad[i].hit_attrib_size_bytes =
+         layout->hit_attrib_size_bytes;
       config->scratchpad[i].continuation_base_bytes =
          layout->continuation_base_bytes;
       config->scratchpad[i].continuation_size_bytes =

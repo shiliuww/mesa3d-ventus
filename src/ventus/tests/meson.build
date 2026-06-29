@@ -11,6 +11,18 @@ if prog_glslang.found()
     depfile : 'vt_rt_minimal_raygen.spv.d',
   )
 
+  vt_rt_flagged_raygen_spv = custom_target(
+    'vt_rt_flagged_raygen.spv',
+    input : 'vt_rt_flagged_raygen.rgen',
+    output : 'vt_rt_flagged_raygen.spv',
+    command : [
+      prog_glslang, '-V', '--target-env', 'vulkan1.2',
+      '-o', '@OUTPUT@', '@INPUT@',
+      glslang_quiet, glslang_depfile,
+    ],
+    depfile : 'vt_rt_flagged_raygen.spv.d',
+  )
+
   vt_rt_minimal_loop_test = executable(
     'vt_rt_minimal_loop_test',
     [
@@ -33,6 +45,17 @@ if prog_glslang.found()
     build_by_default : false,
   )
 
+  vt_rt_flagged_image_smoke_test = executable(
+    'vt_rt_flagged_image_smoke_test',
+    [
+      'vt_rt_flagged_image_smoke_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_vtn, idep_nir, idep_mesautil, dep_m],
+    build_by_default : false,
+  )
+
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
@@ -46,6 +69,16 @@ if prog_glslang.found()
     args : [
       vt_rt_minimal_raygen_spv,
       meson.current_build_dir() / 'vt_rt_smoke.ppm',
+    ],
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_rt_flagged_image_smoke',
+    vt_rt_flagged_image_smoke_test,
+    args : [
+      vt_rt_flagged_raygen_spv,
+      meson.current_build_dir() / 'vt_rt_flagged_smoke.ppm',
     ],
     suite : ['ventus'],
   )

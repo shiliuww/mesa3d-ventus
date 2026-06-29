@@ -55,7 +55,9 @@ enum vt_rt_shader_layout {
    VT_RT_LAYOUT_RAYGEN = 0,
    VT_RT_LAYOUT_CLOSEST_HIT = 1,
    VT_RT_LAYOUT_MISS = 2,
-   VT_RT_LAYOUT_COUNT = 3,
+   VT_RT_LAYOUT_ANY_HIT = 3,
+   VT_RT_LAYOUT_INTERSECTION = 4,
+   VT_RT_LAYOUT_COUNT = 5,
 };
 
 enum vt_rt_payload_word {
@@ -88,7 +90,20 @@ enum vt_rt_hit_record_word {
    VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI = 12,
    VT_RT_HIT_RECORD_INSTANCE_ADDR_LO = 13,
    VT_RT_HIT_RECORD_INSTANCE_ADDR_HI = 14,
-   VT_RT_HIT_RECORD_WORD_COUNT = 15,
+   VT_RT_HIT_RECORD_FRONT_FACE = 15,
+   VT_RT_HIT_RECORD_OPAQUE = 16,
+   VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST = 17,
+   VT_RT_HIT_RECORD_WORD_COUNT = 18,
+};
+
+enum vt_rt_control_word {
+   VT_RT_CONTROL_DONE = 0,
+   VT_RT_CONTROL_INCOMPLETE = 1,
+   VT_RT_CONTROL_ACCEPT_HIT = 2,
+   VT_RT_CONTROL_IGNORE_HIT = 3,
+   VT_RT_CONTROL_TERMINATE_RAY = 4,
+   VT_RT_CONTROL_SKIP_CLOSEST_HIT = 5,
+   VT_RT_CONTROL_WORD_COUNT = 6,
 };
 
 struct vt_nir_scratchpad_layout {
@@ -96,7 +111,11 @@ struct vt_nir_scratchpad_layout {
    uint32_t stride_bytes;
    uint32_t ray_state_base_bytes;
    uint32_t payload_base_bytes;
+   uint32_t control_base_bytes;
+   uint32_t candidate_hit_record_base_bytes;
    uint32_t hit_record_base_bytes;
+   uint32_t hit_attrib_base_bytes;
+   uint32_t hit_attrib_size_bytes;
    uint32_t continuation_base_bytes;
    uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
@@ -107,8 +126,14 @@ struct vt_nir_rt_abi_layout {
    uint32_t ray_state_size_bytes;
    uint32_t payload_base_bytes;
    uint32_t payload_size_bytes;
+   uint32_t control_base_bytes;
+   uint32_t control_size_bytes;
+   uint32_t candidate_hit_record_base_bytes;
+   uint32_t candidate_hit_record_size_bytes;
    uint32_t hit_record_base_bytes;
    uint32_t hit_record_size_bytes;
+   uint32_t hit_attrib_base_bytes;
+   uint32_t hit_attrib_size_bytes;
    uint32_t continuation_base_bytes;
    uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
@@ -188,6 +213,16 @@ nir_def *vt_nir_hit_record_addr(nir_builder *b,
                                 enum vt_rt_shader_layout layout,
                                 enum vt_rt_hit_record_word word);
 
+nir_def *vt_nir_candidate_hit_record_addr(nir_builder *b,
+                                          const struct vt_nir_rt_config *config,
+                                          enum vt_rt_shader_layout layout,
+                                          enum vt_rt_hit_record_word word);
+
+nir_def *vt_nir_control_addr(nir_builder *b,
+                             const struct vt_nir_rt_config *config,
+                             enum vt_rt_shader_layout layout,
+                             enum vt_rt_control_word word);
+
 nir_def *vt_nir_load_payload_word(nir_builder *b,
                                   const struct vt_nir_rt_config *config,
                                   enum vt_rt_shader_layout layout,
@@ -212,6 +247,30 @@ void vt_nir_store_hit_record_word(nir_builder *b,
                                   enum vt_rt_hit_record_word word,
                                   nir_def *value);
 
+nir_def *vt_nir_load_candidate_hit_record_word(nir_builder *b,
+                                               const struct vt_nir_rt_config *config,
+                                               enum vt_rt_shader_layout layout,
+                                               enum vt_rt_hit_record_word word,
+                                               uint32_t bit_size);
+
+void vt_nir_store_candidate_hit_record_word(nir_builder *b,
+                                            const struct vt_nir_rt_config *config,
+                                            enum vt_rt_shader_layout layout,
+                                            enum vt_rt_hit_record_word word,
+                                            nir_def *value);
+
+nir_def *vt_nir_load_control_word(nir_builder *b,
+                                  const struct vt_nir_rt_config *config,
+                                  enum vt_rt_shader_layout layout,
+                                  enum vt_rt_control_word word,
+                                  uint32_t bit_size);
+
+void vt_nir_store_control_word(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_shader_layout layout,
+                               enum vt_rt_control_word word,
+                               nir_def *value);
+
 struct vt_nir_rt_result
 vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_trace_params *params,
@@ -231,6 +290,9 @@ bool vt_nir_lower_rt_hit_record(nir_shader *shader,
 
 bool vt_nir_lower_shader_record_ptr(nir_shader *shader,
                                     const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_rt_control(nir_shader *shader,
+                             const struct vt_nir_rt_config *config);
 
 bool vt_nir_lower_shader_scratch(nir_shader *shader,
                                  const struct vt_nir_rt_config *config);

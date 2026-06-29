@@ -42,8 +42,12 @@ enum vt_rt_shader_layout
 vt_nir_layout_for_stage(mesa_shader_stage stage)
 {
    switch (stage) {
+   case MESA_SHADER_ANY_HIT:
+      return VT_RT_LAYOUT_ANY_HIT;
    case MESA_SHADER_CLOSEST_HIT:
       return VT_RT_LAYOUT_CLOSEST_HIT;
+   case MESA_SHADER_INTERSECTION:
+      return VT_RT_LAYOUT_INTERSECTION;
    case MESA_SHADER_MISS:
       return VT_RT_LAYOUT_MISS;
    case MESA_SHADER_RAYGEN:
@@ -101,6 +105,28 @@ vt_nir_hit_record_addr(nir_builder *b,
 }
 
 nir_def *
+vt_nir_candidate_hit_record_addr(nir_builder *b,
+                                 const struct vt_nir_rt_config *config,
+                                 enum vt_rt_shader_layout layout,
+                                 enum vt_rt_hit_record_word word)
+{
+   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
+   return vt_nir_scratchpad_addr(b, config, layout,
+                                 sp->candidate_hit_record_base_bytes + word * 4);
+}
+
+nir_def *
+vt_nir_control_addr(nir_builder *b,
+                    const struct vt_nir_rt_config *config,
+                    enum vt_rt_shader_layout layout,
+                    enum vt_rt_control_word word)
+{
+   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
+   return vt_nir_scratchpad_addr(b, config, layout,
+                                 sp->control_base_bytes + word * 4);
+}
+
+nir_def *
 vt_nir_load_payload_word(nir_builder *b,
                          const struct vt_nir_rt_config *config,
                          enum vt_rt_shader_layout layout,
@@ -142,7 +168,59 @@ vt_nir_store_hit_record_word(nir_builder *b,
                              enum vt_rt_hit_record_word word,
                              nir_def *value)
 {
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
    nir_store_shared(b, value, vt_nir_hit_record_addr(b, config, layout, word),
+                    .align_mul = 4);
+}
+
+nir_def *
+vt_nir_load_candidate_hit_record_word(nir_builder *b,
+                                      const struct vt_nir_rt_config *config,
+                                      enum vt_rt_shader_layout layout,
+                                      enum vt_rt_hit_record_word word,
+                                      uint32_t bit_size)
+{
+   return nir_load_shared(b, 1, bit_size,
+                          vt_nir_candidate_hit_record_addr(b, config, layout, word),
+                          .align_mul = 4);
+}
+
+void
+vt_nir_store_candidate_hit_record_word(nir_builder *b,
+                                       const struct vt_nir_rt_config *config,
+                                       enum vt_rt_shader_layout layout,
+                                       enum vt_rt_hit_record_word word,
+                                       nir_def *value)
+{
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_store_shared(b, value, vt_nir_candidate_hit_record_addr(b, config, layout, word),
+                    .align_mul = 4);
+}
+
+nir_def *
+vt_nir_load_control_word(nir_builder *b,
+                         const struct vt_nir_rt_config *config,
+                         enum vt_rt_shader_layout layout,
+                         enum vt_rt_control_word word,
+                         uint32_t bit_size)
+{
+   return nir_load_shared(b, 1, bit_size,
+                          vt_nir_control_addr(b, config, layout, word),
+                          .align_mul = 4);
+}
+
+void
+vt_nir_store_control_word(nir_builder *b,
+                          const struct vt_nir_rt_config *config,
+                          enum vt_rt_shader_layout layout,
+                          enum vt_rt_control_word word,
+                          nir_def *value)
+{
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_store_shared(b, value, vt_nir_control_addr(b, config, layout, word),
                     .align_mul = 4);
 }
 
@@ -246,6 +324,42 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *shader_record_ptr =
       build_hit_shader_record_ptr(b, config, sbt_index);
 
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_DONE,
+                             nir_ieq_imm(b, status, VT_RT_STATUS_DONE));
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_INCOMPLETE,
+                             nir_ieq_imm(b, status, VT_RT_STATUS_TRACE_REQUEST));
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_ACCEPT_HIT,
+                             nir_ieq_imm(b, status, VT_RT_STATUS_HIT));
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_SKIP_CLOSEST_HIT, nir_imm_false(b));
+
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_STATUS, status);
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_HIT_T, hit_t);
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_SBT_INDEX, sbt_index);
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO,
+                                          nir_unpack_64_2x32_split_x(b, shader_record_ptr));
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
+                                          nir_unpack_64_2x32_split_y(b, shader_record_ptr));
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_OPAQUE, nir_imm_true(b));
+   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                          VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
+                                          nir_imm_false(b));
+
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_STATUS, status);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
@@ -258,6 +372,13 @@ vt_nir_build_traversal(nir_builder *b,
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
                                 nir_unpack_64_2x32_split_y(b, shader_record_ptr));
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_OPAQUE, nir_imm_true(b));
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
+                                nir_imm_false(b));
 
    struct vt_nir_rt_result result = {
       .hit = nir_ieq_imm(b, status, VT_RT_STATUS_HIT),

@@ -22,6 +22,7 @@ vt_nir_lower_rt_abi(nir_shader *shader,
    bool progress = false;
    progress |= vt_nir_lower_rt_payload(shader, config);
    progress |= vt_nir_lower_rt_hit_record(shader, config);
+   progress |= vt_nir_lower_rt_control(shader, config);
    progress |= vt_nir_lower_shader_record_ptr(shader, config);
    progress |= vt_nir_lower_shader_scratch(shader, config);
 
