@@ -75,6 +75,7 @@ main(int argc, char **argv)
 
    progress = vt_nir_lower_rt_abi(raygen, &config);
    VT_RT_CHECK(!progress || raygen->scratch_size >= 0);
+   VT_RT_CHECK(raygen->scratch_size >= abi.total_size_bytes);
 
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
@@ -97,6 +98,7 @@ main(int argc, char **argv)
 
    progress = vt_nir_lower_rt_abi(closest_hit, &config);
    VT_RT_CHECK(progress);
+   VT_RT_CHECK(closest_hit->scratch_size >= abi.total_size_bytes);
 
    struct vt_rt_intrinsic_counts closest_after;
    vt_rt_count_intrinsics(closest_hit, &closest_after);
@@ -109,32 +111,62 @@ main(int argc, char **argv)
    VT_RT_CHECK(closest_after.load_shared > closest_before.load_shared);
    VT_RT_CHECK(closest_after.store_shared > closest_before.store_shared);
 
-   raygen->scratch_size = 48;
-   miss->scratch_size = 16;
-   closest_hit->scratch_size = 80;
-
    nir_shader *pipeline[] = {raygen, miss, closest_hit};
    struct vt_nir_pipeline_scratch_info scratch_info;
    uint32_t per_lane_scratch =
       vt_nir_pipeline_compute_scratch(pipeline, 3, &scratch_info);
 
-   VT_RT_CHECK(per_lane_scratch == 80);
-   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_RAYGEN] == 48);
-   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_MISS] == 16);
-   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
+   VT_RT_CHECK(per_lane_scratch >= abi.total_size_bytes);
+   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_RAYGEN] >=
+               abi.total_size_bytes);
+   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_MISS] ==
+               miss->scratch_size);
+   VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] >=
+               abi.total_size_bytes);
+
+   nir_shader *manual_raygen =
+      vt_rt_build_empty_shader(MESA_SHADER_RAYGEN, &options,
+                               "vt_rt_manual_raygen_scratch");
+   nir_shader *manual_miss =
+      vt_rt_build_empty_shader(MESA_SHADER_MISS, &options,
+                               "vt_rt_manual_miss_scratch");
+   nir_shader *manual_closest_hit =
+      vt_rt_build_empty_shader(MESA_SHADER_CLOSEST_HIT, &options,
+                               "vt_rt_manual_closest_hit_scratch");
+   manual_raygen->scratch_size = 48;
+   manual_miss->scratch_size = 16;
+   manual_closest_hit->scratch_size = 80;
+   nir_shader *manual_pipeline[] = {
+      manual_raygen,
+      manual_miss,
+      manual_closest_hit,
+   };
+   struct vt_nir_pipeline_scratch_info manual_scratch_info;
+   uint32_t manual_per_lane_scratch =
+      vt_nir_pipeline_compute_scratch(manual_pipeline, 3,
+                                      &manual_scratch_info);
+   VT_RT_CHECK(manual_per_lane_scratch == 80);
+   VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_RAYGEN] == 48);
+   VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_MISS] == 16);
+   VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
    printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
           "abi_hit_record=1 sbt_entry_calc=1 hit_sbt_base=0x%llx "
           "hit_sbt_stride=%u shader_group_handle_size=%u "
-          "shared_store=%u shared_load=%u per_lane_scratch=%u\n",
+          "shared_store=%u shared_load=%u per_lane_scratch=%u "
+          "abi_total=%u manual_max_scratch=%u\n",
           (unsigned long long)config.hit_sbt_base_addr,
           config.hit_sbt_record_stride, config.shader_group_handle_size,
           after.store_shared + closest_after.store_shared,
-          after.load_shared + closest_after.load_shared, per_lane_scratch);
+          after.load_shared + closest_after.load_shared, per_lane_scratch,
+          abi.total_size_bytes, manual_per_lane_scratch);
 
    ralloc_free(raygen);
    ralloc_free(miss);
    ralloc_free(closest_hit);
+   ralloc_free(manual_raygen);
+   ralloc_free(manual_miss);
+   ralloc_free(manual_closest_hit);
    glsl_type_singleton_decref();
    return 0;
 }
