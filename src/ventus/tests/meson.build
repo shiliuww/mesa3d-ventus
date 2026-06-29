@@ -22,10 +22,31 @@ if prog_glslang.found()
     build_by_default : false,
   )
 
+  vt_rt_image_smoke_test = executable(
+    'vt_rt_image_smoke_test',
+    [
+      'vt_rt_image_smoke_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_vtn, idep_nir, idep_mesautil, dep_m],
+    build_by_default : false,
+  )
+
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
     args : [vt_rt_minimal_raygen_spv],
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_rt_image_smoke',
+    vt_rt_image_smoke_test,
+    args : [
+      vt_rt_minimal_raygen_spv,
+      meson.current_build_dir() / 'vt_rt_smoke.ppm',
+    ],
     suite : ['ventus'],
   )
 endif

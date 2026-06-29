@@ -1,0 +1,110 @@
+/*
+ * Copyright 2026
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef VT_RT_TEST_COMMON_H
+#define VT_RT_TEST_COMMON_H
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "compiler/glsl_types.h"
+#include "nir/nir.h"
+#include "nir/nir_builder.h"
+#include "spirv/nir_spirv.h"
+#include "ventus/compiler/vt_nir.h"
+
+#define VT_RT_CHECK(cond)                                                       \
+   do {                                                                        \
+      if (!(cond)) {                                                           \
+         fprintf(stderr, "CHECK failed: %s at %s:%d\n", #cond, __FILE__,      \
+                 __LINE__);                                                    \
+         abort();                                                              \
+      }                                                                        \
+   } while (0)
+
+struct vt_rt_intrinsic_counts {
+   unsigned trace_ray;
+   unsigned load_shared;
+   unsigned store_shared;
+};
+
+static inline void
+vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts)
+{
+   *counts = (struct vt_rt_intrinsic_counts){0};
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            switch (intrin->intrinsic) {
+            case nir_intrinsic_trace_ray:
+               counts->trace_ray++;
+               break;
+            case nir_intrinsic_load_shared:
+               counts->load_shared++;
+               break;
+            case nir_intrinsic_store_shared:
+               counts->store_shared++;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+}
+
+static inline nir_shader *
+vt_rt_load_raygen_spirv(const char *path,
+                        const nir_shader_compiler_options *options)
+{
+   FILE *fp = fopen(path, "rb");
+   VT_RT_CHECK(fp != NULL);
+
+   VT_RT_CHECK(fseek(fp, 0, SEEK_END) == 0);
+   long size = ftell(fp);
+   VT_RT_CHECK(size > 0 && (size % 4) == 0);
+   VT_RT_CHECK(fseek(fp, 0, SEEK_SET) == 0);
+
+   uint32_t *words = malloc((size_t)size);
+   VT_RT_CHECK(words != NULL);
+   VT_RT_CHECK(fread(words, 1, (size_t)size, fp) == (size_t)size);
+   VT_RT_CHECK(fclose(fp) == 0);
+
+   const struct spirv_to_nir_options spirv_options = {
+      .environment = NIR_SPIRV_VULKAN,
+      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .phys_ssbo_addr_format = nir_address_format_64bit_global,
+      .push_const_addr_format = nir_address_format_logical,
+      .shared_addr_format = nir_address_format_32bit_offset,
+      .constant_addr_format = nir_address_format_64bit_global,
+   };
+
+   nir_shader *shader =
+      spirv_to_nir(words, (size_t)size / 4, NULL, MESA_SHADER_RAYGEN, "main",
+                   &spirv_options, options);
+   free(words);
+
+   VT_RT_CHECK(shader != NULL);
+   VT_RT_CHECK(shader->info.stage == MESA_SHADER_RAYGEN);
+   return shader;
+}
+
+static inline nir_shader *
+vt_rt_build_empty_shader(mesa_shader_stage stage,
+                         const nir_shader_compiler_options *options,
+                         const char *name)
+{
+   nir_builder b = nir_builder_init_simple_shader(stage, options, "%s", name);
+   return b.shader;
+}
+
+#endif
