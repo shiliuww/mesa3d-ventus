@@ -150,6 +150,9 @@ typedef void (*vt_nir_rt_emit_shader_cb)(nir_builder *b,
 struct vt_nir_rt_config {
    enum vt_rt_execution_model execution_model;
    struct vt_nir_scratchpad_layout scratchpad[VT_RT_LAYOUT_COUNT];
+   uint64_t hit_sbt_base_addr;
+   uint32_t hit_sbt_record_stride;
+   uint32_t shader_group_handle_size;
    uint32_t miss_depth_value;
    bool enable_monolithic_shader_callbacks;
    vt_nir_rt_emit_shader_cb emit_closest_hit;

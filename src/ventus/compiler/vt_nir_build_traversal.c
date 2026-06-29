@@ -25,6 +25,9 @@ vt_nir_rt_default_config(void)
             .stride_bytes = 256,
          },
       },
+      .hit_sbt_base_addr = 0,
+      .hit_sbt_record_stride = 64,
+      .shader_group_handle_size = 32,
       .miss_depth_value = 0x7fffffff,
       .enable_monolithic_shader_callbacks = false,
       .emit_closest_hit = NULL,
@@ -192,6 +195,20 @@ store_u64_words(nir_builder *b, nir_def *base, enum vt_rt_slot_word lo_word,
    }
 }
 
+static nir_def *
+build_hit_shader_record_ptr(nir_builder *b,
+                            const struct vt_nir_rt_config *config,
+                            nir_def *sbt_index)
+{
+   nir_def *record_offset =
+      nir_iadd_imm(b, nir_imul_imm(b, sbt_index,
+                                   config->hit_sbt_record_stride),
+                   config->shader_group_handle_size);
+
+   return nir_iadd(b, nir_imm_int64(b, config->hit_sbt_base_addr),
+                   nir_u2u64(b, record_offset));
+}
+
 struct vt_nir_rt_result
 vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_trace_params *params,
@@ -227,8 +244,7 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
    nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
    nir_def *shader_record_ptr =
-      nir_pack_64_2x32_split(b, load_word(b, base, VT_RT_SLOT_SBT_INDEX),
-                             nir_imm_int(b, 0));
+      build_hit_shader_record_ptr(b, config, sbt_index);
 
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_STATUS, status);

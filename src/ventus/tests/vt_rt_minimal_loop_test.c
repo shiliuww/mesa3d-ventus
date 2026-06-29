@@ -49,6 +49,9 @@ main(int argc, char **argv)
 
    const nir_shader_compiler_options options = {0};
    struct vt_nir_rt_config config = vt_nir_rt_default_config();
+   config.hit_sbt_base_addr = 0x100000000ull;
+   config.hit_sbt_record_stride = 96;
+   config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *miss =
       vt_rt_build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
@@ -78,6 +81,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.trace_ray == 0);
    VT_RT_CHECK(after.store_shared > 0);
    VT_RT_CHECK(after.load_shared > 0);
+   VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen,
+                                           config.hit_sbt_record_stride));
 
    struct vt_rt_intrinsic_counts closest_before;
    vt_rt_count_intrinsics(closest_hit, &closest_before);
@@ -119,7 +124,11 @@ main(int argc, char **argv)
    VT_RT_CHECK(scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
    printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
-          "abi_hit_record=1 shared_store=%u shared_load=%u per_lane_scratch=%u\n",
+          "abi_hit_record=1 sbt_entry_calc=1 hit_sbt_base=0x%llx "
+          "hit_sbt_stride=%u shader_group_handle_size=%u "
+          "shared_store=%u shared_load=%u per_lane_scratch=%u\n",
+          (unsigned long long)config.hit_sbt_base_addr,
+          config.hit_sbt_record_stride, config.shader_group_handle_size,
           after.store_shared + closest_after.store_shared,
           after.load_shared + closest_after.load_shared, per_lane_scratch);
 

@@ -39,6 +39,31 @@ struct vt_rt_intrinsic_counts {
    unsigned load_ray_hit_kind;
 };
 
+static inline bool
+vt_rt_shader_has_imul_const(nir_shader *shader, uint32_t value)
+{
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op != nir_op_imul)
+               continue;
+
+            for (unsigned i = 0; i < 2; ++i) {
+               if (nir_src_is_const(alu->src[i].src) &&
+                   nir_src_as_uint(alu->src[i].src) == value)
+                  return true;
+            }
+         }
+      }
+   }
+
+   return false;
+}
+
 static inline void
 vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts)
 {
