@@ -112,10 +112,8 @@ main(int argc, char **argv)
       build_abi_probe_terminating_any_hit(&options);
 
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(abi.payload_base_bytes >=
-               abi.ray_state_base_bytes + abi.ray_state_size_bytes);
    VT_RT_CHECK(abi.control_base_bytes >=
-               abi.payload_base_bytes + abi.payload_size_bytes);
+               abi.ray_state_base_bytes + abi.ray_state_size_bytes);
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes >=
                abi.control_base_bytes + abi.control_size_bytes);
    VT_RT_CHECK(abi.hit_record_base_bytes >=
@@ -123,8 +121,10 @@ main(int argc, char **argv)
                abi.candidate_hit_record_size_bytes);
    VT_RT_CHECK(abi.hit_attrib_base_bytes >=
                abi.hit_record_base_bytes + abi.hit_record_size_bytes);
-   VT_RT_CHECK(abi.continuation_base_bytes >=
+   VT_RT_CHECK(abi.payload_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
+   VT_RT_CHECK(abi.continuation_base_bytes >=
+               abi.payload_base_bytes + abi.payload_size_bytes);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes ==
                VT_RT_HIT_RECORD_WORD_COUNT * 4);
@@ -273,7 +273,7 @@ main(int argc, char **argv)
           "hit_sbt_stride=%u shader_group_handle_size=%u "
           "shared_store=%u shared_load=%u per_lane_scratch=%u "
           "abi_total=%u control_base=%u candidate_base=%u committed_base=%u "
-          "hit_attrib_base=%u manual_max_scratch=%u\n",
+          "hit_attrib_base=%u payload_base=%u manual_max_scratch=%u\n",
           (unsigned long long)config.hit_sbt_base_addr,
           config.hit_sbt_record_stride, config.shader_group_handle_size,
           after.store_shared + closest_after.store_shared +
@@ -283,7 +283,8 @@ main(int argc, char **argv)
              any_after.load_shared + intersection_after.load_shared,
           per_lane_scratch, abi.total_size_bytes, abi.control_base_bytes,
           abi.candidate_hit_record_base_bytes, abi.hit_record_base_bytes,
-          abi.hit_attrib_base_bytes, manual_per_lane_scratch);
+          abi.hit_attrib_base_bytes, abi.payload_base_bytes,
+          manual_per_lane_scratch);
 
    ralloc_free(raygen);
    ralloc_free(miss);

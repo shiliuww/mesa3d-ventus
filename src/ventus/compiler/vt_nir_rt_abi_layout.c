@@ -5,53 +5,34 @@
 
 #include "vt_nir.h"
 
-#include "util/u_math.h"
-
-struct vt_abi_region_allocator {
-   uint32_t offset;
-};
-
-static uint32_t
-alloc_region(struct vt_abi_region_allocator *alloc, uint32_t size,
-             uint32_t alignment)
-{
-   alloc->offset = align(alloc->offset, alignment);
-   uint32_t base = alloc->offset;
-   alloc->offset += size;
-   return base;
-}
-
 struct vt_nir_rt_abi_layout
 vt_nir_rt_default_abi_layout(void)
 {
-   struct vt_abi_region_allocator alloc = {0};
    struct vt_nir_rt_abi_layout layout = {0};
 
-   layout.ray_state_base_bytes = alloc_region(&alloc, VT_RT_SLOT_SBT_INDEX * 4 + 4, 16);
-   layout.ray_state_size_bytes = VT_RT_SLOT_SBT_INDEX * 4 + 4;
+   layout.ray_state_base_bytes = VT_RT_ABI_RAY_STATE_BASE_BYTES;
+   layout.ray_state_size_bytes = VT_RT_ABI_RAY_STATE_SIZE_BYTES;
 
-   layout.payload_base_bytes =
-      alloc_region(&alloc, (VT_RT_PAYLOAD_RAY_DIRECTION_Z + 1) * 4, 16);
-   layout.payload_size_bytes = (VT_RT_PAYLOAD_RAY_DIRECTION_Z + 1) * 4;
-
-   layout.control_base_bytes =
-      alloc_region(&alloc, VT_RT_CONTROL_WORD_COUNT * 4, 16);
-   layout.control_size_bytes = VT_RT_CONTROL_WORD_COUNT * 4;
+   layout.control_base_bytes = VT_RT_ABI_CONTROL_BASE_BYTES;
+   layout.control_size_bytes = VT_RT_ABI_CONTROL_SIZE_BYTES;
 
    layout.candidate_hit_record_base_bytes =
-      alloc_region(&alloc, VT_RT_HIT_RECORD_WORD_COUNT * 4, 16);
-   layout.candidate_hit_record_size_bytes = VT_RT_HIT_RECORD_WORD_COUNT * 4;
+      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES;
+   layout.candidate_hit_record_size_bytes =
+      VT_RT_ABI_CANDIDATE_HIT_RECORD_SIZE_BYTES;
 
-   layout.hit_record_base_bytes =
-      alloc_region(&alloc, VT_RT_HIT_RECORD_WORD_COUNT * 4, 16);
-   layout.hit_record_size_bytes = VT_RT_HIT_RECORD_WORD_COUNT * 4;
+   layout.hit_record_base_bytes = VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES;
+   layout.hit_record_size_bytes = VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES;
 
-   layout.hit_attrib_base_bytes = alloc_region(&alloc, 32, 16);
-   layout.hit_attrib_size_bytes = 32;
+   layout.hit_attrib_base_bytes = VT_RT_ABI_HIT_ATTRIB_BASE_BYTES;
+   layout.hit_attrib_size_bytes = VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES;
 
-   layout.continuation_base_bytes = alloc_region(&alloc, 0, 16);
-   layout.continuation_size_bytes = 0;
-   layout.total_size_bytes = align(alloc.offset, 16);
+   layout.payload_base_bytes = VT_RT_ABI_PAYLOAD_BASE_BYTES;
+   layout.payload_size_bytes = VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES;
+
+   layout.continuation_base_bytes = VT_RT_ABI_CONTINUATION_BASE_BYTES;
+   layout.continuation_size_bytes = VT_RT_ABI_CONTINUATION_SIZE_BYTES;
+   layout.total_size_bytes = VT_RT_ABI_TOTAL_SIZE_BYTES;
 
    return layout;
 }
