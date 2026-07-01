@@ -94,6 +94,8 @@ struct vt_nir_rt_trace_params {
 };
 
 struct vt_nir_rt_result {
+   nir_def *slot_base;
+   nir_def *status;
    nir_def *hit;
    nir_def *hit_t;
    nir_def *sbt_index;

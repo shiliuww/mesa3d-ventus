@@ -766,6 +766,12 @@ intrinsic("rt_execute_callable", src_comp=[1, -1], indices=[CALL_IDX,STACK_SIZE]
 intrinsic("rt_trace_ray", src_comp=[-1, 1, 1, 1, 1, 1, 3, 1, 3, 1, -1],
           indices=[CALL_IDX, STACK_SIZE])
 
+# Ventus RTcore traversal bridge.  The src is the per-lane RT scratch slot
+# base.  These intrinsics have target-visible side effects and intentionally
+# are not marked CAN_ELIMINATE/CAN_REORDER.
+intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
+intrinsic("ventus_rt_release", src_comp=[1])
+
 
 # Atomic counters
 #

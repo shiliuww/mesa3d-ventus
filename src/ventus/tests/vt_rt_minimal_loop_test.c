@@ -145,6 +145,8 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
    VT_RT_CHECK(after.trace_ray == 0);
+   VT_RT_CHECK(after.ventus_rt_traverse == 1);
+   VT_RT_CHECK(after.ventus_rt_release == 1);
    VT_RT_CHECK(after.store_shared > 0);
    VT_RT_CHECK(after.load_shared > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen,
@@ -268,6 +270,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
    printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
+          "rt_traverse=1 rt_release=1 "
           "abi_candidate_committed=1 abi_control=1 sbt_entry_calc=1 "
           "hit_sbt_base=0x%llx "
           "hit_sbt_stride=%u shader_group_handle_size=%u "

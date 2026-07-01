@@ -317,8 +317,7 @@ vt_nir_build_traversal(nir_builder *b,
    store_word(b, base, VT_RT_SLOT_TMAX, params->tmax);
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
 
-   nir_def *status =
-      load_word(b, base, VT_RT_SLOT_STATUS);
+   nir_def *status = nir_ventus_rt_traverse(b, base);
    nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
    nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
    nir_def *shader_record_ptr =
@@ -326,13 +325,22 @@ vt_nir_build_traversal(nir_builder *b,
 
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_DONE,
-                             nir_ieq_imm(b, status, VT_RT_STATUS_DONE));
+                             nir_ior(b,
+                                     nir_ieq_imm(b, status,
+                                                VT_RT_TRAVERSAL_COMPLETE_MISS),
+                                     nir_ieq_imm(b, status,
+                                                VT_RT_TRAVERSAL_COMPLETE_HIT)));
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_INCOMPLETE,
-                             nir_ieq_imm(b, status, VT_RT_STATUS_TRACE_REQUEST));
+                             nir_ior(b,
+                                     nir_ieq_imm(b, status,
+                                                VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE),
+                                     nir_ieq_imm(b, status,
+                                                VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB)));
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_ACCEPT_HIT,
-                             nir_ieq_imm(b, status, VT_RT_STATUS_HIT));
+                             nir_ieq_imm(b, status,
+                                         VT_RT_TRAVERSAL_COMPLETE_HIT));
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
@@ -381,7 +389,9 @@ vt_nir_build_traversal(nir_builder *b,
                                 nir_imm_false(b));
 
    struct vt_nir_rt_result result = {
-      .hit = nir_ieq_imm(b, status, VT_RT_STATUS_HIT),
+      .slot_base = base,
+      .status = status,
+      .hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT),
       .hit_t = hit_t,
       .sbt_index = sbt_index,
       .shader_record_ptr = shader_record_ptr,

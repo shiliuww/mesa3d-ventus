@@ -51,6 +51,8 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
    }
 
+   nir_ventus_rt_release(b, result.slot_base);
+
    nir_instr_remove(&intrin->instr);
    return true;
 }

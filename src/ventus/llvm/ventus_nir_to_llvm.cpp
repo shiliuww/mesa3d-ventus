@@ -140,6 +140,11 @@ private:
                               GlobalValue::ExternalLinkage, name, module);
    }
 
+   Value *sharedPtr(Value *addr)
+   {
+      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 3));
+   }
+
    Function *createEntry(nir_shader *shader)
    {
       std::string name = "vt_" + stage_name(shader->info.stage);
@@ -348,17 +353,22 @@ private:
          return nullptr;
       }
       case nir_intrinsic_load_shared: {
-         Function *fn = declare("llvm.riscv.ventus.shared.load.i32", i32, {i32});
-         return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
+         return builder.CreateLoad(defType(&intrin->def),
+                                   sharedPtr(value(intrin->src[0])));
       }
       case nir_intrinsic_store_shared: {
-         Function *fn = declare("llvm.riscv.ventus.shared.store.i32", Type::getVoidTy(context), {i32, i32});
-         builder.CreateCall(fn, {asInt32(value(intrin->src[0])), asInt32(value(intrin->src[1]))});
+         builder.CreateStore(value(intrin->src[0]),
+                             sharedPtr(value(intrin->src[1])));
          return nullptr;
       }
-      case nir_intrinsic_trace_ray: {
-         Function *fn = declare("llvm.riscv.ventus.rt.intersect", i32, {i32, i32});
-         builder.CreateCall(fn, {ConstantInt::get(i32, 0), asInt32(value(intrin->src[0]))});
+      case nir_intrinsic_ventus_rt_traverse: {
+         Function *fn = declare("llvm.riscv.ventus.rt.traverse.i32", i32, {i32});
+         return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
+      }
+      case nir_intrinsic_ventus_rt_release: {
+         Function *fn = declare("llvm.riscv.ventus.rt.release.i32",
+                                Type::getVoidTy(context), {i32});
+         builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
          return nullptr;
       }
       default:

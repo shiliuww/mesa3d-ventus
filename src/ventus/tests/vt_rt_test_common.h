@@ -44,6 +44,8 @@ struct vt_rt_intrinsic_counts {
    unsigned report_ray_intersection;
    unsigned ignore_ray_intersection;
    unsigned terminate_ray;
+   unsigned ventus_rt_traverse;
+   unsigned ventus_rt_release;
 };
 
 static inline bool
@@ -137,6 +139,12 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_terminate_ray:
                counts->terminate_ray++;
+               break;
+            case nir_intrinsic_ventus_rt_traverse:
+               counts->ventus_rt_traverse++;
+               break;
+            case nir_intrinsic_ventus_rt_release:
+               counts->ventus_rt_release++;
                break;
             default:
                break;
