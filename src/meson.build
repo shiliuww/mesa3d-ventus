@@ -69,6 +69,9 @@ endif
 if with_any_vk or with_gallium_zink
   subdir('vulkan')
 endif
+if with_ventus_vk
+  subdir('ventus/vulkan')
+endif
 if with_virtio_vk
   subdir('virtio/vulkan')
 endif

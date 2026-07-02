@@ -291,7 +291,8 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
+                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp',
+                      'ventus']
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -309,6 +310,7 @@ with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
+with_ventus_vk = _vulkan_drivers.contains('ventus')
 with_any_vk = _vulkan_drivers.length() != 0
 
 with_llvm = with_llvm \
@@ -704,7 +706,7 @@ if with_gallium_d3d12 and not _with_gallium_d3d12_video.disabled()
   pre_args += '-DHAVE_GALLIUM_D3D12_VIDEO'
 endif
 
-with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk
+with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk or with_ventus_vk
 _glslang_preamble_version = '12.2'
 
 # GLSL has interesting version output and Meson doesn't parse it correctly as of

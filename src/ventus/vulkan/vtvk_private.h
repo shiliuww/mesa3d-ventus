@@ -1,0 +1,49 @@
+#ifndef VTVK_PRIVATE_H
+#define VTVK_PRIVATE_H
+
+#include "util/macros.h"
+#include "vk_alloc.h"
+#include "vk_device.h"
+#include "vk_command_buffer.h"
+#include "vk_instance.h"
+#include "vk_log.h"
+#include "vk_physical_device.h"
+#include "vk_queue.h"
+
+#define VTVK_VENDOR_ID 0x5654
+#define VTVK_DEVICE_ID 0x5254
+#define VTVK_QUEUE_FAMILY 0
+
+struct vtvk_instance {
+   struct vk_instance vk;
+};
+
+struct vtvk_physical_device {
+   struct vk_physical_device vk;
+
+   VkMemoryHeap memory_heaps[1];
+   VkMemoryType memory_types[1];
+
+   const struct vk_sync_type *sync_types[1];
+};
+
+struct vtvk_queue {
+   struct vk_queue vk;
+};
+
+struct vtvk_device {
+   struct vk_device vk;
+};
+
+VK_DEFINE_HANDLE_CASTS(vtvk_instance, vk.base, VkInstance,
+                       VK_OBJECT_TYPE_INSTANCE)
+VK_DEFINE_HANDLE_CASTS(vtvk_physical_device, vk.base, VkPhysicalDevice,
+                       VK_OBJECT_TYPE_PHYSICAL_DEVICE)
+VK_DEFINE_HANDLE_CASTS(vtvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+VkResult vtvk_enumerate_physical_devices(struct vk_instance *vk_instance);
+void vtvk_destroy_physical_device(struct vk_physical_device *vk_pdev);
+
+extern const struct vk_command_buffer_ops vtvk_command_buffer_ops;
+
+#endif

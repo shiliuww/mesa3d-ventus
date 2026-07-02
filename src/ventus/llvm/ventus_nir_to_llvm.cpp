@@ -63,8 +63,9 @@ public:
       resetFunctionState();
 
       Function *fn = createEntry(shader);
+      BasicBlock *entry = BasicBlock::Create(context, "entry", fn);
       mapBlocks(fn, impl);
-      builder.SetInsertPoint(BasicBlock::Create(context, "entry", fn));
+      builder.SetInsertPoint(entry);
       allocateVariables(shader, impl);
 
       BasicBlock *first = firstBlock(&impl->body);
