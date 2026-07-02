@@ -197,8 +197,8 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
    VT_RT_CHECK(after.trace_ray == 0);
-   VT_RT_CHECK(after.store_shared > 0);
-   VT_RT_CHECK(after.load_shared > 0);
+   VT_RT_CHECK(after.ventus_rt_store_slot > 0);
+   VT_RT_CHECK(after.ventus_rt_load_slot > 0);
 
    write_ppm(argv[2], 160, 96);
    printf("PASS vt_rt_image_smoke spirv_input=1 image=%s width=160 height=96\n",

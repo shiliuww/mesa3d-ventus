@@ -22,12 +22,11 @@ current_layout(nir_builder *b)
 }
 
 static nir_def *
-load_shared_word(nir_builder *b, const struct vt_nir_rt_config *config,
-                 enum vt_rt_shader_layout layout, uint32_t byte_offset)
+load_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
+                  enum vt_rt_shader_layout layout, uint32_t byte_offset)
 {
-   return nir_load_shared(b, 1, 32,
-                          vt_nir_scratchpad_addr(b, config, layout, byte_offset),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(
+      b, 1, 32, vt_nir_scratchpad_addr(b, config, layout, byte_offset));
 }
 
 static nir_def *
@@ -35,34 +34,33 @@ load_ray_state_word(nir_builder *b, const struct vt_nir_rt_config *config,
                     enum vt_rt_shader_layout layout, enum vt_rt_slot_word word)
 {
    const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return load_shared_word(b, config, layout,
-                           sp->ray_state_base_bytes + word * 4);
+   return load_rt_slot_word(b, config, layout,
+                            sp->ray_state_base_bytes + word * 4);
 }
 
 static void
-store_shared_word(nir_builder *b, const struct vt_nir_rt_config *config,
-                  enum vt_rt_shader_layout layout, uint32_t byte_offset,
-                  nir_def *value)
+store_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
+                   enum vt_rt_shader_layout layout, uint32_t byte_offset,
+                   nir_def *value)
 {
-   nir_store_shared(b, value, vt_nir_scratchpad_addr(b, config, layout,
-                                                     byte_offset),
-                    .align_mul = 4);
+   nir_ventus_rt_store_slot(
+      b, value, vt_nir_scratchpad_addr(b, config, layout, byte_offset));
 }
 
 static nir_def *
 load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                  uint32_t word)
 {
-   return load_shared_word(b, state->config, current_layout(b),
-                           state->base_offset + word * 4);
+   return load_rt_slot_word(b, state->config, current_layout(b),
+                            state->base_offset + word * 4);
 }
 
 static void
 store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                   uint32_t word, nir_def *value)
 {
-   store_shared_word(b, state->config, current_layout(b),
-                     state->base_offset + word * 4, value);
+   store_rt_slot_word(b, state->config, current_layout(b),
+                      state->base_offset + word * 4, value);
 }
 
 static bool

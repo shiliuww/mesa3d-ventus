@@ -772,6 +772,13 @@ intrinsic("rt_trace_ray", src_comp=[-1, 1, 1, 1, 1, 1, 3, 1, 3, 1, -1],
 intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_release", src_comp=[1])
 
+# Ventus RT per-lane slot memory.  This is private/PDS scratch, not shared/LDS
+# memory.  Loads may be eliminated when unused, but neither loads nor stores are
+# marked CAN_REORDER because vt.rt.traverse/release observe the same slot.
+intrinsic("ventus_rt_load_slot", src_comp=[1], dest_comp=0,
+          bit_sizes=[8, 16, 32, 64], flags=[CAN_ELIMINATE])
+intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
+
 
 # Atomic counters
 #

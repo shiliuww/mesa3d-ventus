@@ -281,8 +281,8 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
    VT_RT_CHECK(after.trace_ray == 0);
-   VT_RT_CHECK(after.store_shared > before.store_shared);
-   VT_RT_CHECK(after.load_shared > before.load_shared);
+   VT_RT_CHECK(after.ventus_rt_store_slot > before.ventus_rt_store_slot);
+   VT_RT_CHECK(after.ventus_rt_load_slot > before.ventus_rt_load_slot);
    VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen, config.hit_sbt_record_stride));
 
    nir_shader *any_hit = build_flag_probe_any_hit(&options);
@@ -301,8 +301,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(any_after.load_ray_flags == 0);
    VT_RT_CHECK(any_after.load_cull_mask == 0);
    VT_RT_CHECK(any_after.ignore_ray_intersection == 0);
-   VT_RT_CHECK(any_after.load_shared > any_before.load_shared);
-   VT_RT_CHECK(any_after.store_shared > any_before.store_shared);
+   VT_RT_CHECK(any_after.ventus_rt_load_slot > any_before.ventus_rt_load_slot);
+   VT_RT_CHECK(any_after.ventus_rt_store_slot > any_before.ventus_rt_store_slot);
 
    nir_shader *intersection = build_flag_probe_intersection(&options);
    struct vt_rt_intrinsic_counts intersection_before;
@@ -316,8 +316,10 @@ main(int argc, char **argv)
    vt_rt_count_intrinsics(intersection, &intersection_after);
    VT_RT_CHECK(intersection_after.load_ray_t_min == 0);
    VT_RT_CHECK(intersection_after.report_ray_intersection == 0);
-   VT_RT_CHECK(intersection_after.load_shared > intersection_before.load_shared);
-   VT_RT_CHECK(intersection_after.store_shared > intersection_before.store_shared);
+   VT_RT_CHECK(intersection_after.ventus_rt_load_slot >
+               intersection_before.ventus_rt_load_slot);
+   VT_RT_CHECK(intersection_after.ventus_rt_store_slot >
+               intersection_before.ventus_rt_store_slot);
 
    unsigned software_opacity_pixels = 0;
    write_flagged_ppm(argv[2], 192, 108, &software_opacity_pixels);

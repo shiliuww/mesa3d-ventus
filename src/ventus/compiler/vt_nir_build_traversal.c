@@ -133,9 +133,8 @@ vt_nir_load_payload_word(nir_builder *b,
                          enum vt_rt_payload_word word,
                          uint32_t bit_size)
 {
-   return nir_load_shared(b, 1, bit_size,
-                          vt_nir_payload_addr(b, config, layout, word),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(b, 1, bit_size,
+                                  vt_nir_payload_addr(b, config, layout, word));
 }
 
 void
@@ -145,8 +144,8 @@ vt_nir_store_payload_word(nir_builder *b,
                           enum vt_rt_payload_word word,
                           nir_def *value)
 {
-   nir_store_shared(b, value, vt_nir_payload_addr(b, config, layout, word),
-                    .align_mul = 4);
+   nir_ventus_rt_store_slot(b, value,
+                            vt_nir_payload_addr(b, config, layout, word));
 }
 
 nir_def *
@@ -156,9 +155,8 @@ vt_nir_load_hit_record_word(nir_builder *b,
                             enum vt_rt_hit_record_word word,
                             uint32_t bit_size)
 {
-   return nir_load_shared(b, 1, bit_size,
-                          vt_nir_hit_record_addr(b, config, layout, word),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(b, 1, bit_size,
+                                  vt_nir_hit_record_addr(b, config, layout, word));
 }
 
 void
@@ -170,8 +168,8 @@ vt_nir_store_hit_record_word(nir_builder *b,
 {
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
-   nir_store_shared(b, value, vt_nir_hit_record_addr(b, config, layout, word),
-                    .align_mul = 4);
+   nir_ventus_rt_store_slot(b, value,
+                            vt_nir_hit_record_addr(b, config, layout, word));
 }
 
 nir_def *
@@ -181,9 +179,9 @@ vt_nir_load_candidate_hit_record_word(nir_builder *b,
                                       enum vt_rt_hit_record_word word,
                                       uint32_t bit_size)
 {
-   return nir_load_shared(b, 1, bit_size,
-                          vt_nir_candidate_hit_record_addr(b, config, layout, word),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(
+      b, 1, bit_size,
+      vt_nir_candidate_hit_record_addr(b, config, layout, word));
 }
 
 void
@@ -195,8 +193,8 @@ vt_nir_store_candidate_hit_record_word(nir_builder *b,
 {
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
-   nir_store_shared(b, value, vt_nir_candidate_hit_record_addr(b, config, layout, word),
-                    .align_mul = 4);
+   nir_ventus_rt_store_slot(
+      b, value, vt_nir_candidate_hit_record_addr(b, config, layout, word));
 }
 
 nir_def *
@@ -206,9 +204,8 @@ vt_nir_load_control_word(nir_builder *b,
                          enum vt_rt_control_word word,
                          uint32_t bit_size)
 {
-   return nir_load_shared(b, 1, bit_size,
-                          vt_nir_control_addr(b, config, layout, word),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(b, 1, bit_size,
+                                  vt_nir_control_addr(b, config, layout, word));
 }
 
 void
@@ -220,8 +217,8 @@ vt_nir_store_control_word(nir_builder *b,
 {
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
-   nir_store_shared(b, value, vt_nir_control_addr(b, config, layout, word),
-                    .align_mul = 4);
+   nir_ventus_rt_store_slot(b, value,
+                            vt_nir_control_addr(b, config, layout, word));
 }
 
 static nir_def *
@@ -236,14 +233,13 @@ store_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word, nir_def *va
    if (!value)
       return;
 
-   nir_store_shared(b, value, slot_offset(b, base, word), .align_mul = 4);
+   nir_ventus_rt_store_slot(b, value, slot_offset(b, base, word));
 }
 
 static nir_def *
 load_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
 {
-   return nir_load_shared(b, 1, 32, slot_offset(b, base, word),
-                          .align_mul = 4);
+   return nir_ventus_rt_load_slot(b, 1, 32, slot_offset(b, base, word));
 }
 
 static void

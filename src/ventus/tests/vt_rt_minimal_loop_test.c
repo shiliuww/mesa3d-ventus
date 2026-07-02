@@ -147,8 +147,9 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.trace_ray == 0);
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
    VT_RT_CHECK(after.ventus_rt_release == 1);
-   VT_RT_CHECK(after.store_shared > 0);
-   VT_RT_CHECK(after.load_shared > 0);
+   VT_RT_CHECK(vt_rt_all_releases_are_conditional(raygen));
+   VT_RT_CHECK(after.ventus_rt_store_slot > 0);
+   VT_RT_CHECK(after.ventus_rt_load_slot > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen,
                                            config.hit_sbt_record_stride));
 
@@ -175,8 +176,10 @@ main(int argc, char **argv)
    VT_RT_CHECK(closest_after.load_instance_id == 0);
    VT_RT_CHECK(closest_after.load_ray_geometry_index == 0);
    VT_RT_CHECK(closest_after.load_ray_hit_kind == 0);
-   VT_RT_CHECK(closest_after.load_shared > closest_before.load_shared);
-   VT_RT_CHECK(closest_after.store_shared > closest_before.store_shared);
+   VT_RT_CHECK(closest_after.ventus_rt_load_slot >
+               closest_before.ventus_rt_load_slot);
+   VT_RT_CHECK(closest_after.ventus_rt_store_slot >
+               closest_before.ventus_rt_store_slot);
 
    struct vt_rt_intrinsic_counts any_before;
    vt_rt_count_intrinsics(any_hit, &any_before);
@@ -193,8 +196,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(any_after.load_front_face == 0);
    VT_RT_CHECK(any_after.load_ray_hit_kind == 0);
    VT_RT_CHECK(any_after.ignore_ray_intersection == 0);
-   VT_RT_CHECK(any_after.load_shared > any_before.load_shared);
-   VT_RT_CHECK(any_after.store_shared > any_before.store_shared);
+   VT_RT_CHECK(any_after.ventus_rt_load_slot > any_before.ventus_rt_load_slot);
+   VT_RT_CHECK(any_after.ventus_rt_store_slot > any_before.ventus_rt_store_slot);
 
    struct vt_rt_intrinsic_counts terminating_any_before;
    vt_rt_count_intrinsics(terminating_any_hit, &terminating_any_before);
@@ -207,8 +210,8 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts terminating_any_after;
    vt_rt_count_intrinsics(terminating_any_hit, &terminating_any_after);
    VT_RT_CHECK(terminating_any_after.terminate_ray == 0);
-   VT_RT_CHECK(terminating_any_after.store_shared >
-               terminating_any_before.store_shared);
+   VT_RT_CHECK(terminating_any_after.ventus_rt_store_slot >
+               terminating_any_before.ventus_rt_store_slot);
 
    struct vt_rt_intrinsic_counts intersection_before;
    vt_rt_count_intrinsics(intersection, &intersection_before);
@@ -221,8 +224,10 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts intersection_after;
    vt_rt_count_intrinsics(intersection, &intersection_after);
    VT_RT_CHECK(intersection_after.report_ray_intersection == 0);
-   VT_RT_CHECK(intersection_after.load_shared > intersection_before.load_shared);
-   VT_RT_CHECK(intersection_after.store_shared > intersection_before.store_shared);
+   VT_RT_CHECK(intersection_after.ventus_rt_load_slot >
+               intersection_before.ventus_rt_load_slot);
+   VT_RT_CHECK(intersection_after.ventus_rt_store_slot >
+               intersection_before.ventus_rt_store_slot);
 
    nir_shader *pipeline[] = {
       raygen, miss, closest_hit, any_hit, intersection, terminating_any_hit,
@@ -274,11 +279,19 @@ main(int argc, char **argv)
           "abi_candidate_committed=1 abi_control=1 sbt_entry_calc=1 "
           "hit_sbt_base=0x%llx "
           "hit_sbt_stride=%u shader_group_handle_size=%u "
-          "shared_store=%u shared_load=%u per_lane_scratch=%u "
+          "rt_slot_store=%u rt_slot_load=%u shared_store=%u shared_load=%u "
+          "per_lane_scratch=%u "
           "abi_total=%u control_base=%u candidate_base=%u committed_base=%u "
           "hit_attrib_base=%u payload_base=%u manual_max_scratch=%u\n",
           (unsigned long long)config.hit_sbt_base_addr,
           config.hit_sbt_record_stride, config.shader_group_handle_size,
+          after.ventus_rt_store_slot + closest_after.ventus_rt_store_slot +
+             any_after.ventus_rt_store_slot +
+             terminating_any_after.ventus_rt_store_slot +
+             intersection_after.ventus_rt_store_slot,
+          after.ventus_rt_load_slot + closest_after.ventus_rt_load_slot +
+             any_after.ventus_rt_load_slot +
+             intersection_after.ventus_rt_load_slot,
           after.store_shared + closest_after.store_shared +
              any_after.store_shared + terminating_any_after.store_shared +
              intersection_after.store_shared,

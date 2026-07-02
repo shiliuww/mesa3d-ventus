@@ -37,21 +37,33 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    };
 
    struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
+   nir_def *complete_hit =
+      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_HIT);
+   nir_def *complete_miss =
+      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_MISS);
+   nir_def *terminated =
+      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_TERMINATED);
+   nir_def *terminal = nir_ior(b, nir_ior(b, complete_hit, complete_miss),
+                               terminated);
 
    if (config && config->enable_monolithic_shader_callbacks &&
        (config->emit_closest_hit || config->emit_miss)) {
-      nir_push_if(b, result.hit);
+      nir_push_if(b, complete_hit);
       if (config->emit_closest_hit)
          config->emit_closest_hit(b, &params, &result, config->callback_data);
 
       nir_push_else(b, NULL);
+      nir_push_if(b, complete_miss);
       if (config->emit_miss)
          config->emit_miss(b, &params, &result, config->callback_data);
 
       nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
    }
 
+   nir_push_if(b, terminal);
    nir_ventus_rt_release(b, result.slot_base);
+   nir_pop_if(b, NULL);
 
    nir_instr_remove(&intrin->instr);
    return true;

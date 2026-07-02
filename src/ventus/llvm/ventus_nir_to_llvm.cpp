@@ -145,6 +145,11 @@ private:
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 3));
    }
 
+   Value *privatePtr(Value *addr)
+   {
+      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
+   }
+
    Function *createEntry(nir_shader *shader)
    {
       std::string name = "vt_" + stage_name(shader->info.stage);
@@ -359,6 +364,15 @@ private:
       case nir_intrinsic_store_shared: {
          builder.CreateStore(value(intrin->src[0]),
                              sharedPtr(value(intrin->src[1])));
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_load_slot: {
+         return builder.CreateLoad(defType(&intrin->def),
+                                   privatePtr(value(intrin->src[0])));
+      }
+      case nir_intrinsic_ventus_rt_store_slot: {
+         builder.CreateStore(value(intrin->src[0]),
+                             privatePtr(value(intrin->src[1])));
          return nullptr;
       }
       case nir_intrinsic_ventus_rt_traverse: {

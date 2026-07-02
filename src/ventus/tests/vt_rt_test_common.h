@@ -29,6 +29,8 @@ struct vt_rt_intrinsic_counts {
    unsigned trace_ray;
    unsigned load_shared;
    unsigned store_shared;
+   unsigned ventus_rt_load_slot;
+   unsigned ventus_rt_store_slot;
    unsigned load_deref;
    unsigned store_deref;
    unsigned load_shader_record_ptr;
@@ -73,6 +75,37 @@ vt_rt_shader_has_imul_const(nir_shader *shader, uint32_t value)
    return false;
 }
 
+static inline bool
+vt_rt_all_releases_are_conditional(nir_shader *shader)
+{
+   unsigned releases = 0;
+   unsigned conditional_releases = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_ventus_rt_release)
+               continue;
+
+            releases++;
+            for (nir_cf_node *parent = block->cf_node.parent; parent;
+                 parent = parent->parent) {
+               if (parent->type == nir_cf_node_if) {
+                  conditional_releases++;
+                  break;
+               }
+            }
+         }
+      }
+   }
+
+   return releases > 0 && releases == conditional_releases;
+}
+
 static inline void
 vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts)
 {
@@ -94,6 +127,12 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_store_shared:
                counts->store_shared++;
+               break;
+            case nir_intrinsic_ventus_rt_load_slot:
+               counts->ventus_rt_load_slot++;
+               break;
+            case nir_intrinsic_ventus_rt_store_slot:
+               counts->ventus_rt_store_slot++;
                break;
             case nir_intrinsic_load_deref:
                counts->load_deref++;
