@@ -6,8 +6,10 @@
 #include "ventus_nir_to_llvm.h"
 
 #include <memory>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -68,7 +70,8 @@ public:
         i1(Type::getInt1Ty(context)), i32(Type::getInt32Ty(context)),
         i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
-        earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")) {}
+        earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
+        debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
 
    void translate(nir_shader *shader)
    {
@@ -114,9 +117,11 @@ private:
    Type *f32;
    bool noopRtIntrinsics;
    bool earlyExit;
+   bool debugLowering;
 
    std::unordered_map<const nir_def *, Value *> defs;
    std::unordered_map<const nir_variable *, Value *> variables;
+   std::unordered_map<const nir_def *, const nir_variable *> derefVars;
    std::unordered_map<const nir_block *, BasicBlock *> blocks;
    std::unordered_map<const nir_block *, BasicBlock *> blockEnds;
    std::vector<std::pair<nir_phi_instr *, PHINode *>> phis;
@@ -133,6 +138,7 @@ private:
    {
       defs.clear();
       variables.clear();
+      derefVars.clear();
       blocks.clear();
       blockEnds.clear();
       phis.clear();
@@ -162,6 +168,11 @@ private:
    Value *undefFor(const nir_def *def, bool preferFloat = false)
    {
       return UndefValue::get(defType(def, preferFloat));
+   }
+
+   Value *zeroFor(const nir_def *def, bool preferFloat = false)
+   {
+      return Constant::getNullValue(defType(def, preferFloat));
    }
 
    Function *declare(StringRef name, Type *ret, ArrayRef<Type *> args)
@@ -209,6 +220,34 @@ private:
       return loadI32Global(dispatchArgsBase(), offset);
    }
 
+   Value *rayLaunchId()
+   {
+      Type *vecType = FixedVectorType::get(i32, 3);
+      if (noopRtIntrinsics)
+         return ConstantAggregateZero::get(vecType);
+      Value *vec = ConstantAggregateZero::get(vecType);
+      vec = builder.CreateInsertElement(
+         vec, callI32Intrinsic("llvm.riscv.workitem.id.x"), uint64_t(0));
+      vec = builder.CreateInsertElement(
+         vec, callI32Intrinsic("llvm.riscv.workitem.id.y"), uint64_t(1));
+      vec = builder.CreateInsertElement(
+         vec, callI32Intrinsic("llvm.riscv.workitem.id.z"), uint64_t(2));
+      return vec;
+   }
+
+   Value *rayLaunchSize()
+   {
+      Type *vecType = FixedVectorType::get(i32, 3);
+      Value *vec = ConstantAggregateZero::get(vecType);
+      vec = builder.CreateInsertElement(
+         vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
+      vec = builder.CreateInsertElement(
+         vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
+      vec = builder.CreateInsertElement(
+         vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
+      return vec;
+   }
+
    Value *descriptorAddressForBinding(uint32_t binding)
    {
       switch (binding) {
@@ -228,6 +267,13 @@ private:
       Value *addr32 = asInt32(addr);
       if (def->bit_size == 64)
          return builder.CreateZExt(addr32, i64);
+      if (def->num_components > 1) {
+         Value *vec =
+            Constant::getNullValue(FixedVectorType::get(i32, def->num_components));
+         vec = builder.Insert(InsertElementInst::Create(
+            vec, addr32, ConstantInt::get(i32, 0)));
+         return vec;
+      }
       return addr32;
    }
 
@@ -266,7 +312,7 @@ private:
          return loadScalar(0);
 
       Type *vecType = defType(def);
-      Value *vec = UndefValue::get(vecType);
+      Value *vec = ConstantAggregateZero::get(vecType);
       for (unsigned i = 0; i < def->num_components; ++i)
          vec = builder.CreateInsertElement(vec, loadScalar(i), uint64_t(i));
       return vec;
@@ -327,8 +373,11 @@ private:
       auto allocVar = [&](nir_variable *var) {
          if (!var || variables.count(var))
             return;
-         variables[var] = builder.CreateAlloca(i32, nullptr,
-                                               var->name ? var->name : "nir.var");
+         AllocaInst *alloca =
+            builder.CreateAlloca(FixedVectorType::get(i32, 4), nullptr,
+                                 var->name ? var->name : "nir.var");
+         alloca->setAlignment(Align(16));
+         variables[var] = alloca;
       };
 
       nir_foreach_variable_in_shader(var, shader)
@@ -387,9 +436,37 @@ private:
 
    Value *component(Value *v, unsigned idx)
    {
-      if (isa<FixedVectorType>(v->getType()))
+      if (auto *vecType = dyn_cast<FixedVectorType>(v->getType())) {
+         unsigned count = vecType->getNumElements();
+         if (idx >= count)
+            idx = count - 1;
          return builder.CreateExtractElement(v, uint64_t(idx));
+      }
       return v;
+   }
+
+   AllocaInst *entryAlloca(Type *type, StringRef name, Align align)
+   {
+      Function *fn = builder.GetInsertBlock()->getParent();
+      IRBuilder<> entryBuilder(&fn->getEntryBlock(),
+                               fn->getEntryBlock().getFirstInsertionPt());
+      AllocaInst *alloca = entryBuilder.CreateAlloca(type, nullptr, name);
+      alloca->setAlignment(align);
+      return alloca;
+   }
+
+   Value *reinterpretI32AsF32(Value *v)
+   {
+      if (auto *constant = dyn_cast<Constant>(v))
+         return ConstantExpr::getBitCast(constant, f32);
+      return builder.CreateBitCast(v, f32);
+   }
+
+   Value *reinterpretF32AsI32(Value *v)
+   {
+      if (auto *constant = dyn_cast<Constant>(v))
+         return ConstantExpr::getBitCast(constant, i32);
+      return builder.CreateBitCast(v, i32);
    }
 
    Value *aluSrcScalar(nir_alu_instr *alu, unsigned srcIdx, unsigned componentIdx = 0)
@@ -405,7 +482,7 @@ private:
          return component(src, alu->src[srcIdx].swizzle[0]);
 
       Type *scalar = component(src, alu->src[srcIdx].swizzle[0])->getType();
-      Value *vec = UndefValue::get(FixedVectorType::get(scalar, components));
+      Value *vec = ConstantAggregateZero::get(FixedVectorType::get(scalar, components));
       for (unsigned i = 0; i < components; ++i)
          vec = builder.CreateInsertElement(
             vec, component(src, alu->src[srcIdx].swizzle[i]), uint64_t(i));
@@ -432,7 +509,7 @@ private:
       if (v->getType()->isFloatingPointTy())
          return v;
       if (v->getType()->isIntegerTy(32))
-         return builder.CreateBitCast(v, f32);
+         return reinterpretI32AsF32(v);
       return UndefValue::get(f32);
    }
 
@@ -440,8 +517,10 @@ private:
    {
       if (v->getType()->isIntegerTy(32))
          return v;
+      if (isa<FixedVectorType>(v->getType()))
+         return asInt32(component(v, 0));
       if (v->getType()->isFloatingPointTy())
-         return builder.CreateBitCast(v, i32);
+         return reinterpretF32AsI32(v);
       if (v->getType()->isIntegerTy())
          return builder.CreateZExtOrTrunc(v, i32);
       if (v->getType()->isPointerTy())
@@ -456,6 +535,91 @@ private:
       if (v->getType()->isIntegerTy())
          return builder.CreateZExtOrTrunc(v, i64);
       return builder.CreateZExt(asInt32(v), i64);
+   }
+
+   Value *asSignedInt64(Value *v)
+   {
+      if (v->getType()->isIntegerTy(64))
+         return v;
+      if (v->getType()->isIntegerTy())
+         return builder.CreateSExtOrTrunc(v, i64);
+      return builder.CreateSExt(asInt32(v), i64);
+   }
+
+   Value *asInteger(Value *v, unsigned bits, bool isSigned = false)
+   {
+      if (bits == 64)
+         return isSigned ? asSignedInt64(v) : asInt64(v);
+      return asInt32(v);
+   }
+
+   Value *asStorageBits(Value *v)
+   {
+      if (auto *vecType = dyn_cast<FixedVectorType>(v->getType())) {
+         unsigned count = vecType->getNumElements();
+         Value *bits = ConstantAggregateZero::get(FixedVectorType::get(i32, count));
+         for (unsigned i = 0; i < count; ++i)
+            bits = builder.CreateInsertElement(bits, asInt32(component(v, i)),
+                                               uint64_t(i));
+         return bits;
+      }
+      return asInt32(v);
+   }
+
+   Value *buildVector(unsigned components, Type *scalarType,
+                      const std::function<Value *(unsigned)> &element)
+   {
+      if (components <= 1)
+         return element(0);
+
+      Value *vec =
+         Constant::getNullValue(FixedVectorType::get(scalarType, components));
+      for (unsigned i = 0; i < components; ++i)
+         vec = builder.Insert(InsertElementInst::Create(
+            vec, element(i), ConstantInt::get(i32, i)));
+      return vec;
+   }
+
+   Value *floatResult(const nir_def *def,
+                      const std::function<Value *(unsigned)> &element)
+   {
+      if (def->num_components <= 1)
+         return element(0);
+
+      return buildVector(def->num_components, i32, [&](unsigned i) {
+         return asInt32(element(i));
+      });
+   }
+
+   Value *intResult(const nir_def *def,
+                    const std::function<Value *(unsigned)> &element)
+   {
+      Type *scalar = scalarType(def->bit_size);
+      return buildVector(def->num_components, scalar, [&](unsigned i) {
+         return asInteger(element(i), def->bit_size);
+      });
+   }
+
+   Value *boolResult(const nir_def *def,
+                     const std::function<Value *(unsigned)> &element)
+   {
+      Type *scalar = def->bit_size == 1 ? i1 : i32;
+      return buildVector(def->num_components, scalar, [&](unsigned i) {
+         Value *v = element(i);
+         if (def->bit_size == 1)
+            return asBool(v);
+         return builder.CreateZExtOrTrunc(asBool(v), i32);
+      });
+   }
+
+   Function *unaryFloatIntrinsic(StringRef name)
+   {
+      return declare(("llvm." + name + ".f32").str(), f32, {f32});
+   }
+
+   Value *sqrtF32(Value *v)
+   {
+      return builder.CreateCall(unaryFloatIntrinsic("sqrt"), {asFloat(v)});
    }
 
    Value *byteComponent(Value *v)
@@ -484,12 +648,10 @@ private:
       Value *x = asInt32(component(coord, 0));
       Value *y = isa<FixedVectorType>(coord->getType()) ?
          asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
-      Value *offset =
-         builder.CreateAdd(builder.CreateMul(y, stride),
-                           builder.CreateMul(x, ConstantInt::get(i32, 4)));
-      Value *addr = builder.CreateAdd(imageBase, offset);
-      StoreInst *store = builder.CreateStore(packRGBA8(rgba), globalPtr(addr));
-      store->setAlignment(Align(4));
+      Function *fn = declare("llvm.riscv.ventus.image.store.rgba8",
+                             builder.getVoidTy(),
+                             {i32, i32, i32, i32, i32});
+      builder.CreateCall(fn, {imageBase, x, y, stride, packRGBA8(rgba)});
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
@@ -507,101 +669,325 @@ private:
    Value *lowerDeref(nir_deref_instr *deref)
    {
       if (deref->deref_type == nir_deref_type_var && deref->var) {
+         derefVars[&deref->def] = deref->var;
          auto it = variables.find(deref->var);
          if (it != variables.end())
             return it->second;
       }
 
-      if (deref->deref_type != nir_deref_type_var)
-         return value(deref->parent);
+      switch (deref->deref_type) {
+      case nir_deref_type_cast:
+         return asInt32(value(deref->parent));
+      case nir_deref_type_struct: {
+         Value *base = asInt32(value(deref->parent));
+         nir_deref_instr *parent = nir_deref_instr_parent(deref);
+         int offset = parent ? glsl_get_struct_field_offset(parent->type,
+                                                            deref->strct.index)
+                             : -1;
+         if (offset > 0)
+            base = builder.CreateAdd(base, ConstantInt::get(i32, offset));
+         return base;
+      }
+      case nir_deref_type_array:
+      case nir_deref_type_ptr_as_array: {
+         Value *base = asInt32(value(deref->parent));
+         unsigned stride = nir_deref_instr_array_stride(deref);
+         Value *index = asInt32(value(deref->arr.index));
+         if (stride)
+            base = builder.CreateAdd(
+               base, builder.CreateMul(index, ConstantInt::get(i32, stride)));
+         return base;
+      }
+      case nir_deref_type_array_wildcard:
+         return asInt32(value(deref->parent));
+      default:
+         break;
+      }
 
       return UndefValue::get(PointerType::get(context, 0));
    }
 
    Value *lowerAlu(nir_alu_instr *alu)
    {
-      auto src = [&](unsigned idx) { return aluSrcScalar(alu, idx); };
+      auto src = [&](unsigned idx, unsigned component = 0) {
+         return aluSrcScalar(alu, idx, component);
+      };
+      auto intBin = [&](const std::function<Value *(Value *, Value *)> &op) {
+         unsigned bits = alu->def.bit_size == 64 ? 64 : 32;
+         return intResult(&alu->def, [&](unsigned i) {
+            return op(asInteger(src(0, i), bits), asInteger(src(1, i), bits));
+         });
+      };
+      auto floatBin = [&](const std::function<Value *(Value *, Value *)> &op) {
+         return floatResult(&alu->def, [&](unsigned i) {
+            return op(asFloat(src(0, i)), asFloat(src(1, i)));
+         });
+      };
+      auto cmpBin = [&](const std::function<Value *(Value *, Value *)> &op,
+                        bool floatSources) {
+         return boolResult(&alu->def, [&](unsigned i) {
+            Value *lhs = floatSources ? asFloat(src(0, i)) : asInt32(src(0, i));
+            Value *rhs = floatSources ? asFloat(src(1, i)) : asInt32(src(1, i));
+            return op(lhs, rhs);
+         });
+      };
 
       switch (alu->op) {
       case nir_op_mov:
          return aluSrcVector(alu, 0, alu->def.num_components);
       case nir_op_iadd:
-         return builder.CreateAdd(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateAdd(a, b); });
       case nir_op_isub:
-         return builder.CreateSub(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateSub(a, b); });
       case nir_op_imul:
-         return builder.CreateMul(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateMul(a, b); });
       case nir_op_iand:
-         return builder.CreateAnd(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateAnd(a, b); });
       case nir_op_ior:
-         return builder.CreateOr(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateOr(a, b); });
       case nir_op_ixor:
-         return builder.CreateXor(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateXor(a, b); });
       case nir_op_ishl:
-         return builder.CreateShl(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateShl(a, b); });
       case nir_op_ushr:
-         return builder.CreateLShr(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateLShr(a, b); });
       case nir_op_ishr:
-         return builder.CreateAShr(asInt32(src(0)), asInt32(src(1)));
+         return intBin([&](Value *a, Value *b) { return builder.CreateAShr(a, b); });
       case nir_op_fadd:
-         return builder.CreateFAdd(asFloat(src(0)), asFloat(src(1)));
+         return floatBin([&](Value *a, Value *b) { return builder.CreateFAdd(a, b); });
       case nir_op_fsub:
-         return builder.CreateFSub(asFloat(src(0)), asFloat(src(1)));
+         return floatBin([&](Value *a, Value *b) { return builder.CreateFSub(a, b); });
       case nir_op_fmul:
-         return builder.CreateFMul(asFloat(src(0)), asFloat(src(1)));
+         return floatBin([&](Value *a, Value *b) { return builder.CreateFMul(a, b); });
       case nir_op_fdiv:
-         return builder.CreateFDiv(asFloat(src(0)), asFloat(src(1)));
+         return floatBin([&](Value *a, Value *b) { return builder.CreateFDiv(a, b); });
       case nir_op_fneg:
-         return builder.CreateFNeg(asFloat(src(0)));
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFNeg(asFloat(src(0, i)));
+         });
+      case nir_op_fabs:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateCall(unaryFloatIntrinsic("fabs"),
+                                      {asFloat(src(0, i))});
+         });
+      case nir_op_fsqrt:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return sqrtF32(src(0, i));
+         });
+      case nir_op_frsq:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFDiv(ConstantFP::get(f32, 1.0),
+                                      sqrtF32(src(0, i)));
+         });
+      case nir_op_frcp:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFDiv(ConstantFP::get(f32, 1.0),
+                                      asFloat(src(0, i)));
+         });
+      case nir_op_ffma:
+      case nir_op_ffma_weak:
+      case nir_op_fmad:
+      case nir_op_fmadz:
+      case nir_op_ffmaz:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFAdd(
+               builder.CreateFMul(asFloat(src(0, i)), asFloat(src(1, i))),
+               asFloat(src(2, i)));
+         });
+      case nir_op_flrp:
+         return floatResult(&alu->def, [&](unsigned i) {
+            Value *t = asFloat(src(2, i));
+            return builder.CreateFAdd(
+               builder.CreateFMul(asFloat(src(0, i)),
+                                  builder.CreateFSub(ConstantFP::get(f32, 1.0), t)),
+               builder.CreateFMul(asFloat(src(1, i)), t));
+         });
+      case nir_op_fmin:
+         return floatBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateFCmpOLT(a, b), a, b);
+         });
+      case nir_op_fmax:
+         return floatBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateFCmpOGT(a, b), a, b);
+         });
+      case nir_op_imin:
+         return intBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateICmpSLT(a, b), a, b);
+         });
+      case nir_op_imax:
+         return intBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateICmpSGT(a, b), a, b);
+         });
+      case nir_op_umin:
+         return intBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateICmpULT(a, b), a, b);
+         });
+      case nir_op_umax:
+         return intBin([&](Value *a, Value *b) {
+            return builder.CreateSelect(builder.CreateICmpUGT(a, b), a, b);
+         });
       case nir_op_feq:
-         return builder.CreateFCmpOEQ(asFloat(src(0)), asFloat(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpOEQ(a, b);
+         }, true);
       case nir_op_fneu:
-         return builder.CreateFCmpONE(asFloat(src(0)), asFloat(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpONE(a, b);
+         }, true);
       case nir_op_flt:
-         return builder.CreateFCmpOLT(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_slt:
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpOLT(a, b);
+         }, true);
       case nir_op_fge:
-         return builder.CreateFCmpOGE(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_sge:
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpOGE(a, b);
+         }, true);
+      case nir_op_seq:
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpOEQ(a, b);
+         }, true);
+      case nir_op_sne:
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateFCmpONE(a, b);
+         }, true);
       case nir_op_ieq:
-         return builder.CreateICmpEQ(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpEQ(a, b);
+         }, false);
       case nir_op_ine:
-         return builder.CreateICmpNE(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpNE(a, b);
+         }, false);
       case nir_op_ilt:
-         return builder.CreateICmpSLT(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpSLT(a, b);
+         }, false);
       case nir_op_ige:
-         return builder.CreateICmpSGE(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpSGE(a, b);
+         }, false);
       case nir_op_ult:
-         return builder.CreateICmpULT(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpULT(a, b);
+         }, false);
       case nir_op_uge:
-         return builder.CreateICmpUGE(asInt32(src(0)), asInt32(src(1)));
+         return cmpBin([&](Value *a, Value *b) {
+            return builder.CreateICmpUGE(a, b);
+         }, false);
+      case nir_op_b2i32:
+         return intResult(&alu->def, [&](unsigned i) {
+            return builder.CreateZExt(asBool(src(0, i)), i32);
+         });
+      case nir_op_b2f32:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateSelect(asBool(src(0, i)),
+                                        ConstantFP::get(f32, 1.0),
+                                        ConstantFP::get(f32, 0.0));
+         });
       case nir_op_u2f32:
-         return builder.CreateUIToFP(asInt32(src(0)), f32);
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateUIToFP(asInt32(src(0, i)), f32);
+         });
       case nir_op_f2u32:
-         return builder.CreateFPToUI(asFloat(src(0)), i32);
+         return intResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFPToUI(asFloat(src(0, i)), i32);
+         });
       case nir_op_i2f32:
-         return builder.CreateSIToFP(asInt32(src(0)), f32);
+         return floatResult(&alu->def, [&](unsigned i) {
+            return builder.CreateSIToFP(asInt32(src(0, i)), f32);
+         });
       case nir_op_f2i32:
-         return builder.CreateFPToSI(asFloat(src(0)), i32);
+         return intResult(&alu->def, [&](unsigned i) {
+            return builder.CreateFPToSI(asFloat(src(0, i)), i32);
+         });
+      case nir_op_f2f32:
+         return floatResult(&alu->def, [&](unsigned i) {
+            return asFloat(src(0, i));
+         });
+      case nir_op_i2i32:
+         return intResult(&alu->def, [&](unsigned i) {
+            return asInt32(src(0, i));
+         });
+      case nir_op_u2u32:
+         return intResult(&alu->def, [&](unsigned i) {
+            return asInt32(src(0, i));
+         });
+      case nir_op_i2i64:
+         return intResult(&alu->def, [&](unsigned i) {
+            return asSignedInt64(src(0, i));
+         });
+      case nir_op_u2u64:
+         return intResult(&alu->def, [&](unsigned i) {
+            return asInt64(src(0, i));
+         });
       case nir_op_unpack_64_2x32_split_x:
          return builder.CreateTrunc(asInt64(src(0)), i32);
       case nir_op_unpack_64_2x32_split_y:
          return builder.CreateTrunc(
-            builder.CreateLShr(asInt64(src(0)), ConstantInt::get(i64, 32)), i32);
+            builder.CreateLShr(asInt64(src(0)), ConstantInt::get(i64, 32)),
+            i32);
       case nir_op_pack_64_2x32_split:
          return builder.CreateOr(builder.CreateZExt(asInt32(src(0)), i64),
                                  builder.CreateShl(builder.CreateZExt(asInt32(src(1)), i64),
                                                    ConstantInt::get(i64, 32)));
       case nir_op_bcsel:
-         return builder.CreateSelect(asBool(src(0)), src(1), src(2));
+         if (alu->def.num_components <= 1)
+            return builder.CreateSelect(asBool(src(0)), src(1), src(2));
+         return buildVector(alu->def.num_components, i32, [&](unsigned i) {
+            return asInt32(builder.CreateSelect(asBool(src(0, i)), src(1, i),
+                                                src(2, i)));
+         });
+      case nir_op_fdot2:
+      case nir_op_fdot2_replicated:
+      case nir_op_fdot3:
+      case nir_op_fdot3_replicated:
+      case nir_op_fdot4:
+      case nir_op_fdot4_replicated: {
+         unsigned count = alu->op == nir_op_fdot2 ||
+                                 alu->op == nir_op_fdot2_replicated
+                             ? 2
+                             : alu->op == nir_op_fdot3 ||
+                                      alu->op == nir_op_fdot3_replicated
+                                  ? 3
+                                  : 4;
+         Value *sum = ConstantFP::get(f32, 0.0);
+         for (unsigned i = 0; i < count; ++i)
+            sum = builder.CreateFAdd(
+               sum,
+               builder.CreateFMul(asFloat(src(0, i)), asFloat(src(1, i))));
+         if (alu->op == nir_op_fdot2_replicated ||
+             alu->op == nir_op_fdot3_replicated ||
+             alu->op == nir_op_fdot4_replicated)
+            return floatResult(&alu->def, [&](unsigned) { return sum; });
+         return sum;
+      }
+      case nir_op_fdph:
+      case nir_op_fdph_replicated: {
+         Value *sum = ConstantFP::get(f32, 0.0);
+         for (unsigned i = 0; i < 3; ++i)
+            sum = builder.CreateFAdd(
+               sum,
+               builder.CreateFMul(asFloat(src(0, i)), asFloat(src(1, i))));
+         sum = builder.CreateFAdd(sum, asFloat(src(1, 3)));
+         if (alu->op == nir_op_fdph_replicated)
+            return floatResult(&alu->def, [&](unsigned) { return sum; });
+         return sum;
+      }
       case nir_op_vec2:
       case nir_op_vec3:
       case nir_op_vec4: {
          unsigned count = alu->op == nir_op_vec2 ? 2 : alu->op == nir_op_vec3 ? 3 : 4;
-         Value *vec = UndefValue::get(FixedVectorType::get(i32, count));
+         Value *vec = ConstantAggregateZero::get(FixedVectorType::get(i32, count));
          for (unsigned i = 0; i < count; ++i)
             vec = builder.CreateInsertElement(vec, asInt32(src(i)), i);
          return vec;
       }
       default:
+         if (debugLowering)
+            fprintf(stderr, "ventus-nir-to-llvm: unsupported ALU op %s\n",
+                    nir_op_infos[alu->op].name);
          return undefFor(&alu->def);
       }
    }
@@ -610,28 +996,10 @@ private:
    {
       switch (intrin->intrinsic) {
       case nir_intrinsic_load_ray_launch_id: {
-         Type *vecType = FixedVectorType::get(i32, 3);
-         if (noopRtIntrinsics)
-            return ConstantAggregateZero::get(vecType);
-         Value *vec = UndefValue::get(vecType);
-         vec = builder.CreateInsertElement(
-            vec, callI32Intrinsic("llvm.riscv.workitem.id.x"), uint64_t(0));
-         vec = builder.CreateInsertElement(
-            vec, callI32Intrinsic("llvm.riscv.workitem.id.y"), uint64_t(1));
-         vec = builder.CreateInsertElement(
-            vec, callI32Intrinsic("llvm.riscv.workitem.id.z"), uint64_t(2));
-         return vec;
+         return rayLaunchId();
       }
       case nir_intrinsic_load_ray_launch_size: {
-         Type *vecType = FixedVectorType::get(i32, 3);
-         Value *vec = UndefValue::get(vecType);
-         vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
-         vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
-         vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
-         return vec;
+         return rayLaunchSize();
       }
       case nir_intrinsic_vulkan_resource_index: {
          return ConstantInt::get(i32, nir_intrinsic_binding(intrin));
@@ -662,7 +1030,7 @@ private:
       case nir_intrinsic_image_deref_size:
       case nir_intrinsic_image_size: {
          Type *vecType = FixedVectorType::get(i32, 3);
-         Value *vec = UndefValue::get(vecType);
+         Value *vec = ConstantAggregateZero::get(vecType);
          vec = builder.CreateInsertElement(
             vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
          vec = builder.CreateInsertElement(
@@ -672,15 +1040,31 @@ private:
          return vec;
       }
       case nir_intrinsic_load_deref: {
+         if (intrin->src[0].ssa) {
+            auto varIt = derefVars.find(intrin->src[0].ssa);
+            if (varIt != derefVars.end()) {
+               const nir_variable *var = varIt->second;
+               if (var->data.mode == nir_var_system_value) {
+                  switch (var->data.location) {
+                  case SYSTEM_VALUE_RAY_LAUNCH_ID:
+                     return rayLaunchId();
+                  case SYSTEM_VALUE_RAY_LAUNCH_SIZE:
+                     return rayLaunchSize();
+                  default:
+                     break;
+                  }
+               }
+            }
+         }
          Value *ptr = value(intrin->src[0]);
          if (!ptr->getType()->isPointerTy())
-            return undefFor(&intrin->def);
+            return loadGlobalForDef(ptr, ConstantInt::get(i32, 0), &intrin->def);
          return builder.CreateLoad(defType(&intrin->def), ptr);
       }
       case nir_intrinsic_store_deref: {
          Value *ptr = value(intrin->src[0]);
          if (ptr->getType()->isPointerTy())
-            builder.CreateStore(value(intrin->src[1]), ptr);
+            builder.CreateStore(asStorageBits(value(intrin->src[1])), ptr);
          return nullptr;
       }
       case nir_intrinsic_load_shared: {
@@ -746,7 +1130,7 @@ private:
          break;
       }
       case nir_instr_type_undef:
-         result = undefFor(&nir_instr_as_undef(instr)->def);
+         result = zeroFor(&nir_instr_as_undef(instr)->def);
          def = &nir_instr_as_undef(instr)->def;
          break;
       case nir_instr_type_phi:

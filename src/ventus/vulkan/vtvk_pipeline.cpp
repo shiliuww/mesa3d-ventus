@@ -35,8 +35,18 @@
 #ifdef Status
 #undef Status
 #endif
+#ifdef True
+#undef True
+#endif
+#ifdef False
+#undef False
+#endif
 
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -67,6 +77,7 @@ struct vtvk_pipeline {
 
    llvm::Module *llvm_module;
    char *generated_kernel_path;
+   uint64_t generated_kernel_entry;
 };
 
 struct vtvk_acceleration_structure {
@@ -371,7 +382,7 @@ vtvk_write_rt_linker_script(const std::string &path)
 
    static const char script[] =
       "OUTPUT_ARCH(riscv)\n"
-      "ENTRY(main)\n"
+      "ENTRY(_start)\n"
       "PHDRS { text PT_LOAD FLAGS(5); data PT_LOAD FLAGS(6); }\n"
       "SECTIONS {\n"
       "  . = 0x80000000;\n"
@@ -383,9 +394,9 @@ vtvk_write_rt_linker_script(const std::string &path)
       "  . = ALIGN(16);\n"
       "  .data : {\n"
       "    *(.data .data.*) *(.sdata .sdata.*)\n"
-      "    . = ALIGN(8);\n"
-      "    tohost = .; QUAD(0); fromhost = .; QUAD(0);\n"
       "  } :data\n"
+      "  . = ALIGN(64);\n"
+      "  .tohost : { *(.tohost .tohost.*) } :data\n"
       "  . = ALIGN(16);\n"
       "  .bss : { *(.bss .bss.*) *(COMMON) } :data\n"
       "}\n";
@@ -422,22 +433,137 @@ vtvk_llvm_tool_env_prefix(void)
 }
 
 static bool
-vtvk_dump_rt_llvm_module(struct vtvk_pipeline *pipeline, std::string *ll_path)
+vtvk_dump_rt_llvm_module_to(struct vtvk_pipeline *pipeline,
+                            const std::string &ll_path,
+                            const char *label)
 {
-   std::string base = vtvk_rt_artifact_base();
-   *ll_path = base + ".ll";
-
    std::error_code ec;
-   llvm::raw_fd_ostream os(*ll_path, ec, llvm::sys::fs::OF_Text);
+   llvm::raw_fd_ostream os(ll_path, ec, llvm::sys::fs::OF_Text);
    if (ec) {
       mesa_loge("ventus-vk: failed to dump RT LLVM module %s: %s",
-                ll_path->c_str(), ec.message().c_str());
+                ll_path.c_str(), ec.message().c_str());
       return false;
    }
 
    pipeline->llvm_module->print(os, nullptr);
    os.flush();
-   mesa_logi("ventus-vk: dumped RT LLVM module to %s", ll_path->c_str());
+   mesa_logi("ventus-vk: dumped %s RT LLVM module to %s", label,
+             ll_path.c_str());
+   return true;
+}
+
+static bool
+vtvk_dump_rt_llvm_module(struct vtvk_pipeline *pipeline, std::string *ll_path)
+{
+   std::string base = vtvk_rt_artifact_base();
+   *ll_path = base + ".ll";
+   return vtvk_dump_rt_llvm_module_to(pipeline, *ll_path, "pre-lowering");
+}
+
+static bool
+vtvk_find_crt0(std::string *path)
+{
+   const char *env_path = getenv("VENTUS_VK_CRT0");
+   if (env_path && env_path[0]) {
+      if (llvm::sys::fs::exists(env_path)) {
+         *path = env_path;
+         return true;
+      }
+      mesa_loge("ventus-vk: VENTUS_VK_CRT0 does not exist: %s", env_path);
+      return false;
+   }
+
+   static const char *candidates[] = {
+      "/home/guanys/ventus-env/llvm/install/lib/crt0.o",
+      "/home/guanys/ventus-env/llvm/build-libclc/lib/crt0.o",
+      "/home/guanys/ventus-env/llvm/build-libclc/riscv32/lib/CMakeFiles/ctr0_obj.dir/crt0.S.o",
+   };
+
+   for (const char *candidate : candidates) {
+      if (llvm::sys::fs::exists(candidate)) {
+         *path = candidate;
+         return true;
+      }
+   }
+
+   mesa_loge("ventus-vk: RT ELF needs Ventus crt0.o startup; set "
+             "VENTUS_VK_CRT0 or build LLVM libclc");
+   return false;
+}
+
+static bool
+vtvk_dump_rt_emit_llvm_module(struct vtvk_pipeline *pipeline,
+                              const std::string &ll_path,
+                              std::string *emit_ll_path)
+{
+   *emit_ll_path = ll_path.substr(0, ll_path.size() - 3) + ".emit.ll";
+   return vtvk_dump_rt_llvm_module_to(pipeline, *emit_ll_path, "ELF-input");
+}
+
+static bool
+vtvk_rt_elf_link_command(const std::string &tool_env, const char *ld_lld,
+                         const std::string &ld_path,
+                         const std::string &elf_path,
+                         const std::string &crt0_path,
+                         const std::string &obj_path,
+                         std::string *link_cmd)
+{
+   *link_cmd = tool_env + vtvk_shell_quote(ld_lld) + " -T " +
+               vtvk_shell_quote(ld_path.c_str()) + " -o " +
+               vtvk_shell_quote(elf_path.c_str()) + " " +
+               vtvk_shell_quote(crt0_path.c_str()) + " " +
+               vtvk_shell_quote(obj_path.c_str());
+   return true;
+}
+
+static const char *
+vtvk_llvm_nm_path(void)
+{
+   const char *llvm_nm = getenv("VENTUS_VK_LLVM_NM");
+   if (!llvm_nm || !llvm_nm[0])
+      llvm_nm = "/home/guanys/ventus-env/llvm/build/bin/llvm-nm";
+   return llvm_nm;
+}
+
+static bool
+vtvk_read_elf_symbol(const std::string &elf_path, const char *symbol,
+                     uint64_t *addr)
+{
+   std::string cmd = vtvk_llvm_tool_env_prefix() +
+                     vtvk_shell_quote(vtvk_llvm_nm_path()) +
+                     " --defined-only " + vtvk_shell_quote(elf_path.c_str());
+   FILE *pipe = popen(cmd.c_str(), "r");
+   if (!pipe) {
+      mesa_loge("ventus-vk: failed to run llvm-nm for %s", elf_path.c_str());
+      return false;
+   }
+
+   char line[512];
+   bool found = false;
+   while (fgets(line, sizeof(line), pipe)) {
+      unsigned long long value = 0;
+      char type = 0;
+      char name[256] = {};
+      if (sscanf(line, "%llx %c %255s", &value, &type, name) == 3 &&
+          strcmp(name, symbol) == 0) {
+         *addr = value;
+         found = true;
+         break;
+      }
+   }
+
+   int ret = pclose(pipe);
+   if (ret != 0) {
+      mesa_loge("ventus-vk: llvm-nm failed with status %d: %s", ret,
+                cmd.c_str());
+      return false;
+   }
+   if (!found) {
+      mesa_loge("ventus-vk: symbol %s not found in %s", symbol,
+                elf_path.c_str());
+      return false;
+   }
+
    return true;
 }
 
@@ -456,6 +582,8 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
    std::string obj_path = ll_path.substr(0, ll_path.size() - 3) + ".o";
    std::string elf_path = ll_path.substr(0, ll_path.size() - 3) + ".riscv";
    std::string ld_path = ll_path.substr(0, ll_path.size() - 3) + ".ld";
+   std::string emit_ll_path;
+   std::string crt0_path;
    const char *llc = getenv("VENTUS_VK_LLC");
    const char *ld_lld = getenv("VENTUS_VK_LD_LLD");
    if (!llc || !llc[0])
@@ -465,27 +593,39 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
 
    if (!vtvk_write_rt_linker_script(ld_path))
       return;
+   if (!vtvk_find_crt0(&crt0_path))
+      return;
+
+   if (!vtvk_dump_rt_emit_llvm_module(pipeline, ll_path, &emit_ll_path))
+      return;
 
    std::string tool_env = vtvk_llvm_tool_env_prefix();
    std::string llc_cmd = tool_env + vtvk_shell_quote(llc) +
                          " -mtriple=riscv32-unknown-elf"
-                         " -mattr=+m,+a,+f,+d,+c,+v,+zfh"
+                         " -target-abi=ilp32"
+                         " -mattr=+m,+a,+f,+d,+v,+zfh"
                          " -filetype=obj " +
-                         vtvk_shell_quote(ll_path.c_str()) + " -o " +
+                         vtvk_shell_quote(emit_ll_path.c_str()) + " -o " +
                          vtvk_shell_quote(obj_path.c_str());
    if (!vtvk_run_tool(llc_cmd, "llc"))
       return;
 
-   std::string link_cmd = tool_env + vtvk_shell_quote(ld_lld) + " -T " +
-                          vtvk_shell_quote(ld_path.c_str()) + " -o " +
-                          vtvk_shell_quote(elf_path.c_str()) + " " +
-                          vtvk_shell_quote(obj_path.c_str());
+   std::string link_cmd;
+   if (!vtvk_rt_elf_link_command(tool_env, ld_lld, ld_path, elf_path, crt0_path,
+                                 obj_path, &link_cmd))
+      return;
    if (!vtvk_run_tool(link_cmd, "link"))
+      return;
+
+   uint64_t kernel_entry = 0;
+   if (!vtvk_read_elf_symbol(elf_path, "main", &kernel_entry))
       return;
 
    free(pipeline->generated_kernel_path);
    pipeline->generated_kernel_path = strdup(elf_path.c_str());
-   mesa_logi("ventus-vk: emitted RT RISC-V kernel to %s", elf_path.c_str());
+   pipeline->generated_kernel_entry = kernel_entry;
+   mesa_logi("ventus-vk: emitted RT RISC-V kernel to %s entry=0x%" PRIx64,
+             elf_path.c_str(), kernel_entry);
 }
 
 struct vtvk_driver_kernel_metadata {
@@ -855,7 +995,9 @@ vtvk_driver_trace_rays(
       goto out;
    }
 
-   metadata[VTVK_KNL_ENTRY / 4] = 0x80000000u;
+   metadata[VTVK_KNL_ENTRY / 4] =
+      pipeline->generated_kernel_entry ? (uint32_t)pipeline->generated_kernel_entry
+                                       : 0x80000000u;
    metadata[VTVK_KNL_ARG_BASE / 4] = (uint32_t)args_dev_addr;
    metadata[VTVK_KNL_WORK_DIM / 4] = depth > 1 ? 3 : height > 1 ? 2 : 1;
    metadata[VTVK_KNL_GL_SIZE_X / 4] = width;
@@ -1012,6 +1154,8 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
 
    NIR_PASS(_, *nir_out, vt_nir_lower_rt_abi, &config);
    nir_validate_shader(*nir_out, "after Ventus RT lowering");
+   if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
+      nir_print_shader(*nir_out, stderr);
 
    return VK_SUCCESS;
 }

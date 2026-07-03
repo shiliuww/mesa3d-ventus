@@ -61,16 +61,8 @@ vt_nir_scratchpad_base(nir_builder *b,
                        const struct vt_nir_rt_config *config,
                        enum vt_rt_shader_layout layout)
 {
-   nir_def *launch_id = nir_load_ray_launch_id(b);
-   nir_def *launch_size = nir_load_ray_launch_size(b);
-   nir_def *x = nir_channel(b, launch_id, 0);
-   nir_def *y = nir_channel(b, launch_id, 1);
-   nir_def *width = nir_channel(b, launch_size, 0);
-   nir_def *linear_id = nir_iadd(b, x, nir_imul(b, y, width));
-
    const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return nir_iadd_imm(b, nir_imul_imm(b, linear_id, sp->stride_bytes),
-                       sp->base_bytes);
+   return nir_imm_int(b, sp->base_bytes);
 }
 
 nir_def *
