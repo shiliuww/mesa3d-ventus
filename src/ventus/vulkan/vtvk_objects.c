@@ -157,7 +157,12 @@ vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
       return NULL;
 
    VkDescriptorBufferInfo *info = &set->bindings[binding].buffer;
-   VkDeviceSize range = info->range == VK_WHOLE_SIZE ? 0 : info->range;
+   VkDeviceSize range = info->range;
+   if (range == VK_WHOLE_SIZE) {
+      struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)info->buffer);
+      range = buffer && info->offset <= buffer->size ?
+                 buffer->size - info->offset : 0;
+   }
    if (range_out)
       *range_out = range;
    return vtvk_buffer_host_ptr(info->buffer, info->offset, range);
