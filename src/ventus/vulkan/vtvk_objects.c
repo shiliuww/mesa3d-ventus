@@ -1,12 +1,11 @@
 #include "vtvk_private.h"
 
+#include <string.h>
+
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
+#include "vk_util.h"
 #include "vtvk_entrypoints.h"
-
-struct vtvk_cmd_buffer {
-   struct vk_command_buffer vk;
-};
 
 struct vtvk_memory {
    VkDeviceSize size;
@@ -15,10 +14,18 @@ struct vtvk_memory {
 
 struct vtvk_buffer {
    VkDeviceSize size;
+   VkDeviceMemory memory;
+   VkDeviceSize memory_offset;
+   void *map;
 };
 
 struct vtvk_image {
    VkExtent3D extent;
+   VkFormat format;
+   VkDeviceSize size;
+   VkDeviceMemory memory;
+   VkDeviceSize memory_offset;
+   void *map;
 };
 
 struct vtvk_image_view {
@@ -48,6 +55,12 @@ struct vtvk_descriptor_pool {
 
 struct vtvk_descriptor_set {
    VkDescriptorSetLayout layout;
+   struct {
+      VkDescriptorType type;
+      VkAccelerationStructureKHR acceleration_structure;
+      VkDescriptorImageInfo image;
+      VkDescriptorBufferInfo buffer;
+   } bindings[VTVK_MAX_DESCRIPTOR_BINDINGS];
 };
 
 struct vtvk_swapchain {
@@ -65,6 +78,104 @@ static uint64_t
 vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
+}
+
+VkDeviceAddress
+vtvk_buffer_get_device_address(VkBuffer _buffer)
+{
+   struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)_buffer);
+   return buffer ? (VkDeviceAddress)(uintptr_t)buffer : 0;
+}
+
+void *
+vtvk_buffer_host_ptr(VkBuffer _buffer, VkDeviceSize offset, VkDeviceSize size)
+{
+   struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)_buffer);
+   if (!buffer || !buffer->map || offset > buffer->size)
+      return NULL;
+   if (size > buffer->size - offset)
+      return NULL;
+   return (uint8_t *)buffer->map + offset;
+}
+
+void *
+vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
+{
+   struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)address);
+   return vtvk_buffer_host_ptr((VkBuffer)(uintptr_t)buffer, 0, size);
+}
+
+VkPipeline
+vtvk_cmd_buffer_bound_rt_pipeline(VkCommandBuffer commandBuffer)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   return cmd ? cmd->bound_rt_pipeline : VK_NULL_HANDLE;
+}
+
+VkDescriptorSet
+vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
+                                     uint32_t set)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (!cmd || set >= VTVK_MAX_BOUND_DESCRIPTOR_SETS)
+      return VK_NULL_HANDLE;
+   return cmd->bound_descriptor_sets[set];
+}
+
+VkAccelerationStructureKHR
+vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
+                                           uint32_t binding)
+{
+   struct vtvk_descriptor_set *set =
+      vtvk_handle_to_ptr((uint64_t)descriptorSet);
+   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+      return VK_NULL_HANDLE;
+
+   return set->bindings[binding].acceleration_structure;
+}
+
+VkImage
+vtvk_descriptor_set_image(VkDescriptorSet descriptorSet, uint32_t binding)
+{
+   struct vtvk_descriptor_set *set =
+      vtvk_handle_to_ptr((uint64_t)descriptorSet);
+   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+      return VK_NULL_HANDLE;
+
+   struct vtvk_image_view *view =
+      vtvk_handle_to_ptr((uint64_t)set->bindings[binding].image.imageView);
+   return view ? view->image : VK_NULL_HANDLE;
+}
+
+void *
+vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
+                               VkDeviceSize *range_out)
+{
+   struct vtvk_descriptor_set *set =
+      vtvk_handle_to_ptr((uint64_t)descriptorSet);
+   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+      return NULL;
+
+   VkDescriptorBufferInfo *info = &set->bindings[binding].buffer;
+   VkDeviceSize range = info->range == VK_WHOLE_SIZE ? 0 : info->range;
+   if (range_out)
+      *range_out = range;
+   return vtvk_buffer_host_ptr(info->buffer, info->offset, range);
+}
+
+void *
+vtvk_image_host_ptr(VkImage _image, VkExtent3D *extent_out,
+                    VkFormat *format_out)
+{
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)_image);
+   if (!image || !image->map)
+      return NULL;
+
+   if (extent_out)
+      *extent_out = image->extent;
+   if (format_out)
+      *format_out = image->format;
+   return image->map;
 }
 
 static void
@@ -228,6 +339,9 @@ vtvk_CreateImage(VkDevice _device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    image->extent = pCreateInfo->extent;
+   image->format = pCreateInfo->format;
+   image->size = (VkDeviceSize)image->extent.width * image->extent.height *
+                 image->extent.depth * 4;
    *pImage = (VkImage)vtvk_ptr_to_handle(image);
    return VK_SUCCESS;
 }
@@ -496,10 +610,52 @@ vtvk_UpdateDescriptorSets(VkDevice device,
                           const VkCopyDescriptorSet *pDescriptorCopies)
 {
    (void)device;
-   (void)descriptorWriteCount;
-   (void)pDescriptorWrites;
-   (void)descriptorCopyCount;
-   (void)pDescriptorCopies;
+   for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+      const VkWriteDescriptorSet *write = &pDescriptorWrites[i];
+      struct vtvk_descriptor_set *set =
+         vtvk_handle_to_ptr((uint64_t)write->dstSet);
+      if (!set || write->dstBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
+          write->descriptorCount == 0)
+         continue;
+
+      set->bindings[write->dstBinding].type = write->descriptorType;
+      switch (write->descriptorType) {
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+         const VkWriteDescriptorSetAccelerationStructureKHR *as_info =
+            vk_find_struct_const(write->pNext,
+                                 WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+         if (as_info && as_info->accelerationStructureCount)
+            set->bindings[write->dstBinding].acceleration_structure =
+               as_info->pAccelerationStructures[0];
+         break;
+      }
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         if (write->pImageInfo)
+            set->bindings[write->dstBinding].image = write->pImageInfo[0];
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         if (write->pBufferInfo)
+            set->bindings[write->dstBinding].buffer = write->pBufferInfo[0];
+         break;
+      default:
+         break;
+      }
+   }
+
+   for (uint32_t i = 0; i < descriptorCopyCount; i++) {
+      const VkCopyDescriptorSet *copy = &pDescriptorCopies[i];
+      struct vtvk_descriptor_set *src =
+         vtvk_handle_to_ptr((uint64_t)copy->srcSet);
+      struct vtvk_descriptor_set *dst =
+         vtvk_handle_to_ptr((uint64_t)copy->dstSet);
+      if (!src || !dst ||
+          copy->srcBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
+          copy->dstBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
+          copy->descriptorCount == 0)
+         continue;
+      dst->bindings[copy->dstBinding] = src->bindings[copy->srcBinding];
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -670,8 +826,9 @@ vtvk_GetImageMemoryRequirements2(
    const VkImageMemoryRequirementsInfo2 *pInfo,
    VkMemoryRequirements2 *pMemoryRequirements)
 {
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)pInfo->image);
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
-      .size = 4096,
+      .size = image ? image->size : 0,
       .alignment = 64,
       .memoryTypeBits = 1,
    };
@@ -682,6 +839,19 @@ vtvk_BindBufferMemory2(VkDevice device,
                        uint32_t bindInfoCount,
                        const VkBindBufferMemoryInfo *pBindInfos)
 {
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      struct vtvk_buffer *buffer =
+         vtvk_handle_to_ptr((uint64_t)pBindInfos[i].buffer);
+      struct vtvk_memory *mem =
+         vtvk_handle_to_ptr((uint64_t)pBindInfos[i].memory);
+
+      if (!buffer || !mem || pBindInfos[i].memoryOffset > mem->size)
+         return VK_ERROR_UNKNOWN;
+
+      buffer->memory = pBindInfos[i].memory;
+      buffer->memory_offset = pBindInfos[i].memoryOffset;
+      buffer->map = (uint8_t *)mem->map + pBindInfos[i].memoryOffset;
+   }
    return VK_SUCCESS;
 }
 
@@ -690,6 +860,22 @@ vtvk_BindImageMemory2(VkDevice device,
                       uint32_t bindInfoCount,
                       const VkBindImageMemoryInfo *pBindInfos)
 {
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      struct vtvk_image *image =
+         vtvk_handle_to_ptr((uint64_t)pBindInfos[i].image);
+      struct vtvk_memory *mem =
+         vtvk_handle_to_ptr((uint64_t)pBindInfos[i].memory);
+
+      if (!image || !mem || pBindInfos[i].memoryOffset > mem->size)
+         return VK_ERROR_UNKNOWN;
+
+      if (image->size > mem->size - pBindInfos[i].memoryOffset)
+         return VK_ERROR_UNKNOWN;
+
+      image->memory = pBindInfos[i].memory;
+      image->memory_offset = pBindInfos[i].memoryOffset;
+      image->map = (uint8_t *)mem->map + pBindInfos[i].memoryOffset;
+   }
    return VK_SUCCESS;
 }
 
@@ -746,9 +932,9 @@ vtvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
                      VkPipelineBindPoint pipelineBindPoint,
                      VkPipeline pipeline)
 {
-   (void)commandBuffer;
-   (void)pipelineBindPoint;
-   (void)pipeline;
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (cmd && pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+      cmd->bound_rt_pipeline = pipeline;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -761,14 +947,18 @@ vtvk_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
                            uint32_t dynamicOffsetCount,
                            const uint32_t *pDynamicOffsets)
 {
-   (void)commandBuffer;
-   (void)pipelineBindPoint;
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
    (void)layout;
-   (void)firstSet;
-   (void)descriptorSetCount;
-   (void)pDescriptorSets;
    (void)dynamicOffsetCount;
    (void)pDynamicOffsets;
+   if (!cmd || pipelineBindPoint != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+      return;
+
+   for (uint32_t i = 0; i < descriptorSetCount; i++) {
+      uint32_t set = firstSet + i;
+      if (set < VTVK_MAX_BOUND_DESCRIPTOR_SETS)
+         cmd->bound_descriptor_sets[set] = pDescriptorSets[i];
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -781,12 +971,37 @@ vtvk_CmdCopyImage(VkCommandBuffer commandBuffer,
                   const VkImageCopy *pRegions)
 {
    (void)commandBuffer;
-   (void)srcImage;
    (void)srcImageLayout;
-   (void)dstImage;
    (void)dstImageLayout;
-   (void)regionCount;
-   (void)pRegions;
+   struct vtvk_image *src = vtvk_handle_to_ptr((uint64_t)srcImage);
+   struct vtvk_image *dst = vtvk_handle_to_ptr((uint64_t)dstImage);
+   if (!src || !dst || !src->map || !dst->map)
+      return;
+
+   for (uint32_t r = 0; r < regionCount; r++) {
+      const VkImageCopy *region = &pRegions[r];
+      uint32_t width = region->extent.width;
+      uint32_t height = region->extent.height;
+      uint32_t depth = region->extent.depth ? region->extent.depth : 1;
+
+      for (uint32_t z = 0; z < depth; z++) {
+         for (uint32_t y = 0; y < height; y++) {
+            VkDeviceSize src_offset =
+               (((VkDeviceSize)(region->srcOffset.z + z) * src->extent.height +
+                 (region->srcOffset.y + y)) * src->extent.width +
+                region->srcOffset.x) * 4;
+            VkDeviceSize dst_offset =
+               (((VkDeviceSize)(region->dstOffset.z + z) * dst->extent.height +
+                 (region->dstOffset.y + y)) * dst->extent.width +
+                region->dstOffset.x) * 4;
+            VkDeviceSize bytes = (VkDeviceSize)width * 4;
+            if (src_offset + bytes <= src->size &&
+                dst_offset + bytes <= dst->size)
+               memcpy((uint8_t *)dst->map + dst_offset,
+                      (uint8_t *)src->map + src_offset, bytes);
+         }
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -797,10 +1012,14 @@ vtvk_CmdCopyBuffer(VkCommandBuffer commandBuffer,
                    const VkBufferCopy *pRegions)
 {
    (void)commandBuffer;
-   (void)srcBuffer;
-   (void)dstBuffer;
-   (void)regionCount;
-   (void)pRegions;
+   for (uint32_t i = 0; i < regionCount; i++) {
+      void *src = vtvk_buffer_host_ptr(srcBuffer, pRegions[i].srcOffset,
+                                       pRegions[i].size);
+      void *dst = vtvk_buffer_host_ptr(dstBuffer, pRegions[i].dstOffset,
+                                       pRegions[i].size);
+      if (src && dst)
+         memcpy(dst, src, pRegions[i].size);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
