@@ -21,7 +21,6 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -171,31 +170,6 @@ private:
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
    }
 
-   Value *globalPtr(Value *addr)
-   {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 0));
-   }
-
-   Value *loadGlobalU32(Value *base, uint32_t offset)
-   {
-      Value *addr = builder.CreateAdd(asInt32(base), ConstantInt::get(i32, offset));
-      return builder.CreateLoad(i32, globalPtr(addr));
-   }
-
-   Value *readCsr(uint32_t csr)
-   {
-      char asmText[32];
-      snprintf(asmText, sizeof(asmText), "csrr $0, 0x%x", csr);
-      FunctionType *ft = FunctionType::get(i32, false);
-      InlineAsm *asmFn = InlineAsm::get(ft, asmText, "=r", true);
-      return builder.CreateCall(asmFn);
-   }
-
-   Value *dispatchArgsBase()
-   {
-      return loadGlobalU32(readCsr(0x803), 4);
-   }
-
    bool isKernelMain(void) const
    {
       BasicBlock *bb = builder.GetInsertBlock();
@@ -207,17 +181,20 @@ private:
 
    void emitEndprg()
    {
-      FunctionType *ft = FunctionType::get(Type::getVoidTy(context), false);
-      InlineAsm *asmFn =
-         InlineAsm::get(ft,
-                        "la t0, tohost\n"
-                        "li t1, 1\n"
-                        "sw t1, 0(t0)\n"
-                        "sw zero, 4(t0)\n"
-                        "1: j 1b",
-                        "", true);
-      builder.CreateCall(asmFn);
-      builder.CreateUnreachable();
+      GlobalVariable *tohost = module.getGlobalVariable("tohost");
+      if (!tohost) {
+         tohost = new GlobalVariable(module, i64, false,
+                                     GlobalValue::ExternalLinkage, nullptr,
+                                     "tohost");
+      }
+
+      builder.CreateStore(ConstantInt::get(i64, 1), tohost);
+
+      Function *fn = builder.GetInsertBlock()->getParent();
+      BasicBlock *loop = BasicBlock::Create(context, "kernel.exit.spin", fn);
+      builder.CreateBr(loop);
+      builder.SetInsertPoint(loop);
+      builder.CreateBr(loop);
    }
 
    void emitReturn()
@@ -235,6 +212,12 @@ private:
          name = "main";
       return Function::Create(FunctionType::get(Type::getVoidTy(context), false),
                               GlobalValue::ExternalLinkage, name, module);
+   }
+
+   Value *callI32Intrinsic(StringRef name)
+   {
+      Function *fn = declare(name, i32, {});
+      return builder.CreateCall(fn);
    }
 
    void allocateVariables(nir_shader *shader, nir_function_impl *impl)
@@ -408,18 +391,16 @@ private:
          if (noopRtIntrinsics)
             return ConstantAggregateZero::get(vecType);
          Value *vec = UndefValue::get(vecType);
-         vec = builder.CreateInsertElement(vec, readCsr(0x80d), uint64_t(0));
-         vec = builder.CreateInsertElement(vec, readCsr(0x80e), uint64_t(1));
-         vec = builder.CreateInsertElement(vec, readCsr(0x80f), uint64_t(2));
+         vec = builder.CreateInsertElement(
+            vec, callI32Intrinsic("llvm.riscv.workitem.id.x"), uint64_t(0));
+         vec = builder.CreateInsertElement(
+            vec, callI32Intrinsic("llvm.riscv.workitem.id.y"), uint64_t(1));
+         vec = builder.CreateInsertElement(
+            vec, callI32Intrinsic("llvm.riscv.workitem.id.z"), uint64_t(2));
          return vec;
       }
       case nir_intrinsic_load_ray_launch_size: {
-         Value *args = dispatchArgsBase();
-         Value *vec = UndefValue::get(FixedVectorType::get(i32, 3));
-         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 48), uint64_t(0));
-         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 52), uint64_t(1));
-         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 56), uint64_t(2));
-         return vec;
+         return ConstantAggregateZero::get(FixedVectorType::get(i32, 3));
       }
       case nir_intrinsic_load_deref: {
          Value *ptr = value(intrin->src[0]);
