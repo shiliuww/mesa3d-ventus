@@ -52,7 +52,7 @@ NIR shader (nir_shader*)
   ├─ Ventus-specific NIR passes        ← src/ventus/compiler/
   │   · lower RT I/O (payload → shared memory slot)
   │   · build traversal shader (BVH walk loop)
-  │   · lower RT ABI (CSR + slot layout)
+  │   · lower RT ABI (LLVM/Ventus intrinsics + slot layout)
   |   可能还有其他的？
   │
   ▼
@@ -109,7 +109,7 @@ radv_rt_nir_to_asm()
 | AMD 文件 | Ventus 对应 (`src/ventus/compiler/`) | 关键差异 |
 |----------|--------------------------------------|---------|
 | `radv_nir_rt_stage_functions.c` | `vt_nir_lower_rt_io.c` | payload：Ventus 用 shared memory slot，AMD 有三种模式 |
-| `radv_nir_lower_rt_abi_*` | `vt_nir_lower_rt_abi.c` | ABI：AMD = SGPR/VGPR，Ventus = CSR + slot layout |
+| `radv_nir_lower_rt_abi_*` | `vt_nir_lower_rt_abi.c` | ABI：AMD = SGPR/VGPR，Ventus = LLVM/Ventus intrinsics + slot layout |
 | `radv_nir_lower_descriptors.c` | `vt_nir_lower_descriptors.c` | 地址空间：Ventus 全局地址 + 固定段映射 |
 | `radv_nir_rt_traversal_shader.c` | `vt_nir_build_traversal.c` | 遍历逻辑通用，BVH 指令换 Ventus |
 | `radv_nir_rt_common.c` | 合并进 `vt_nir_build_traversal.c` | BVH 节点访问 helper |
@@ -120,7 +120,7 @@ radv_rt_nir_to_asm()
 
 - `trace_ray` → 写 ray 参数到 shared memory slot → 调 `vt.rt.intersect`
 - 自动插入 shader dispatch poll loop
-- 系统值 intrinsic（`launch_size_x` 等）→ CSR 读取（`csrr a0, 0xCC0`）
+- 系统值 intrinsic（`launch_size_x` 等）→ 正式 LLVM/Ventus ABI intrinsic，由 LLVM 后端选择目标指令
 - UBO / push constant / descriptor 加载 → 地址映射后的 plain load
 
 **因此 NIR 层（`ventus/compiler/`）只需负责**：

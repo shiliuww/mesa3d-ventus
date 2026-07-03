@@ -1,10 +1,11 @@
 # Ventus RT Driver Probe
 
-`probe_write_pixel.S` is a minimal RV32 Spike-driver kernel for checking the
+`probe_write_pixel.ll` is a minimal RV32 Spike-driver kernel for checking the
 Mesa -> driver -> Spike bridge before using generated raygen code.
 
-It reads the Mesa dispatch args pointer from `CSR_KNL + 4`, loads
-`args.image_addr`, and writes four diagnostic pixels:
+It requests the kernel metadata pointer through
+`llvm.riscv.ventus.kernel.metadata()`, loads `args.image_addr`, and writes four
+diagnostic pixels:
 
 - pixel 0: fixed RGBA test pattern
 - pixel 1: low 32 bits of the dispatch args device address

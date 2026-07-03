@@ -25,10 +25,22 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Alignment.h"
 
 using namespace llvm;
 
 namespace {
+
+enum {
+   VTVK_KNL_ARG_BASE = 4,
+   VTVK_RT_ARGS_TLAS_ADDR = 0,
+   VTVK_RT_ARGS_IMAGE_ADDR = 8,
+   VTVK_RT_ARGS_CAMERA_ADDR = 16,
+   VTVK_RT_ARGS_WIDTH = 48,
+   VTVK_RT_ARGS_HEIGHT = 52,
+   VTVK_RT_ARGS_DEPTH = 56,
+   VTVK_RT_ARGS_IMAGE_STRIDE = 64,
+};
 
 static std::string
 stage_name(mesa_shader_stage stage)
@@ -165,9 +177,99 @@ private:
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 3));
    }
 
+   Value *globalPtr(Value *addr)
+   {
+      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 1));
+   }
+
    Value *privatePtr(Value *addr)
    {
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
+   }
+
+   Value *loadI32Global(Value *base, uint32_t offset)
+   {
+      Value *addr = asInt32(base);
+      if (offset)
+         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+      LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
+      load->setAlignment(Align(4));
+      return load;
+   }
+
+   Value *dispatchArgsBase()
+   {
+      Value *metadataBase =
+         callI32Intrinsic("llvm.riscv.ventus.kernel.metadata");
+      return loadI32Global(metadataBase, VTVK_KNL_ARG_BASE);
+   }
+
+   Value *dispatchArgI32(uint32_t offset)
+   {
+      return loadI32Global(dispatchArgsBase(), offset);
+   }
+
+   Value *descriptorAddressForBinding(uint32_t binding)
+   {
+      switch (binding) {
+      case 0:
+         return dispatchArgI32(VTVK_RT_ARGS_TLAS_ADDR);
+      case 1:
+         return dispatchArgI32(VTVK_RT_ARGS_IMAGE_ADDR);
+      case 2:
+         return dispatchArgI32(VTVK_RT_ARGS_CAMERA_ADDR);
+      default:
+         return ConstantInt::get(i32, 0);
+      }
+   }
+
+   Value *descriptorValueForDef(const nir_def *def, Value *addr)
+   {
+      Value *addr32 = asInt32(addr);
+      if (def->bit_size == 64)
+         return builder.CreateZExt(addr32, i64);
+      return addr32;
+   }
+
+   Value *loadI32At(Value *addr)
+   {
+      LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
+      load->setAlignment(Align(4));
+      return load;
+   }
+
+   Value *loadGlobalForDef(Value *base, Value *offset, const nir_def *def)
+   {
+      Value *addr = builder.CreateAdd(asInt32(base), asInt32(offset));
+      auto loadScalar = [&](unsigned component) -> Value * {
+         Value *componentAddr = addr;
+         if (component)
+            componentAddr =
+               builder.CreateAdd(componentAddr, ConstantInt::get(i32, component * 4));
+
+         if (def->bit_size == 64) {
+            Value *lo = loadI32At(componentAddr);
+            Value *hi = loadI32At(builder.CreateAdd(componentAddr,
+                                                    ConstantInt::get(i32, 4)));
+            return builder.CreateOr(builder.CreateZExt(lo, i64),
+                                    builder.CreateShl(builder.CreateZExt(hi, i64),
+                                                      ConstantInt::get(i64, 32)));
+         }
+
+         Value *word = loadI32At(componentAddr);
+         if (def->bit_size == 1)
+            return builder.CreateICmpNE(word, ConstantInt::get(i32, 0));
+         return word;
+      };
+
+      if (def->num_components <= 1)
+         return loadScalar(0);
+
+      Type *vecType = defType(def);
+      Value *vec = UndefValue::get(vecType);
+      for (unsigned i = 0; i < def->num_components; ++i)
+         vec = builder.CreateInsertElement(vec, loadScalar(i), uint64_t(i));
+      return vec;
    }
 
    bool isKernelMain(void) const
@@ -283,6 +385,33 @@ private:
       return undefFor(src.ssa);
    }
 
+   Value *component(Value *v, unsigned idx)
+   {
+      if (isa<FixedVectorType>(v->getType()))
+         return builder.CreateExtractElement(v, uint64_t(idx));
+      return v;
+   }
+
+   Value *aluSrcScalar(nir_alu_instr *alu, unsigned srcIdx, unsigned componentIdx = 0)
+   {
+      unsigned swizzle = alu->src[srcIdx].swizzle[componentIdx];
+      return component(value(alu->src[srcIdx].src), swizzle);
+   }
+
+   Value *aluSrcVector(nir_alu_instr *alu, unsigned srcIdx, unsigned components)
+   {
+      Value *src = value(alu->src[srcIdx].src);
+      if (components <= 1)
+         return component(src, alu->src[srcIdx].swizzle[0]);
+
+      Type *scalar = component(src, alu->src[srcIdx].swizzle[0])->getType();
+      Value *vec = UndefValue::get(FixedVectorType::get(scalar, components));
+      for (unsigned i = 0; i < components; ++i)
+         vec = builder.CreateInsertElement(
+            vec, component(src, alu->src[srcIdx].swizzle[i]), uint64_t(i));
+      return vec;
+   }
+
    Value *asBool(Value *v)
    {
       if (v->getType()->isIntegerTy(1))
@@ -315,7 +444,52 @@ private:
          return builder.CreateBitCast(v, i32);
       if (v->getType()->isIntegerTy())
          return builder.CreateZExtOrTrunc(v, i32);
+      if (v->getType()->isPointerTy())
+         return builder.CreatePtrToInt(v, i32);
       return UndefValue::get(i32);
+   }
+
+   Value *asInt64(Value *v)
+   {
+      if (v->getType()->isIntegerTy(64))
+         return v;
+      if (v->getType()->isIntegerTy())
+         return builder.CreateZExtOrTrunc(v, i64);
+      return builder.CreateZExt(asInt32(v), i64);
+   }
+
+   Value *byteComponent(Value *v)
+   {
+      return builder.CreateAnd(asInt32(v), ConstantInt::get(i32, 0xff));
+   }
+
+   Value *packRGBA8(Value *value)
+   {
+      Value *r = byteComponent(component(value, 0));
+      Value *g = byteComponent(component(value, 1));
+      Value *b = byteComponent(component(value, 2));
+      Value *a = isa<FixedVectorType>(value->getType()) ?
+         byteComponent(component(value, 3)) : ConstantInt::get(i32, 255);
+
+      return builder.CreateOr(
+         builder.CreateOr(r, builder.CreateShl(g, ConstantInt::get(i32, 8))),
+         builder.CreateOr(builder.CreateShl(b, ConstantInt::get(i32, 16)),
+                          builder.CreateShl(a, ConstantInt::get(i32, 24))));
+   }
+
+   void storeStorageImage(Value *coord, Value *rgba)
+   {
+      Value *imageBase = dispatchArgI32(VTVK_RT_ARGS_IMAGE_ADDR);
+      Value *stride = dispatchArgI32(VTVK_RT_ARGS_IMAGE_STRIDE);
+      Value *x = asInt32(component(coord, 0));
+      Value *y = isa<FixedVectorType>(coord->getType()) ?
+         asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
+      Value *offset =
+         builder.CreateAdd(builder.CreateMul(y, stride),
+                           builder.CreateMul(x, ConstantInt::get(i32, 4)));
+      Value *addr = builder.CreateAdd(imageBase, offset);
+      StoreInst *store = builder.CreateStore(packRGBA8(rgba), globalPtr(addr));
+      store->setAlignment(Align(4));
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
@@ -346,27 +520,76 @@ private:
 
    Value *lowerAlu(nir_alu_instr *alu)
    {
-      auto src = [&](unsigned idx) { return value(alu->src[idx].src); };
+      auto src = [&](unsigned idx) { return aluSrcScalar(alu, idx); };
 
       switch (alu->op) {
       case nir_op_mov:
-         return src(0);
+         return aluSrcVector(alu, 0, alu->def.num_components);
       case nir_op_iadd:
          return builder.CreateAdd(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_isub:
+         return builder.CreateSub(asInt32(src(0)), asInt32(src(1)));
       case nir_op_imul:
          return builder.CreateMul(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_iand:
+         return builder.CreateAnd(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ior:
+         return builder.CreateOr(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ixor:
+         return builder.CreateXor(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ishl:
+         return builder.CreateShl(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ushr:
+         return builder.CreateLShr(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ishr:
+         return builder.CreateAShr(asInt32(src(0)), asInt32(src(1)));
       case nir_op_fadd:
          return builder.CreateFAdd(asFloat(src(0)), asFloat(src(1)));
       case nir_op_fsub:
          return builder.CreateFSub(asFloat(src(0)), asFloat(src(1)));
       case nir_op_fmul:
          return builder.CreateFMul(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_fdiv:
+         return builder.CreateFDiv(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_fneg:
+         return builder.CreateFNeg(asFloat(src(0)));
+      case nir_op_feq:
+         return builder.CreateFCmpOEQ(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_fneu:
+         return builder.CreateFCmpONE(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_flt:
+         return builder.CreateFCmpOLT(asFloat(src(0)), asFloat(src(1)));
       case nir_op_fge:
          return builder.CreateFCmpOGE(asFloat(src(0)), asFloat(src(1)));
+      case nir_op_ieq:
+         return builder.CreateICmpEQ(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ine:
+         return builder.CreateICmpNE(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ilt:
+         return builder.CreateICmpSLT(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ige:
+         return builder.CreateICmpSGE(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_ult:
+         return builder.CreateICmpULT(asInt32(src(0)), asInt32(src(1)));
+      case nir_op_uge:
+         return builder.CreateICmpUGE(asInt32(src(0)), asInt32(src(1)));
       case nir_op_u2f32:
          return builder.CreateUIToFP(asInt32(src(0)), f32);
       case nir_op_f2u32:
          return builder.CreateFPToUI(asFloat(src(0)), i32);
+      case nir_op_i2f32:
+         return builder.CreateSIToFP(asInt32(src(0)), f32);
+      case nir_op_f2i32:
+         return builder.CreateFPToSI(asFloat(src(0)), i32);
+      case nir_op_unpack_64_2x32_split_x:
+         return builder.CreateTrunc(asInt64(src(0)), i32);
+      case nir_op_unpack_64_2x32_split_y:
+         return builder.CreateTrunc(
+            builder.CreateLShr(asInt64(src(0)), ConstantInt::get(i64, 32)), i32);
+      case nir_op_pack_64_2x32_split:
+         return builder.CreateOr(builder.CreateZExt(asInt32(src(0)), i64),
+                                 builder.CreateShl(builder.CreateZExt(asInt32(src(1)), i64),
+                                                   ConstantInt::get(i64, 32)));
       case nir_op_bcsel:
          return builder.CreateSelect(asBool(src(0)), src(1), src(2));
       case nir_op_vec2:
@@ -400,7 +623,53 @@ private:
          return vec;
       }
       case nir_intrinsic_load_ray_launch_size: {
-         return ConstantAggregateZero::get(FixedVectorType::get(i32, 3));
+         Type *vecType = FixedVectorType::get(i32, 3);
+         Value *vec = UndefValue::get(vecType);
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
+         return vec;
+      }
+      case nir_intrinsic_vulkan_resource_index: {
+         return ConstantInt::get(i32, nir_intrinsic_binding(intrin));
+      }
+      case nir_intrinsic_vulkan_resource_reindex: {
+         return builder.CreateAdd(asInt32(value(intrin->src[0])),
+                                  asInt32(value(intrin->src[1])));
+      }
+      case nir_intrinsic_load_vulkan_descriptor: {
+         Value *bindingValue = asInt32(value(intrin->src[0]));
+         if (auto *bindingConst = dyn_cast<ConstantInt>(bindingValue)) {
+            Value *addr =
+               descriptorAddressForBinding(bindingConst->getZExtValue());
+            return descriptorValueForDef(&intrin->def, addr);
+         }
+         return descriptorValueForDef(&intrin->def, ConstantInt::get(i32, 0));
+      }
+      case nir_intrinsic_load_ubo: {
+         Value *base = asInt32(value(intrin->src[0]));
+         Value *offset = asInt32(value(intrin->src[1]));
+         return loadGlobalForDef(base, offset, &intrin->def);
+      }
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_image_store: {
+         storeStorageImage(value(intrin->src[1]), value(intrin->src[3]));
+         return nullptr;
+      }
+      case nir_intrinsic_image_deref_size:
+      case nir_intrinsic_image_size: {
+         Type *vecType = FixedVectorType::get(i32, 3);
+         Value *vec = UndefValue::get(vecType);
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
+         vec = builder.CreateInsertElement(
+            vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
+         return vec;
       }
       case nir_intrinsic_load_deref: {
          Value *ptr = value(intrin->src[0]);
@@ -428,7 +697,7 @@ private:
                                    privatePtr(value(intrin->src[0])));
       }
       case nir_intrinsic_ventus_rt_store_slot: {
-         builder.CreateStore(value(intrin->src[0]),
+         builder.CreateStore(asInt32(value(intrin->src[0])),
                              privatePtr(value(intrin->src[1])));
          return nullptr;
       }
