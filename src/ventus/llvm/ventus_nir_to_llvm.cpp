@@ -6,6 +6,8 @@
 #include "ventus_nir_to_llvm.h"
 
 #include <memory>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -19,6 +21,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -52,7 +55,9 @@ public:
    VentusNirToLlvm(LLVMContext &context, Module &module)
       : context(context), module(module), builder(context),
         i1(Type::getInt1Ty(context)), i32(Type::getInt32Ty(context)),
-        i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)) {}
+        i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
+        noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
+        earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")) {}
 
    void translate(nir_shader *shader)
    {
@@ -64,8 +69,15 @@ public:
 
       Function *fn = createEntry(shader);
       BasicBlock *entry = BasicBlock::Create(context, "entry", fn);
-      mapBlocks(fn, impl);
       builder.SetInsertPoint(entry);
+
+      if (earlyExit && fn->getName() == "main") {
+         emitEndprg();
+         verifyFunction(*fn, &errs());
+         return;
+      }
+
+      mapBlocks(fn, impl);
       allocateVariables(shader, impl);
 
       BasicBlock *first = firstBlock(&impl->body);
@@ -76,7 +88,7 @@ public:
       finishPhis();
 
       if (builder.GetInsertBlock() && !builder.GetInsertBlock()->getTerminator())
-         builder.CreateRetVoid();
+         emitReturn();
 
       verifyFunction(*fn, &errs());
    }
@@ -89,6 +101,8 @@ private:
    Type *i32;
    Type *i64;
    Type *f32;
+   bool noopRtIntrinsics;
+   bool earlyExit;
 
    std::unordered_map<const nir_def *, Value *> defs;
    std::unordered_map<const nir_variable *, Value *> variables;
@@ -97,6 +111,12 @@ private:
    std::vector<std::pair<nir_phi_instr *, PHINode *>> phis;
    std::vector<BasicBlock *> breakTargets;
    std::vector<BasicBlock *> continueTargets;
+
+   static bool envEnabled(const char *name)
+   {
+      const char *value = getenv(name);
+      return value && value[0] && strcmp(value, "0") != 0;
+   }
 
    void resetFunctionState()
    {
@@ -149,6 +169,63 @@ private:
    Value *privatePtr(Value *addr)
    {
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
+   }
+
+   Value *globalPtr(Value *addr)
+   {
+      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 0));
+   }
+
+   Value *loadGlobalU32(Value *base, uint32_t offset)
+   {
+      Value *addr = builder.CreateAdd(asInt32(base), ConstantInt::get(i32, offset));
+      return builder.CreateLoad(i32, globalPtr(addr));
+   }
+
+   Value *readCsr(uint32_t csr)
+   {
+      char asmText[32];
+      snprintf(asmText, sizeof(asmText), "csrr $0, 0x%x", csr);
+      FunctionType *ft = FunctionType::get(i32, false);
+      InlineAsm *asmFn = InlineAsm::get(ft, asmText, "=r", true);
+      return builder.CreateCall(asmFn);
+   }
+
+   Value *dispatchArgsBase()
+   {
+      return loadGlobalU32(readCsr(0x803), 4);
+   }
+
+   bool isKernelMain(void) const
+   {
+      BasicBlock *bb = builder.GetInsertBlock();
+      if (!bb)
+         return false;
+      Function *fn = bb->getParent();
+      return fn && fn->getName() == "main";
+   }
+
+   void emitEndprg()
+   {
+      FunctionType *ft = FunctionType::get(Type::getVoidTy(context), false);
+      InlineAsm *asmFn =
+         InlineAsm::get(ft,
+                        "la t0, tohost\n"
+                        "li t1, 1\n"
+                        "sw t1, 0(t0)\n"
+                        "sw zero, 4(t0)\n"
+                        "1: j 1b",
+                        "", true);
+      builder.CreateCall(asmFn);
+      builder.CreateUnreachable();
+   }
+
+   void emitReturn()
+   {
+      if (isKernelMain())
+         emitEndprg();
+      else
+         builder.CreateRetVoid();
    }
 
    Function *createEntry(nir_shader *shader)
@@ -231,7 +308,7 @@ private:
          return builder.CreateICmpNE(v, ConstantInt::get(v->getType(), 0));
       if (v->getType()->isFloatingPointTy())
          return builder.CreateFCmpONE(v, ConstantFP::get(v->getType(), 0.0));
-      if (auto *vec = dyn_cast<FixedVectorType>(v->getType()))
+      if (isa<FixedVectorType>(v->getType()))
          return asBool(builder.CreateExtractElement(v, uint64_t(0)));
       if (v->getType()->isPointerTy())
          return builder.CreateIsNotNull(v);
@@ -323,27 +400,25 @@ private:
       }
    }
 
-   Value *loadLaunchComponent(const char *name)
-   {
-      Function *fn = declare(name, i32, {});
-      return builder.CreateCall(fn);
-   }
-
    Value *lowerIntrinsic(nir_intrinsic_instr *intrin)
    {
       switch (intrin->intrinsic) {
       case nir_intrinsic_load_ray_launch_id: {
-         Value *vec = UndefValue::get(FixedVectorType::get(i32, 3));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.id.x"), uint64_t(0));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.id.y"), uint64_t(1));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.id.z"), uint64_t(2));
+         Type *vecType = FixedVectorType::get(i32, 3);
+         if (noopRtIntrinsics)
+            return ConstantAggregateZero::get(vecType);
+         Value *vec = UndefValue::get(vecType);
+         vec = builder.CreateInsertElement(vec, readCsr(0x80d), uint64_t(0));
+         vec = builder.CreateInsertElement(vec, readCsr(0x80e), uint64_t(1));
+         vec = builder.CreateInsertElement(vec, readCsr(0x80f), uint64_t(2));
          return vec;
       }
       case nir_intrinsic_load_ray_launch_size: {
+         Value *args = dispatchArgsBase();
          Value *vec = UndefValue::get(FixedVectorType::get(i32, 3));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.size.x"), uint64_t(0));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.size.y"), uint64_t(1));
-         vec = builder.CreateInsertElement(vec, loadLaunchComponent("llvm.riscv.ventus.rt.launch.size.z"), uint64_t(2));
+         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 48), uint64_t(0));
+         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 52), uint64_t(1));
+         vec = builder.CreateInsertElement(vec, loadGlobalU32(args, 56), uint64_t(2));
          return vec;
       }
       case nir_intrinsic_load_deref: {
@@ -377,10 +452,14 @@ private:
          return nullptr;
       }
       case nir_intrinsic_ventus_rt_traverse: {
+         if (noopRtIntrinsics)
+            return ConstantInt::get(i32, 0);
          Function *fn = declare("llvm.riscv.ventus.rt.traverse.i32", i32, {i32});
          return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
       }
       case nir_intrinsic_ventus_rt_release: {
+         if (noopRtIntrinsics)
+            return nullptr;
          Function *fn = declare("llvm.riscv.ventus.rt.release.i32",
                                 Type::getVoidTy(context), {i32});
          builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
@@ -442,7 +521,7 @@ private:
       switch (jump->type) {
       case nir_jump_return:
       case nir_jump_halt:
-         builder.CreateRetVoid();
+         emitReturn();
          return true;
       case nir_jump_break:
          if (!breakTargets.empty())

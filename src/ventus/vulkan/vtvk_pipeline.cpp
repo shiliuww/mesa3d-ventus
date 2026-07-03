@@ -1,9 +1,12 @@
 #include "vtvk_private.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -29,8 +32,15 @@
 #ifdef Always
 #undef Always
 #endif
+#ifdef Status
+#undef Status
+#endif
 
 #include "llvm/IR/Module.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <unistd.h>
 
 struct vtvk_aabb {
    float min[3];
@@ -56,6 +66,7 @@ struct vtvk_pipeline {
    struct vt_nir_pipeline_scratch_info scratch_info;
 
    llvm::Module *llvm_module;
+   char *generated_kernel_path;
 };
 
 struct vtvk_acceleration_structure {
@@ -303,6 +314,178 @@ vtvk_env_enabled(const char *name)
           strcmp(value, "FALSE") != 0 &&
           strcmp(value, "off") != 0 &&
           strcmp(value, "OFF") != 0;
+}
+
+static std::string
+vtvk_shell_quote(const char *text)
+{
+   std::string out = "'";
+   for (const char *p = text; p && *p; p++) {
+      if (*p == '\'')
+         out += "'\\''";
+      else
+         out += *p;
+   }
+   out += "'";
+   return out;
+}
+
+static std::string
+vtvk_rt_artifact_base(void)
+{
+   const char *dir = getenv("VENTUS_VK_SHADER_ARTIFACT_DIR");
+   if (!dir || !dir[0])
+      dir = "/tmp";
+
+   std::string base = dir;
+   while (base.size() > 1 && base.back() == '/')
+      base.pop_back();
+
+   std::string tmpl = base + "/ventus_vk_rt_XXXXXX.ll";
+   std::vector<char> writable(tmpl.begin(), tmpl.end());
+   writable.push_back('\0');
+   int fd = mkstemps(writable.data(), 3);
+   if (fd >= 0) {
+      close(fd);
+      unlink(writable.data());
+      std::string ll_path = writable.data();
+      return ll_path.substr(0, ll_path.size() - 3);
+   }
+
+   static unsigned counter;
+   char name[128];
+   snprintf(name, sizeof(name), "/ventus_vk_rt_%ld_%u", (long)getpid(),
+            counter++);
+   return base + name;
+}
+
+static bool
+vtvk_write_rt_linker_script(const std::string &path)
+{
+   FILE *file = fopen(path.c_str(), "w");
+   if (!file) {
+      mesa_loge("ventus-vk: failed to open RT linker script %s: %s",
+                path.c_str(), strerror(errno));
+      return false;
+   }
+
+   static const char script[] =
+      "OUTPUT_ARCH(riscv)\n"
+      "ENTRY(main)\n"
+      "PHDRS { text PT_LOAD FLAGS(5); data PT_LOAD FLAGS(6); }\n"
+      "SECTIONS {\n"
+      "  . = 0x80000000;\n"
+      "  .text : { *(.text .text.*) } :text\n"
+      "  . = ALIGN(16);\n"
+      "  .eh_frame : { *(.eh_frame .eh_frame.*) } :text\n"
+      "  . = ALIGN(16);\n"
+      "  .rodata : { *(.rodata .rodata.*) } :text\n"
+      "  . = ALIGN(16);\n"
+      "  .data : {\n"
+      "    *(.data .data.*) *(.sdata .sdata.*)\n"
+      "    . = ALIGN(8);\n"
+      "    tohost = .; QUAD(0); fromhost = .; QUAD(0);\n"
+      "  } :data\n"
+      "  . = ALIGN(16);\n"
+      "  .bss : { *(.bss .bss.*) *(COMMON) } :data\n"
+      "}\n";
+   if (fwrite(script, 1, sizeof(script) - 1, file) != sizeof(script) - 1) {
+      mesa_loge("ventus-vk: failed to write RT linker script %s", path.c_str());
+      fclose(file);
+      return false;
+   }
+
+   fclose(file);
+   return true;
+}
+
+static bool
+vtvk_run_tool(const std::string &command, const char *stage)
+{
+   int ret = system(command.c_str());
+   if (ret != 0) {
+      mesa_loge("ventus-vk: RT %s failed with status %d: %s", stage, ret,
+                command.c_str());
+      return false;
+   }
+   return true;
+}
+
+static std::string
+vtvk_llvm_tool_env_prefix(void)
+{
+   const char *lib_dir = getenv("VENTUS_VK_LLVM_TOOL_LIB_DIR");
+   if (!lib_dir || !lib_dir[0])
+      lib_dir = "/home/guanys/ventus-env/llvm/build/lib";
+   return "LD_LIBRARY_PATH=" + vtvk_shell_quote(lib_dir) +
+          ":${LD_LIBRARY_PATH:-} ";
+}
+
+static bool
+vtvk_dump_rt_llvm_module(struct vtvk_pipeline *pipeline, std::string *ll_path)
+{
+   std::string base = vtvk_rt_artifact_base();
+   *ll_path = base + ".ll";
+
+   std::error_code ec;
+   llvm::raw_fd_ostream os(*ll_path, ec, llvm::sys::fs::OF_Text);
+   if (ec) {
+      mesa_loge("ventus-vk: failed to dump RT LLVM module %s: %s",
+                ll_path->c_str(), ec.message().c_str());
+      return false;
+   }
+
+   pipeline->llvm_module->print(os, nullptr);
+   os.flush();
+   mesa_logi("ventus-vk: dumped RT LLVM module to %s", ll_path->c_str());
+   return true;
+}
+
+static void
+vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
+{
+   if (!vtvk_env_enabled("VENTUS_VK_DUMP_LLVM") &&
+       !vtvk_env_enabled("VENTUS_VK_EMIT_ELF"))
+      return;
+
+   std::string ll_path;
+   if (!vtvk_dump_rt_llvm_module(pipeline, &ll_path) ||
+       !vtvk_env_enabled("VENTUS_VK_EMIT_ELF"))
+      return;
+
+   std::string obj_path = ll_path.substr(0, ll_path.size() - 3) + ".o";
+   std::string elf_path = ll_path.substr(0, ll_path.size() - 3) + ".riscv";
+   std::string ld_path = ll_path.substr(0, ll_path.size() - 3) + ".ld";
+   const char *llc = getenv("VENTUS_VK_LLC");
+   const char *ld_lld = getenv("VENTUS_VK_LD_LLD");
+   if (!llc || !llc[0])
+      llc = "/home/guanys/ventus-env/llvm/build/bin/llc";
+   if (!ld_lld || !ld_lld[0])
+      ld_lld = "/home/guanys/ventus-env/llvm/build/bin/ld.lld";
+
+   if (!vtvk_write_rt_linker_script(ld_path))
+      return;
+
+   std::string tool_env = vtvk_llvm_tool_env_prefix();
+   std::string llc_cmd = tool_env + vtvk_shell_quote(llc) +
+                         " -mtriple=riscv32-unknown-elf"
+                         " -mattr=+m,+a,+f,+d,+c,+v,+zfh"
+                         " -filetype=obj " +
+                         vtvk_shell_quote(ll_path.c_str()) + " -o " +
+                         vtvk_shell_quote(obj_path.c_str());
+   if (!vtvk_run_tool(llc_cmd, "llc"))
+      return;
+
+   std::string link_cmd = tool_env + vtvk_shell_quote(ld_lld) + " -T " +
+                          vtvk_shell_quote(ld_path.c_str()) + " -o " +
+                          vtvk_shell_quote(elf_path.c_str()) + " " +
+                          vtvk_shell_quote(obj_path.c_str());
+   if (!vtvk_run_tool(link_cmd, "link"))
+      return;
+
+   free(pipeline->generated_kernel_path);
+   pipeline->generated_kernel_path = strdup(elf_path.c_str());
+   mesa_logi("ventus-vk: emitted RT RISC-V kernel to %s", elf_path.c_str());
 }
 
 struct vtvk_driver_kernel_metadata {
@@ -600,6 +783,8 @@ vtvk_driver_trace_rays(
    static bool bridge_failed;
    static bool staged_without_kernel;
    const char *kernel_path = getenv("VENTUS_VK_RAYGEN_ELF");
+   if ((!kernel_path || !kernel_path[0]) && pipeline)
+      kernel_path = pipeline->generated_kernel_path;
    if (bridge_failed)
       return false;
    if ((!kernel_path || !kernel_path[0]) && staged_without_kernel)
@@ -743,6 +928,14 @@ vtvk_driver_trace_rays(
       goto out;
    }
 
+   if (vtvk_env_enabled("VENTUS_VK_PROBE_LOG") && image_bytes >= 16) {
+      uint32_t pixels[4];
+      memcpy(pixels, storage_image_data, sizeof(pixels));
+      mesa_logi("ventus-vk: driver bridge image probe pixels "
+                "%08x %08x %08x %08x",
+                pixels[0], pixels[1], pixels[2], pixels[3]);
+   }
+
    mesa_logi("ventus-vk: driver bridge executed Spike raygen kernel %s",
              kernel_path);
    ok = true;
@@ -770,6 +963,7 @@ vtvk_pipeline_destroy(struct vk_device *device,
       container_of(vk_pipeline, struct vtvk_pipeline, vk);
 
    delete pipeline->llvm_module;
+   free(pipeline->generated_kernel_path);
    ralloc_free(pipeline->nir_mem_ctx);
    vk_free2(&device->alloc, pAllocator, pipeline->shaders);
    vk_free2(&device->alloc, pAllocator, pipeline->group_handles);
@@ -907,6 +1101,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }
+   vtvk_maybe_emit_rt_kernel(pipeline);
 
    vtvk_fill_group_handles(pipeline, info);
 
