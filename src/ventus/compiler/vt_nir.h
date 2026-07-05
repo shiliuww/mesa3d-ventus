@@ -83,6 +83,8 @@ struct vt_nir_rt_trace_params {
    nir_def *accel_struct;
    nir_def *flags;
    nir_def *cull_mask;
+   nir_def *sbt_base;
+   nir_def *miss_sbt_base;
    nir_def *sbt_offset;
    nir_def *sbt_stride;
    nir_def *miss_index;
@@ -122,6 +124,8 @@ struct vt_nir_rt_config {
    bool enable_monolithic_shader_callbacks;
    vt_nir_rt_emit_shader_cb emit_closest_hit;
    vt_nir_rt_emit_shader_cb emit_miss;
+   vt_nir_rt_emit_shader_cb emit_any_hit;
+   vt_nir_rt_emit_shader_cb emit_intersection;
    void *callback_data;
 };
 
@@ -247,6 +251,20 @@ uint32_t vt_nir_pipeline_compute_scratch(nir_shader **shaders,
                                          struct vt_nir_pipeline_scratch_info *info);
 
 uint32_t vt_nir_pipeline_scratch_size(const struct vt_nir_pipeline_scratch_info *info);
+
+enum vt_nir_rt_dispatch_arg {
+   VT_NIR_RT_DISPATCH_ARG_TLAS_ADDR = 0,
+   VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR = 8,
+   VT_NIR_RT_DISPATCH_ARG_CAMERA_ADDR = 16,
+   VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_ADDR = 24,
+   VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR = 32,
+   VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR = 40,
+   VT_NIR_RT_DISPATCH_ARG_WIDTH = 48,
+   VT_NIR_RT_DISPATCH_ARG_HEIGHT = 52,
+   VT_NIR_RT_DISPATCH_ARG_DEPTH = 56,
+   VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT = 60,
+   VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE = 64,
+};
 
 #ifdef __cplusplus
 }

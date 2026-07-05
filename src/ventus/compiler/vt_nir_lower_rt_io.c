@@ -9,6 +9,19 @@ struct lower_rt_io_state {
    const struct vt_nir_rt_config *config;
 };
 
+static nir_def *
+load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
+{
+   nir_intrinsic_instr *intrin =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_ventus_rt_dispatch_arg);
+   intrin->src[0] = nir_src_for_ssa(nir_imm_int(b, offset));
+
+   nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
+   intrin->num_components = 1;
+   nir_builder_instr_insert(b, &intrin->instr);
+   return &intrin->def;
+}
+
 static bool
 lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
@@ -26,9 +39,11 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .accel_struct = intrin->src[0].ssa,
       .flags = intrin->src[1].ssa,
       .cull_mask = intrin->src[2].ssa,
-      .sbt_offset = nir_iand_imm(b, intrin->src[3].ssa, 0xf),
-      .sbt_stride = nir_iand_imm(b, intrin->src[4].ssa, 0xf),
-      .miss_index = nir_iand_imm(b, intrin->src[5].ssa, 0xffff),
+      .sbt_base = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR, 64),
+      .miss_sbt_base = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR, 64),
+      .sbt_offset = intrin->src[3].ssa,
+      .sbt_stride = intrin->src[4].ssa,
+      .miss_index = intrin->src[5].ssa,
       .origin = intrin->src[6].ssa,
       .tmin = intrin->src[7].ssa,
       .direction = intrin->src[8].ssa,
@@ -45,9 +60,14 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_TERMINATED);
    nir_def *terminal = nir_ior(b, nir_ior(b, complete_hit, complete_miss),
                                terminated);
+   nir_def *candidate_non_opaque =
+      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
+   nir_def *candidate_procedural =
+      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
 
    if (config && config->enable_monolithic_shader_callbacks &&
-       (config->emit_closest_hit || config->emit_miss)) {
+       (config->emit_closest_hit || config->emit_miss ||
+        config->emit_any_hit || config->emit_intersection)) {
       nir_push_if(b, complete_hit);
       if (config->emit_closest_hit)
          config->emit_closest_hit(b, &params, &result, config->callback_data);
@@ -56,6 +76,19 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_push_if(b, complete_miss);
       if (config->emit_miss)
          config->emit_miss(b, &params, &result, config->callback_data);
+      nir_push_else(b, NULL);
+
+      nir_push_if(b, candidate_non_opaque);
+      if (config->emit_any_hit)
+         config->emit_any_hit(b, &params, &result, config->callback_data);
+      nir_push_else(b, NULL);
+
+      nir_push_if(b, candidate_procedural);
+      if (config->emit_intersection)
+         config->emit_intersection(b, &params, &result, config->callback_data);
+
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
 
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);

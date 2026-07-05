@@ -51,7 +51,7 @@ struct vt_rt_intrinsic_counts {
 };
 
 static inline bool
-vt_rt_shader_has_imul_const(nir_shader *shader, uint32_t value)
+vt_rt_shader_has_imul_any(nir_shader *shader)
 {
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
@@ -62,12 +62,7 @@ vt_rt_shader_has_imul_const(nir_shader *shader, uint32_t value)
             nir_alu_instr *alu = nir_instr_as_alu(instr);
             if (alu->op != nir_op_imul)
                continue;
-
-            for (unsigned i = 0; i < 2; ++i) {
-               if (nir_src_is_const(alu->src[i].src) &&
-                   nir_src_as_uint(alu->src[i].src) == value)
-                  return true;
-            }
+            return true;
          }
       }
    }

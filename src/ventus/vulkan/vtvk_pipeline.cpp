@@ -12,6 +12,7 @@
 
 #include "compiler/spirv/nir_spirv.h"
 #include "nir/nir.h"
+#include "util/hash_table.h"
 #include "util/log.h"
 #include "util/ralloc.h"
 #include "vk_pipeline.h"
@@ -690,6 +691,144 @@ struct vtvk_rt_dispatch_args {
    uint32_t reserved;
 };
 
+struct vtvk_rt_callback_shader_entry {
+   uint32_t group_index;
+   nir_shader *shader;
+};
+
+struct vtvk_rt_callback_shaders {
+   nir_shader *raygen;
+   std::vector<vtvk_rt_callback_shader_entry> miss;
+   std::vector<vtvk_rt_callback_shader_entry> closest_hit;
+   std::vector<vtvk_rt_callback_shader_entry> any_hit;
+   std::vector<vtvk_rt_callback_shader_entry> intersection;
+};
+
+struct vtvk_rt_pipeline_callback_data {
+   const vtvk_rt_callback_shaders *shaders;
+};
+
+static void
+vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
+{
+   if (!b || !shader)
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return;
+
+   nir_opt_dead_cf(shader);
+   nir_lower_returns(shader);
+   nir_opt_dce(shader);
+
+   struct hash_table *var_remap = _mesa_pointer_hash_table_create(b->shader);
+   if (!var_remap)
+      return;
+
+   nir_foreach_variable(var, shader->variables) {
+      if (var->data.mode == nir_var_function_temp)
+         continue;
+
+      nir_variable *clone = nir_variable_clone(var, b->shader);
+      if (!clone) {
+         _mesa_hash_table_destroy(var_remap, NULL);
+         return;
+      }
+      nir_shader_add_variable(b->shader, clone);
+      _mesa_hash_table_insert(var_remap, var, clone);
+   }
+
+   b->shader->scratch_size =
+      MAX2(b->shader->scratch_size, shader->scratch_size);
+   nir_inline_function_impl(b, impl, NULL, var_remap);
+   _mesa_hash_table_destroy(var_remap, NULL);
+}
+
+static void
+vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
+                                         const std::vector<vtvk_rt_callback_shader_entry>
+                                            &entries,
+                                         nir_def *index)
+{
+   if (!b || !index || entries.empty())
+      return;
+
+   for (size_t i = 0; i < entries.size(); i++) {
+      nir_push_if(b, nir_ieq_imm(b, index, entries[i].group_index));
+      vtvk_inline_rt_callback_shader(b, entries[i].shader);
+      if (i + 1 < entries.size())
+         nir_push_else(b, NULL);
+   }
+   for (size_t i = 0; i < entries.size(); i++)
+      nir_pop_if(b, NULL);
+}
+
+static void
+vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
+                  const struct vt_nir_rt_result *result, void *data)
+{
+   (void)result;
+   const struct vtvk_rt_pipeline_callback_data *cb =
+      static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
+
+   nir_def *index = params && params->miss_index ? params->miss_index : NULL;
+   if (!cb || !cb->shaders || cb->shaders->miss.empty() || !index)
+      return;
+
+   index = nir_channel(index, 0);
+   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->miss, index);
+}
+
+static void
+vtvk_emit_rt_closest_hit(nir_builder *b,
+                         const struct vt_nir_rt_trace_params *params,
+                         const struct vt_nir_rt_result *result, void *data)
+{
+   (void)params;
+   const struct vtvk_rt_pipeline_callback_data *cb =
+      static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
+
+   if (!cb || !cb->shaders || cb->shaders->closest_hit.empty() ||
+       !result || !result->sbt_index)
+      return;
+
+   vtvk_inline_rt_callback_shader_with_index(
+      b, cb->shaders->closest_hit, nir_channel(result->sbt_index, 0));
+}
+
+static void
+vtvk_emit_rt_any_hit(nir_builder *b, const struct vt_nir_rt_trace_params *params,
+                     const struct vt_nir_rt_result *result, void *data)
+{
+   (void)params;
+   const struct vtvk_rt_pipeline_callback_data *cb =
+      static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
+
+   if (!cb || !cb->shaders || cb->shaders->any_hit.empty() ||
+       !result || !result->sbt_index)
+      return;
+
+   vtvk_inline_rt_callback_shader_with_index(
+      b, cb->shaders->any_hit, nir_channel(result->sbt_index, 0));
+}
+
+static void
+vtvk_emit_rt_intersection(nir_builder *b, const struct vt_nir_rt_trace_params *params,
+                          const struct vt_nir_rt_result *result, void *data)
+{
+   (void)params;
+   const struct vtvk_rt_pipeline_callback_data *cb =
+      static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
+
+   if (!cb || !cb->shaders || cb->shaders->intersection.empty() ||
+       !result || !result->sbt_index)
+      return;
+
+   vtvk_inline_rt_callback_shader_with_index(
+      b, cb->shaders->intersection, nir_channel(result->sbt_index, 0));
+}
+
 static bool
 vtvk_driver_resolve(void *lib, const char *name, void **out)
 {
@@ -890,6 +1029,36 @@ vtvk_align_u64(uint64_t value, uint64_t alignment)
    return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static uint32_t
+vtvk_format_bytes_per_pixel(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_R8G8B8A8_UINT:
+      return 4;
+   case VK_FORMAT_R16G16B16A16_UNORM:
+   case VK_FORMAT_R16G16B16A16_SNORM:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return 8;
+   case VK_FORMAT_R32G32B32A32_UINT:
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return 16;
+   case VK_FORMAT_R16G16_UNORM:
+   case VK_FORMAT_R16G16_SNORM:
+   case VK_FORMAT_R16G16_UINT:
+      return 4;
+   default:
+      break;
+   }
+
+   mesa_logw("ventus-vk: unsupported storage image format 0x%x, using 4 bytes/pixel",
+             (unsigned)format);
+   return 4;
+}
+
 enum vtvk_driver_knl_offset {
    VTVK_KNL_ENTRY = 0,
    VTVK_KNL_ARG_BASE = 4,
@@ -947,8 +1116,9 @@ vtvk_driver_trace_rays(
    uint32_t image_width = image_extent.width ? image_extent.width : width;
    uint32_t image_height = image_extent.height ? image_extent.height : height;
    uint32_t image_depth = image_extent.depth ? image_extent.depth : 1;
+   uint32_t image_bpp = vtvk_format_bytes_per_pixel(image_format);
    uint64_t image_bytes =
-      (uint64_t)image_width * image_height * image_depth * 4;
+      (uint64_t)image_width * image_height * image_depth * image_bpp;
    struct vtvk_rt_dispatch_args args = {};
    uint32_t metadata[VTVK_KNL_MAX_METADATA_SIZE / 4] = {};
    uint64_t lanes = (uint64_t)width * height * MAX2(depth, 1u);
@@ -986,7 +1156,7 @@ vtvk_driver_trace_rays(
    args.height = height;
    args.depth = depth;
    args.image_format = image_format;
-   args.image_stride = image_width * 4;
+   args.image_stride = image_width * image_bpp;
    args.camera_size = camera_range;
    args.scratch_stride = pipeline->per_lane_scratch_size;
 
@@ -1149,9 +1319,6 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    vt_nir_rt_config_apply_abi_layout(&config, &abi);
 
-   if (stage == MESA_SHADER_RAYGEN)
-      NIR_PASS(_, *nir_out, vt_nir_lower_rt_io_monolithic, &config);
-
    NIR_PASS(_, *nir_out, vt_nir_lower_rt_abi, &config);
    nir_validate_shader(*nir_out, "after Ventus RT lowering");
    if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
@@ -1180,6 +1347,64 @@ vtvk_fill_group_handles(struct vtvk_pipeline *pipeline,
       memcpy(handle + 20, &group->anyHitShader, sizeof(group->anyHitShader));
       memcpy(handle + 24, &group->intersectionShader,
              sizeof(group->intersectionShader));
+   }
+}
+
+static void
+vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
+                                nir_shader **shaders, uint32_t stage_count,
+                                vtvk_rt_callback_shaders *out)
+{
+   out->raygen = nullptr;
+   out->miss.clear();
+   out->closest_hit.clear();
+   out->any_hit.clear();
+   out->intersection.clear();
+
+   auto add_shader = [&](uint32_t shader_index, uint32_t group_index,
+                         mesa_shader_stage required_stage,
+                         std::vector<vtvk_rt_callback_shader_entry> *dst) {
+      if (shader_index == VK_SHADER_UNUSED_KHR || shader_index >= stage_count ||
+          shader_index >= info->stageCount)
+         return;
+
+      mesa_shader_stage shader_stage =
+         vk_to_mesa_shader_stage(info->pStages[shader_index].stage);
+      if (shader_stage == required_stage) {
+         dst->push_back({group_index, shaders[shader_index]});
+      }
+   };
+
+   for (uint32_t group_index = 0; group_index < info->groupCount; group_index++) {
+      const VkRayTracingShaderGroupCreateInfoKHR *group = &info->pGroups[group_index];
+      if (group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR) {
+         if (group->generalShader != VK_SHADER_UNUSED_KHR &&
+             group->generalShader < stage_count &&
+             group->generalShader < info->stageCount) {
+            mesa_shader_stage stage =
+               vk_to_mesa_shader_stage(info->pStages[group->generalShader].stage);
+            if (stage == MESA_SHADER_RAYGEN && !out->raygen)
+               out->raygen = shaders[group->generalShader];
+            else if (stage == MESA_SHADER_MISS)
+               add_shader(group->generalShader, group_index, MESA_SHADER_MISS,
+                          &out->miss);
+         }
+      } else if (group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR ||
+                 group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR) {
+         add_shader(group->closestHitShader, group_index, MESA_SHADER_CLOSEST_HIT,
+                    &out->closest_hit);
+         add_shader(group->anyHitShader, group_index, MESA_SHADER_ANY_HIT,
+                    &out->any_hit);
+         if (group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR)
+            add_shader(group->intersectionShader, group_index,
+                       MESA_SHADER_INTERSECTION, &out->intersection);
+      }
+   }
+
+   for (uint32_t i = 0; i < stage_count && i < info->stageCount; i++) {
+      mesa_shader_stage stage = vk_to_mesa_shader_stage(info->pStages[i].stage);
+      if (stage == MESA_SHADER_RAYGEN && !out->raygen)
+         out->raygen = shaders[i];
    }
 }
 
@@ -1226,6 +1451,32 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
 
       pipeline->vk.stages |= info->pStages[s].stage;
+   }
+
+   vtvk_rt_callback_shaders cb_shaders = {};
+   vtvk_collect_rt_callback_shaders(info, pipeline->shaders, pipeline->shader_count,
+                                   &cb_shaders);
+
+   {
+      struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
+      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
+      vt_nir_rt_config_apply_abi_layout(&rt_io_config, &abi);
+      rt_io_config.enable_monolithic_shader_callbacks = true;
+      rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
+      rt_io_config.emit_closest_hit =
+         cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
+      rt_io_config.emit_any_hit =
+         cb_shaders.any_hit.empty() ? NULL : vtvk_emit_rt_any_hit;
+      rt_io_config.emit_intersection =
+         cb_shaders.intersection.empty() ? NULL : vtvk_emit_rt_intersection;
+
+      vtvk_rt_pipeline_callback_data cb_data = {
+         .shaders = &cb_shaders,
+      };
+      rt_io_config.callback_data = &cb_data;
+
+      NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
+               &rt_io_config);
    }
 
    pipeline->per_lane_scratch_size =

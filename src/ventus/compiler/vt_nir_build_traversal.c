@@ -32,6 +32,8 @@ vt_nir_rt_default_config(void)
       .enable_monolithic_shader_callbacks = false,
       .emit_closest_hit = NULL,
       .emit_miss = NULL,
+      .emit_any_hit = NULL,
+      .emit_intersection = NULL,
       .callback_data = NULL,
    };
    vt_nir_rt_config_apply_abi_layout(&config, &abi);
@@ -262,17 +264,22 @@ store_u64_words(nir_builder *b, nir_def *base, enum vt_rt_slot_word lo_word,
 }
 
 static nir_def *
-build_hit_shader_record_ptr(nir_builder *b,
-                            const struct vt_nir_rt_config *config,
-                            nir_def *sbt_index)
+build_shader_record_ptr(nir_builder *b,
+                       const struct vt_nir_rt_config *config,
+                       const struct vt_nir_rt_trace_params *params,
+                       nir_def *record_base,
+                       nir_def *sbt_index)
 {
-   nir_def *record_offset =
-      nir_iadd_imm(b, nir_imul_imm(b, sbt_index,
-                                   config->hit_sbt_record_stride),
-                   config->shader_group_handle_size);
+   if (!record_base)
+      record_base = nir_imm_int64(b, 0);
 
-   return nir_iadd(b, nir_imm_int64(b, config->hit_sbt_base_addr),
-                   nir_u2u64(b, record_offset));
+   nir_def *record_index = nir_iadd(b, nir_u2u64(b, sbt_index),
+                                    nir_u2u64(b, params->sbt_offset));
+   nir_def *record_stride = nir_u2u64(b, params->sbt_stride);
+   nir_def *record_offset = nir_imul(b, record_index, record_stride);
+   record_offset = nir_iadd_imm(b, record_offset, config->shader_group_handle_size);
+
+   return nir_iadd(b, nir_u2u64(b, record_base), record_offset);
 }
 
 struct vt_nir_rt_result
@@ -308,8 +315,28 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *status = nir_ventus_rt_traverse(b, base);
    nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
    nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
+   nir_def *candidate_non_opaque_triangle =
+      nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
+   nir_def *candidate_procedural_aabb =
+      nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
+   nir_def *is_candidate =
+      nir_ior(b, candidate_non_opaque_triangle, candidate_procedural_aabb);
+   nir_def *hit_shader_record_ptr =
+      build_shader_record_ptr(b, config, params, params->sbt_base, sbt_index);
+   nir_def *miss_shader_record_ptr =
+      build_shader_record_ptr(b, config, params, params->miss_sbt_base,
+                             params->miss_index);
+   nir_def *complete_hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT);
+   nir_def *complete_miss = nir_ieq_imm(b, status,
+                                        VT_RT_TRAVERSAL_COMPLETE_MISS);
    nir_def *shader_record_ptr =
-      build_hit_shader_record_ptr(b, config, sbt_index);
+      nir_bcsel(b, is_candidate, hit_shader_record_ptr,
+                nir_bcsel(b, complete_hit, hit_shader_record_ptr,
+                          nir_bcsel(b, complete_miss, miss_shader_record_ptr,
+                                    nir_imm_int64(b, 0))));
+   nir_def *opaque = nir_inot(b, candidate_non_opaque_triangle);
+   nir_def *need_software_opacity =
+      candidate_non_opaque_triangle;
 
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_DONE,
@@ -351,10 +378,10 @@ vt_nir_build_traversal(nir_builder *b,
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                           VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                          VT_RT_HIT_RECORD_OPAQUE, nir_imm_true(b));
+                                          VT_RT_HIT_RECORD_OPAQUE, opaque);
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                           VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
-                                          nir_imm_false(b));
+                                          need_software_opacity);
 
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_STATUS, status);
@@ -371,10 +398,10 @@ vt_nir_build_traversal(nir_builder *b,
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                VT_RT_HIT_RECORD_OPAQUE, nir_imm_true(b));
+                                VT_RT_HIT_RECORD_OPAQUE, opaque);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
-                                nir_imm_false(b));
+                                need_software_opacity);
 
    struct vt_nir_rt_result result = {
       .slot_base = base,

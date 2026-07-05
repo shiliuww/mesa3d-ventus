@@ -283,7 +283,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.trace_ray == 0);
    VT_RT_CHECK(after.ventus_rt_store_slot > before.ventus_rt_store_slot);
    VT_RT_CHECK(after.ventus_rt_load_slot > before.ventus_rt_load_slot);
-   VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen, config.hit_sbt_record_stride));
+   VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
 
    nir_shader *any_hit = build_flag_probe_any_hit(&options);
    struct vt_rt_intrinsic_counts any_before;

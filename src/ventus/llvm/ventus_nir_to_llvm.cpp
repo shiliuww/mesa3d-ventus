@@ -28,6 +28,9 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Alignment.h"
+#include "vulkan/vulkan_core.h"
+
+#include "ventus/compiler/vt_nir.h"
 
 using namespace llvm;
 
@@ -35,13 +38,6 @@ namespace {
 
 enum {
    VTVK_KNL_ARG_BASE = 4,
-   VTVK_RT_ARGS_TLAS_ADDR = 0,
-   VTVK_RT_ARGS_IMAGE_ADDR = 8,
-   VTVK_RT_ARGS_CAMERA_ADDR = 16,
-   VTVK_RT_ARGS_WIDTH = 48,
-   VTVK_RT_ARGS_HEIGHT = 52,
-   VTVK_RT_ARGS_DEPTH = 56,
-   VTVK_RT_ARGS_IMAGE_STRIDE = 64,
 };
 
 static std::string
@@ -240,23 +236,29 @@ private:
       Type *vecType = FixedVectorType::get(i32, 3);
       Value *vec = ConstantAggregateZero::get(vecType);
       vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH), uint64_t(0));
       vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT), uint64_t(1));
       vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH), uint64_t(2));
       return vec;
    }
 
-   Value *descriptorAddressForBinding(uint32_t binding)
+   Value *dispatchArg(const nir_def *def, uint32_t offset)
+   {
+      return loadGlobalForDef(dispatchArgsBase(), ConstantInt::get(i32, offset),
+                             def);
+   }
+
+   Value *descriptorAddressForBinding(uint32_t binding, const nir_def *def)
    {
       switch (binding) {
       case 0:
-         return dispatchArgI32(VTVK_RT_ARGS_TLAS_ADDR);
+         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_TLAS_ADDR);
       case 1:
-         return dispatchArgI32(VTVK_RT_ARGS_IMAGE_ADDR);
+         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR);
       case 2:
-         return dispatchArgI32(VTVK_RT_ARGS_CAMERA_ADDR);
+         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_CAMERA_ADDR);
       default:
          return ConstantInt::get(i32, 0);
       }
@@ -264,6 +266,8 @@ private:
 
    Value *descriptorValueForDef(const nir_def *def, Value *addr)
    {
+      if (def->bit_size == 64 && addr->getType()->isIntegerTy(64))
+         return addr;
       Value *addr32 = asInt32(addr);
       if (def->bit_size == 64)
          return builder.CreateZExt(addr32, i64);
@@ -627,13 +631,17 @@ private:
       return builder.CreateAnd(asInt32(v), ConstantInt::get(i32, 0xff));
    }
 
-   Value *packRGBA8(Value *value)
+   Value *packRGBA8(Value *value, unsigned r_channel, unsigned g_channel,
+                    unsigned b_channel, unsigned a_channel)
    {
-      Value *r = byteComponent(component(value, 0));
-      Value *g = byteComponent(component(value, 1));
-      Value *b = byteComponent(component(value, 2));
-      Value *a = isa<FixedVectorType>(value->getType()) ?
-         byteComponent(component(value, 3)) : ConstantInt::get(i32, 255);
+      Value *r = byteComponent(component(value, r_channel));
+      Value *g = byteComponent(component(value, g_channel));
+      Value *b = byteComponent(component(value, b_channel));
+      Value *a =
+         byteComponent((a_channel == 3 &&
+                       !isa<FixedVectorType>(value->getType())) ?
+                            ConstantInt::get(i32, 255)
+                            : component(value, a_channel));
 
       return builder.CreateOr(
          builder.CreateOr(r, builder.CreateShl(g, ConstantInt::get(i32, 8))),
@@ -643,15 +651,23 @@ private:
 
    void storeStorageImage(Value *coord, Value *rgba)
    {
-      Value *imageBase = dispatchArgI32(VTVK_RT_ARGS_IMAGE_ADDR);
-      Value *stride = dispatchArgI32(VTVK_RT_ARGS_IMAGE_STRIDE);
+      Value *imageBase = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR);
+      Value *stride = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE);
+      Value *format = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT);
       Value *x = asInt32(component(coord, 0));
       Value *y = isa<FixedVectorType>(coord->getType()) ?
          asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
       Function *fn = declare("llvm.riscv.ventus.image.store.rgba8",
                              builder.getVoidTy(),
                              {i32, i32, i32, i32, i32});
-      builder.CreateCall(fn, {imageBase, x, y, stride, packRGBA8(rgba)});
+
+      Value *packedRgba = packRGBA8(rgba, 0, 1, 2, 3);
+      Value *packedBgra = packRGBA8(rgba, 2, 1, 0, 3);
+      Value *isBgra = builder.CreateICmpEQ(
+         format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM));
+
+      Value *packed = builder.CreateSelect(isBgra, packedBgra, packedRgba);
+      builder.CreateCall(fn, {imageBase, x, y, stride, packed});
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
@@ -998,6 +1014,10 @@ private:
       case nir_intrinsic_load_ray_launch_id: {
          return rayLaunchId();
       }
+      case nir_intrinsic_ventus_rt_dispatch_arg: {
+         return loadGlobalForDef(dispatchArgsBase(), asInt32(value(intrin->src[0])),
+                                &intrin->def);
+      }
       case nir_intrinsic_load_ray_launch_size: {
          return rayLaunchSize();
       }
@@ -1012,7 +1032,7 @@ private:
          Value *bindingValue = asInt32(value(intrin->src[0]));
          if (auto *bindingConst = dyn_cast<ConstantInt>(bindingValue)) {
             Value *addr =
-               descriptorAddressForBinding(bindingConst->getZExtValue());
+               descriptorAddressForBinding(bindingConst->getZExtValue(), &intrin->def);
             return descriptorValueForDef(&intrin->def, addr);
          }
          return descriptorValueForDef(&intrin->def, ConstantInt::get(i32, 0));
@@ -1032,11 +1052,11 @@ private:
          Type *vecType = FixedVectorType::get(i32, 3);
          Value *vec = ConstantAggregateZero::get(vecType);
          vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_WIDTH), uint64_t(0));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH), uint64_t(0));
          vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_HEIGHT), uint64_t(1));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT), uint64_t(1));
          vec = builder.CreateInsertElement(
-            vec, dispatchArgI32(VTVK_RT_ARGS_DEPTH), uint64_t(2));
+         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH), uint64_t(2));
          return vec;
       }
       case nir_intrinsic_load_deref: {

@@ -150,8 +150,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(vt_rt_all_releases_are_conditional(raygen));
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);
-   VT_RT_CHECK(vt_rt_shader_has_imul_const(raygen,
-                                           config.hit_sbt_record_stride));
+   VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
 
    struct vt_rt_intrinsic_counts closest_before;
    vt_rt_count_intrinsics(closest_hit, &closest_before);
