@@ -1,6 +1,8 @@
 #ifndef VTVK_PRIVATE_H
 #define VTVK_PRIVATE_H
 
+#include <stdint.h>
+
 #include "util/macros.h"
 #include "vk_alloc.h"
 #include "vk_device.h"
@@ -48,6 +50,17 @@ struct vtvk_cmd_buffer {
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
 };
 
+struct vtvk_acceleration_structure {
+   VkAccelerationStructureTypeKHR type;
+   VkBuffer buffer;
+   VkDeviceSize offset;
+   VkDeviceSize size;
+   VkDeviceAddress address;
+   void *data;
+   uint8_t *snapshot;
+   VkDeviceSize snapshot_size;
+};
+
 VK_DEFINE_HANDLE_CASTS(vtvk_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
 VK_DEFINE_HANDLE_CASTS(vtvk_physical_device, vk.base, VkPhysicalDevice,
@@ -77,6 +90,8 @@ void *vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet,
                                      VkDeviceSize *range_out);
 void *vtvk_image_host_ptr(VkImage image, VkExtent3D *extent_out,
                           VkFormat *format_out);
+struct vtvk_acceleration_structure *
+vtvk_find_as_by_address(VkDeviceAddress address);
 
 #ifdef __cplusplus
 }

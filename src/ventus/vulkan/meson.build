@@ -15,6 +15,7 @@ libvtvk_files = files(
   'vtvk_instance.c',
   'vtvk_objects.c',
   'vtvk_physical_device.c',
+  'vtvk_driver_bridge.cpp',
   'vtvk_pipeline.cpp',
 )
 

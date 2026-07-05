@@ -126,9 +126,10 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.continuation_base_bytes >=
                abi.payload_base_bytes + abi.payload_size_bytes);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
-   VT_RT_CHECK(abi.candidate_hit_record_size_bytes ==
-               VT_RT_HIT_RECORD_WORD_COUNT * 4);
-   VT_RT_CHECK(abi.hit_record_size_bytes == VT_RT_HIT_RECORD_WORD_COUNT * 4);
+   VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
+   VT_RT_CHECK(abi.hit_record_size_bytes == 72);
+   VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
+               abi.candidate_hit_record_size_bytes);
    VT_RT_CHECK(abi.continuation_size_bytes == 0);
 
    struct vt_rt_intrinsic_counts before;

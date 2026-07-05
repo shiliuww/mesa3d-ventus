@@ -17,7 +17,6 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
    intrin->src[0] = nir_src_for_ssa(nir_imm_int(b, offset));
 
    nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
-   intrin->num_components = 1;
    nir_builder_instr_insert(b, &intrin->instr);
    return &intrin->def;
 }
@@ -40,7 +39,11 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .flags = intrin->src[1].ssa,
       .cull_mask = intrin->src[2].ssa,
       .sbt_base = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR, 64),
+      .sbt_stride_bytes =
+         load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HIT_SBT_STRIDE, 64),
       .miss_sbt_base = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR, 64),
+      .miss_sbt_stride_bytes =
+         load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_STRIDE, 64),
       .sbt_offset = intrin->src[3].ssa,
       .sbt_stride = intrin->src[4].ssa,
       .miss_index = intrin->src[5].ssa,
@@ -116,6 +119,16 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
       .config = config,
    };
 
-   return nir_shader_intrinsics_pass(shader, lower_trace_ray,
-                                     nir_metadata_none, &state);
+   bool progress =
+      nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,
+                                 &state);
+   if (progress) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+      if (impl) {
+         nir_index_blocks(impl);
+         nir_index_ssa_defs(impl);
+      }
+   }
+
+   return progress;
 }

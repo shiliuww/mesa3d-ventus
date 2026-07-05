@@ -264,21 +264,46 @@ store_u64_words(nir_builder *b, nir_def *base, enum vt_rt_slot_word lo_word,
 }
 
 static nir_def *
-build_shader_record_ptr(nir_builder *b,
-                       const struct vt_nir_rt_config *config,
-                       const struct vt_nir_rt_trace_params *params,
-                       nir_def *record_base,
-                       nir_def *sbt_index)
+build_hit_shader_record_ptr(nir_builder *b,
+                            const struct vt_nir_rt_config *config,
+                            const struct vt_nir_rt_trace_params *params,
+                            nir_def *record_base,
+                            nir_def *instance_sbt_record_offset,
+                            nir_def *geometry_index)
 {
    if (!record_base)
       record_base = nir_imm_int64(b, 0);
 
-   nir_def *record_index = nir_iadd(b, nir_u2u64(b, sbt_index),
-                                    nir_u2u64(b, params->sbt_offset));
-   nir_def *record_stride = nir_u2u64(b, params->sbt_stride);
+   nir_def *trace_stride =
+      params->sbt_stride ? nir_u2u64(b, params->sbt_stride) : nir_imm_int64(b, 0);
+   nir_def *trace_offset =
+      params->sbt_offset ? nir_u2u64(b, params->sbt_offset) : nir_imm_int64(b, 0);
+   nir_def *record_index =
+      nir_iadd(b,
+               nir_iadd(b, nir_u2u64(b, instance_sbt_record_offset),
+                        nir_imul(b, nir_u2u64(b, geometry_index), trace_stride)),
+               trace_offset);
+   nir_def *record_stride = params->sbt_stride_bytes ?
+      nir_u2u64(b, params->sbt_stride_bytes) : nir_imm_int64(b, 0);
    nir_def *record_offset = nir_imul(b, record_index, record_stride);
    record_offset = nir_iadd_imm(b, record_offset, config->shader_group_handle_size);
 
+   return nir_iadd(b, nir_u2u64(b, record_base), record_offset);
+}
+
+static nir_def *
+build_miss_shader_record_ptr(nir_builder *b,
+                             const struct vt_nir_rt_config *config,
+                             const struct vt_nir_rt_trace_params *params)
+{
+   nir_def *record_base = params->miss_sbt_base ?
+      params->miss_sbt_base : nir_imm_int64(b, 0);
+   nir_def *record_index = params->miss_index ?
+      nir_u2u64(b, params->miss_index) : nir_imm_int64(b, 0);
+   nir_def *record_stride = params->miss_sbt_stride_bytes ?
+      nir_u2u64(b, params->miss_sbt_stride_bytes) : nir_imm_int64(b, 0);
+   nir_def *record_offset = nir_imul(b, record_index, record_stride);
+   record_offset = nir_iadd_imm(b, record_offset, config->shader_group_handle_size);
    return nir_iadd(b, nir_u2u64(b, record_base), record_offset);
 }
 
@@ -321,11 +346,28 @@ vt_nir_build_traversal(nir_builder *b,
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
    nir_def *is_candidate =
       nir_ior(b, candidate_non_opaque_triangle, candidate_procedural_aabb);
+   nir_def *candidate_instance_sbt_record_offset =
+      vt_nir_load_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                            VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET,
+                                            32);
+   nir_def *committed_instance_sbt_record_offset =
+      vt_nir_load_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                  VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET, 32);
+   nir_def *instance_sbt_record_offset =
+      nir_bcsel(b, is_candidate, candidate_instance_sbt_record_offset,
+                committed_instance_sbt_record_offset);
+   nir_def *candidate_geometry_index =
+      vt_nir_load_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                            VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
+   nir_def *committed_geometry_index =
+      vt_nir_load_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                  VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
+   nir_def *geometry_index =
+      nir_bcsel(b, is_candidate, candidate_geometry_index, committed_geometry_index);
    nir_def *hit_shader_record_ptr =
-      build_shader_record_ptr(b, config, params, params->sbt_base, sbt_index);
-   nir_def *miss_shader_record_ptr =
-      build_shader_record_ptr(b, config, params, params->miss_sbt_base,
-                             params->miss_index);
+      build_hit_shader_record_ptr(b, config, params, params->sbt_base,
+                                  instance_sbt_record_offset, geometry_index);
+   nir_def *miss_shader_record_ptr = build_miss_shader_record_ptr(b, config, params);
    nir_def *complete_hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT);
    nir_def *complete_miss = nir_ieq_imm(b, status,
                                         VT_RT_TRAVERSAL_COMPLETE_MISS);
@@ -409,6 +451,8 @@ vt_nir_build_traversal(nir_builder *b,
       .hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT),
       .hit_t = hit_t,
       .sbt_index = sbt_index,
+      .instance_sbt_record_offset = instance_sbt_record_offset,
+      .geometry_index = geometry_index,
       .shader_record_ptr = shader_record_ptr,
    };
    return result;

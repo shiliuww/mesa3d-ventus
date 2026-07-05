@@ -84,7 +84,9 @@ struct vt_nir_rt_trace_params {
    nir_def *flags;
    nir_def *cull_mask;
    nir_def *sbt_base;
+   nir_def *sbt_stride_bytes;
    nir_def *miss_sbt_base;
+   nir_def *miss_sbt_stride_bytes;
    nir_def *sbt_offset;
    nir_def *sbt_stride;
    nir_def *miss_index;
@@ -101,6 +103,8 @@ struct vt_nir_rt_result {
    nir_def *hit;
    nir_def *hit_t;
    nir_def *sbt_index;
+   nir_def *instance_sbt_record_offset;
+   nir_def *geometry_index;
    nir_def *shader_record_ptr;
 };
 
@@ -257,13 +261,25 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR = 8,
    VT_NIR_RT_DISPATCH_ARG_CAMERA_ADDR = 16,
    VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_ADDR = 24,
-   VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR = 32,
-   VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR = 40,
-   VT_NIR_RT_DISPATCH_ARG_WIDTH = 48,
-   VT_NIR_RT_DISPATCH_ARG_HEIGHT = 52,
-   VT_NIR_RT_DISPATCH_ARG_DEPTH = 56,
-   VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT = 60,
-   VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE = 64,
+   VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_SIZE = 32,
+   VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_STRIDE = 40,
+   VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR = 48,
+   VT_NIR_RT_DISPATCH_ARG_MISS_SBT_SIZE = 56,
+   VT_NIR_RT_DISPATCH_ARG_MISS_SBT_STRIDE = 64,
+   VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR = 72,
+   VT_NIR_RT_DISPATCH_ARG_HIT_SBT_SIZE = 80,
+   VT_NIR_RT_DISPATCH_ARG_HIT_SBT_STRIDE = 88,
+   VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_ADDR = 96,
+   VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_SIZE = 104,
+   VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_STRIDE = 112,
+   VT_NIR_RT_DISPATCH_ARG_WIDTH = 120,
+   VT_NIR_RT_DISPATCH_ARG_HEIGHT = 124,
+   VT_NIR_RT_DISPATCH_ARG_DEPTH = 128,
+   VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT = 132,
+   VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE = 136,
+   VT_NIR_RT_DISPATCH_ARG_CAMERA_SIZE = 140,
+   VT_NIR_RT_DISPATCH_ARG_SCRATCH_STRIDE = 144,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 152,
 };
 
 #ifdef __cplusplus

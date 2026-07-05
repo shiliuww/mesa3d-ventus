@@ -17,6 +17,7 @@ struct vtvk_buffer {
    VkDeviceMemory memory;
    VkDeviceSize memory_offset;
    void *map;
+   struct vtvk_buffer *next;
 };
 
 struct vtvk_image {
@@ -67,6 +68,8 @@ struct vtvk_swapchain {
    uint32_t image_count;
    VkImage images[3];
 };
+
+static struct vtvk_buffer *vtvk_buffer_list;
 
 static uint32_t
 vtvk_format_bytes_per_pixel(VkFormat format)
@@ -130,8 +133,20 @@ vtvk_buffer_host_ptr(VkBuffer _buffer, VkDeviceSize offset, VkDeviceSize size)
 void *
 vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
 {
-   struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)address);
-   return vtvk_buffer_host_ptr((VkBuffer)(uintptr_t)buffer, 0, size);
+   for (struct vtvk_buffer *buffer = vtvk_buffer_list; buffer;
+        buffer = buffer->next) {
+      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer;
+      if (address < base)
+         continue;
+
+      VkDeviceSize offset = address - base;
+      if (offset > buffer->size || size > buffer->size - offset)
+         continue;
+
+      return vtvk_buffer_host_ptr((VkBuffer)(uintptr_t)buffer, offset, size);
+   }
+
+   return NULL;
 }
 
 VkPipeline
@@ -345,6 +360,8 @@ vtvk_CreateBuffer(VkDevice _device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    buffer->size = pCreateInfo->size;
+   buffer->next = vtvk_buffer_list;
+   vtvk_buffer_list = buffer;
    *pBuffer = (VkBuffer)vtvk_ptr_to_handle(buffer);
    return VK_SUCCESS;
 }
@@ -355,7 +372,16 @@ vtvk_DestroyBuffer(VkDevice _device, VkBuffer buffer,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
-   vk_free(alloc, vtvk_handle_to_ptr((uint64_t)buffer));
+   struct vtvk_buffer *victim = vtvk_handle_to_ptr((uint64_t)buffer);
+   struct vtvk_buffer **link = &vtvk_buffer_list;
+   while (*link) {
+      if (*link == victim) {
+         *link = victim->next;
+         break;
+      }
+      link = &(*link)->next;
+   }
+   vk_free(alloc, victim);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
