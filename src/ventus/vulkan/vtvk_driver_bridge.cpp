@@ -9,6 +9,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <inttypes.h>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -239,6 +240,27 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
           api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
 }
 
+static void
+vtvk_driver_log_u32_words(const char *name, const void *data, uint64_t size,
+                          uint32_t max_words)
+{
+   if (!vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG") || !data || !size)
+      return;
+
+   const uint32_t *words = (const uint32_t *)data;
+   uint32_t word_count =
+      std::min<uint64_t>(max_words, size / sizeof(uint32_t));
+   for (uint32_t i = 0; i < word_count; i += 4) {
+      uint32_t w0 = words[i];
+      uint32_t w1 = i + 1 < word_count ? words[i + 1] : 0;
+      uint32_t w2 = i + 2 < word_count ? words[i + 2] : 0;
+      uint32_t w3 = i + 3 < word_count ? words[i + 3] : 0;
+      mesa_logi("ventus-vk: driver bridge %s[%03u..%03u] "
+                "%08x %08x %08x %08x",
+                name, i, i + 3, w0, w1, w2, w3);
+   }
+}
+
 static bool
 vtvk_driver_patch_tlas_node(
    struct vtvk_driver_api *api, uint8_t *image, uint64_t image_size,
@@ -450,6 +472,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       mesa_loge("ventus-vk: driver bridge failed to upload camera UBO");
       goto out;
    }
+   vtvk_driver_log_u32_words("camera", info->camera_data, info->camera_range,
+                             32);
 
    if (!vtvk_driver_upload_sbt_region(&driver, info->raygen_sbt,
                                       &args.raygen_sbt, "raygen") ||
@@ -471,6 +495,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
    args.scratch_stride = info->per_lane_scratch_size;
+   vtvk_driver_log_u32_words("dispatch_args", &args, sizeof(args), 40);
 
    if (!vtvk_driver_alloc_copy(&driver, &args, sizeof(args), &args_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to upload dispatch args");

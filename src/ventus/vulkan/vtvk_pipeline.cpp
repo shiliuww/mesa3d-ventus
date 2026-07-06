@@ -426,6 +426,17 @@ vtvk_dump_rt_llvm_module_to(struct vtvk_pipeline *pipeline,
                             const std::string &ll_path,
                             const char *label)
 {
+   std::string text;
+   llvm::raw_string_ostream text_os(text);
+   pipeline->llvm_module->print(text_os, nullptr);
+   text_os.flush();
+
+   const std::string system_name = "define amdgpu_cs_chain void @main(";
+   size_t main_def = text.find(system_name);
+   if (main_def != std::string::npos)
+      text.replace(main_def, system_name.size(),
+                   "define ventus_kernel void @main(");
+
    std::error_code ec;
    llvm::raw_fd_ostream os(ll_path, ec, llvm::sys::fs::OF_Text);
    if (ec) {
@@ -434,7 +445,7 @@ vtvk_dump_rt_llvm_module_to(struct vtvk_pipeline *pipeline,
       return false;
    }
 
-   pipeline->llvm_module->print(os, nullptr);
+   os << text;
    os.flush();
    mesa_logi("ventus-vk: dumped %s RT LLVM module to %s", label,
              ll_path.c_str());
@@ -673,7 +684,7 @@ vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
 
 static void
 vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
-                                         const std::vector<vtvk_rt_callback_shader_entry>
+                                          const std::vector<vtvk_rt_callback_shader_entry>
                                             &entries,
                                          nir_def *index)
 {
@@ -690,15 +701,28 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
       nir_pop_if(b, NULL);
 }
 
+static nir_def *
+vtvk_load_rt_shader_record_group_index(nir_builder *b, nir_def *shader_record_ptr)
+{
+   if (!b || !shader_record_ptr)
+      return NULL;
+
+   const int32_t group_index_offset = 4 - 32;
+   return nir_load_global(b, 1, 32,
+                          nir_iadd_imm(b, shader_record_ptr,
+                                       group_index_offset));
+}
+
 static void
 vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
                   const struct vt_nir_rt_result *result, void *data)
 {
-   (void)result;
+   (void)params;
    const struct vtvk_rt_pipeline_callback_data *cb =
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
-   nir_def *index = params && params->miss_index ? params->miss_index : NULL;
+   nir_def *record_ptr = result ? result->miss_shader_record_ptr : NULL;
+   nir_def *index = vtvk_load_rt_shader_record_group_index(b, record_ptr);
    if (!cb || !cb->shaders || cb->shaders->miss.empty() || !index)
       return;
 
@@ -719,8 +743,10 @@ vtvk_emit_rt_closest_hit(nir_builder *b,
        !result || !result->sbt_index)
       return;
 
-   vtvk_inline_rt_callback_shader_with_index(
-      b, cb->shaders->closest_hit, nir_channel(b, result->sbt_index, 0));
+   nir_def *index =
+      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->closest_hit,
+                                             index);
 }
 
 static void
@@ -735,8 +761,9 @@ vtvk_emit_rt_any_hit(nir_builder *b, const struct vt_nir_rt_trace_params *params
        !result || !result->sbt_index)
       return;
 
-   vtvk_inline_rt_callback_shader_with_index(
-      b, cb->shaders->any_hit, nir_channel(b, result->sbt_index, 0));
+   nir_def *index =
+      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->any_hit, index);
 }
 
 static void
@@ -751,8 +778,10 @@ vtvk_emit_rt_intersection(nir_builder *b, const struct vt_nir_rt_trace_params *p
        !result || !result->sbt_index)
       return;
 
-   vtvk_inline_rt_callback_shader_with_index(
-      b, cb->shaders->intersection, nir_channel(b, result->sbt_index, 0));
+   nir_def *index =
+      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->intersection,
+                                             index);
 }
 
 static struct vtvk_pipeline *

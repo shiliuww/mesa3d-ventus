@@ -216,6 +216,9 @@ vt_nir_lower_rt_payload(nir_shader *shader,
    uint32_t payload_base = config->scratchpad[layout].payload_base_bytes;
 
    bool progress = false;
+   if (shader->info.stage == MESA_SHADER_RAYGEN)
+      progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
+                                payload_base, false);
    progress |= lower_rt_vars(shader, nir_var_function_temp, config,
                              payload_base, true);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,

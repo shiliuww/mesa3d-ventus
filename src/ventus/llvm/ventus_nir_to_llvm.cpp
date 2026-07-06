@@ -19,6 +19,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -38,6 +39,7 @@ namespace {
 
 enum {
    VTVK_KNL_ARG_BASE = 4,
+   VENTUS_KERNEL_CALLING_CONV = 104,
 };
 
 static std::string
@@ -158,7 +160,8 @@ private:
       Type *scalar = scalarType(def->bit_size, preferFloat);
       if (def->num_components <= 1)
          return scalar;
-      return FixedVectorType::get(scalar, def->num_components);
+      std::vector<Type *> fields(def->num_components, scalar);
+      return StructType::get(context, fields);
    }
 
    Value *undefFor(const nir_def *def, bool preferFloat = false)
@@ -218,30 +221,32 @@ private:
 
    Value *rayLaunchId()
    {
-      Type *vecType = FixedVectorType::get(i32, 3);
       if (noopRtIntrinsics)
-         return ConstantAggregateZero::get(vecType);
-      Value *vec = ConstantAggregateZero::get(vecType);
-      vec = builder.CreateInsertElement(
-         vec, callI32Intrinsic("llvm.riscv.workitem.id.x"), uint64_t(0));
-      vec = builder.CreateInsertElement(
-         vec, callI32Intrinsic("llvm.riscv.workitem.id.y"), uint64_t(1));
-      vec = builder.CreateInsertElement(
-         vec, callI32Intrinsic("llvm.riscv.workitem.id.z"), uint64_t(2));
-      return vec;
+         return ConstantAggregateZero::get(StructType::get(context, {i32, i32, i32}));
+      return buildVector(3, i32, [&](unsigned i) {
+         switch (i) {
+         case 0:
+            return callI32Intrinsic("llvm.riscv.workitem.id.x");
+         case 1:
+            return callI32Intrinsic("llvm.riscv.workitem.id.y");
+         default:
+            return callI32Intrinsic("llvm.riscv.workitem.id.z");
+         }
+      });
    }
 
    Value *rayLaunchSize()
    {
-      Type *vecType = FixedVectorType::get(i32, 3);
-      Value *vec = ConstantAggregateZero::get(vecType);
-      vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH), uint64_t(0));
-      vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT), uint64_t(1));
-      vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH), uint64_t(2));
-      return vec;
+      return buildVector(3, i32, [&](unsigned i) {
+         switch (i) {
+         case 0:
+            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+         case 1:
+            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT);
+         default:
+            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH);
+         }
+      });
    }
 
    Value *dispatchArg(const nir_def *def, uint32_t offset)
@@ -271,13 +276,10 @@ private:
       Value *addr32 = asInt32(addr);
       if (def->bit_size == 64)
          return builder.CreateZExt(addr32, i64);
-      if (def->num_components > 1) {
-         Value *vec =
-            Constant::getNullValue(FixedVectorType::get(i32, def->num_components));
-         vec = builder.Insert(InsertElementInst::Create(
-            vec, addr32, ConstantInt::get(i32, 0)));
-         return vec;
-      }
+      if (def->num_components > 1)
+         return buildVector(def->num_components, i32, [&](unsigned i) {
+            return i == 0 ? addr32 : ConstantInt::get(i32, 0);
+         });
       return addr32;
    }
 
@@ -315,11 +317,8 @@ private:
       if (def->num_components <= 1)
          return loadScalar(0);
 
-      Type *vecType = defType(def);
-      Value *vec = ConstantAggregateZero::get(vecType);
-      for (unsigned i = 0; i < def->num_components; ++i)
-         vec = builder.CreateInsertElement(vec, loadScalar(i), uint64_t(i));
-      return vec;
+      return buildVector(def->num_components, scalarType(def->bit_size),
+                         loadScalar);
    }
 
    bool isKernelMain(void) const
@@ -362,8 +361,12 @@ private:
       std::string name = "vt_" + stage_name(shader->info.stage);
       if (shader->info.stage == MESA_SHADER_RAYGEN)
          name = "main";
-      return Function::Create(FunctionType::get(Type::getVoidTy(context), false),
-                              GlobalValue::ExternalLinkage, name, module);
+      Function *fn =
+         Function::Create(FunctionType::get(Type::getVoidTy(context), false),
+                          GlobalValue::ExternalLinkage, name, module);
+      if (name == "main")
+         fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
+      return fn;
    }
 
    Value *callI32Intrinsic(StringRef name)
@@ -378,7 +381,7 @@ private:
          if (!var || variables.count(var))
             return;
          AllocaInst *alloca =
-            builder.CreateAlloca(FixedVectorType::get(i32, 4), nullptr,
+            builder.CreateAlloca(ArrayType::get(i32, 4), nullptr,
                                  var->name ? var->name : "nir.var");
          alloca->setAlignment(Align(16));
          variables[var] = alloca;
@@ -446,6 +449,14 @@ private:
             idx = count - 1;
          return builder.CreateExtractElement(v, uint64_t(idx));
       }
+      if (auto *structType = dyn_cast<StructType>(v->getType())) {
+         unsigned count = structType->getNumElements();
+         if (!count)
+            return UndefValue::get(i32);
+         if (idx >= count)
+            idx = count - 1;
+         return builder.CreateExtractValue(v, {idx});
+      }
       return v;
    }
 
@@ -486,11 +497,9 @@ private:
          return component(src, alu->src[srcIdx].swizzle[0]);
 
       Type *scalar = component(src, alu->src[srcIdx].swizzle[0])->getType();
-      Value *vec = ConstantAggregateZero::get(FixedVectorType::get(scalar, components));
-      for (unsigned i = 0; i < components; ++i)
-         vec = builder.CreateInsertElement(
-            vec, component(src, alu->src[srcIdx].swizzle[i]), uint64_t(i));
-      return vec;
+      return buildVector(components, scalar, [&](unsigned i) {
+         return component(src, alu->src[srcIdx].swizzle[i]);
+      });
    }
 
    Value *asBool(Value *v)
@@ -503,6 +512,8 @@ private:
          return builder.CreateFCmpONE(v, ConstantFP::get(v->getType(), 0.0));
       if (isa<FixedVectorType>(v->getType()))
          return asBool(builder.CreateExtractElement(v, uint64_t(0)));
+      if (isa<StructType>(v->getType()))
+         return asBool(component(v, 0));
       if (v->getType()->isPointerTy())
          return builder.CreateIsNotNull(v);
       return ConstantInt::getFalse(context);
@@ -522,6 +533,8 @@ private:
       if (v->getType()->isIntegerTy(32))
          return v;
       if (isa<FixedVectorType>(v->getType()))
+         return asInt32(component(v, 0));
+      if (isa<StructType>(v->getType()))
          return asInt32(component(v, 0));
       if (v->getType()->isFloatingPointTy())
          return reinterpretF32AsI32(v);
@@ -567,6 +580,12 @@ private:
                                                uint64_t(i));
          return bits;
       }
+      if (auto *structType = dyn_cast<StructType>(v->getType())) {
+         unsigned count = structType->getNumElements();
+         return buildVector(count, i32, [&](unsigned i) {
+            return asInt32(component(v, i));
+         });
+      }
       return asInt32(v);
    }
 
@@ -576,12 +595,51 @@ private:
       if (components <= 1)
          return element(0);
 
-      Value *vec =
-         Constant::getNullValue(FixedVectorType::get(scalarType, components));
+      std::vector<Type *> fields(components, scalarType);
+      Value *vec = UndefValue::get(StructType::get(context, fields));
       for (unsigned i = 0; i < components; ++i)
-         vec = builder.Insert(InsertElementInst::Create(
-            vec, element(i), ConstantInt::get(i32, i)));
+         vec = builder.CreateInsertValue(vec, element(i), {i});
       return vec;
+   }
+
+   Value *localSlotPtr(Value *ptr, unsigned component)
+   {
+      return builder.CreateInBoundsGEP(
+         ArrayType::get(i32, 4), ptr,
+         {ConstantInt::get(i32, 0), ConstantInt::get(i32, component)});
+   }
+
+   Value *loadLocalValue(Value *ptr, const nir_def *def)
+   {
+      auto loadScalar = [&](unsigned component) -> Value * {
+         LoadInst *load = builder.CreateLoad(i32, localSlotPtr(ptr, component));
+         load->setAlignment(Align(4));
+         if (def->bit_size == 1)
+            return builder.CreateICmpNE(load, ConstantInt::get(i32, 0));
+         if (def->bit_size == 64)
+            return builder.CreateZExt(load, i64);
+         return load;
+      };
+
+      if (def->num_components <= 1)
+         return loadScalar(0);
+      return buildVector(def->num_components, scalarType(def->bit_size),
+                         loadScalar);
+   }
+
+   void storeLocalValue(Value *ptr, Value *value)
+   {
+      unsigned components = 1;
+      if (auto *structType = dyn_cast<StructType>(value->getType()))
+         components = std::min<unsigned>(structType->getNumElements(), 4);
+      else if (auto *vecType = dyn_cast<FixedVectorType>(value->getType()))
+         components = std::min<unsigned>(vecType->getNumElements(), 4);
+
+      for (unsigned i = 0; i < components; ++i) {
+         StoreInst *store =
+            builder.CreateStore(asInt32(component(value, i)), localSlotPtr(ptr, i));
+         store->setAlignment(Align(4));
+      }
    }
 
    Value *floatResult(const nir_def *def,
@@ -631,17 +689,50 @@ private:
       return builder.CreateAnd(asInt32(v), ConstantInt::get(i32, 0xff));
    }
 
+   Value *unorm8Component(Value *v)
+   {
+      Value *bits = asInt32(v);
+      Value *sign = builder.CreateICmpNE(
+         builder.CreateAnd(bits, ConstantInt::get(i32, 0x80000000u)),
+         ConstantInt::get(i32, 0));
+      Value *geOne =
+         builder.CreateICmpUGE(bits, ConstantInt::get(i32, 0x3f800000u));
+      Value *tooSmall =
+         builder.CreateICmpULT(bits, ConstantInt::get(i32, 0x3b800000u));
+
+      Value *exp = builder.CreateAnd(builder.CreateLShr(bits, 23),
+                                     ConstantInt::get(i32, 0xff));
+      Value *mant = builder.CreateOr(
+         builder.CreateAnd(bits, ConstantInt::get(i32, 0x007fffffu)),
+         ConstantInt::get(i32, 0x00800000u));
+      Value *scaled = builder.CreateMul(mant, ConstantInt::get(i32, 255));
+
+      Value *shift = builder.CreateSub(ConstantInt::get(i32, 150), exp);
+      shift = builder.CreateSelect(builder.CreateICmpULT(exp,
+                                                         ConstantInt::get(i32, 119)),
+                                   ConstantInt::get(i32, 31), shift);
+      shift = builder.CreateSelect(builder.CreateICmpUGT(exp,
+                                                         ConstantInt::get(i32, 150)),
+                                   ConstantInt::get(i32, 0), shift);
+
+      Value *converted = builder.CreateLShr(scaled, shift);
+      converted = builder.CreateSelect(geOne, ConstantInt::get(i32, 255),
+                                       converted);
+      return builder.CreateSelect(builder.CreateOr(sign, tooSmall),
+                                  ConstantInt::get(i32, 0), converted);
+   }
+
    Value *packRGBA8(Value *value, unsigned r_channel, unsigned g_channel,
                     unsigned b_channel, unsigned a_channel)
    {
-      Value *r = byteComponent(component(value, r_channel));
-      Value *g = byteComponent(component(value, g_channel));
-      Value *b = byteComponent(component(value, b_channel));
+      Value *r = byteComponent(unorm8Component(component(value, r_channel)));
+      Value *g = byteComponent(unorm8Component(component(value, g_channel)));
+      Value *b = byteComponent(unorm8Component(component(value, b_channel)));
       Value *a =
          byteComponent((a_channel == 3 &&
                        !isa<FixedVectorType>(value->getType())) ?
                             ConstantInt::get(i32, 255)
-                            : component(value, a_channel));
+                            : unorm8Component(component(value, a_channel)));
 
       return builder.CreateOr(
          builder.CreateOr(r, builder.CreateShl(g, ConstantInt::get(i32, 8))),
@@ -655,8 +746,9 @@ private:
       Value *stride = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE);
       Value *format = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT);
       Value *x = asInt32(component(coord, 0));
-      Value *y = isa<FixedVectorType>(coord->getType()) ?
-         asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
+      Value *y = (isa<FixedVectorType>(coord->getType()) ||
+                  isa<StructType>(coord->getType())) ?
+                    asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
       Function *fn = declare("llvm.riscv.ventus.image.store.rgba8",
                              builder.getVoidTy(),
                              {i32, i32, i32, i32, i32});
@@ -679,7 +771,7 @@ private:
       Type *scalar = scalarType(instr->def.bit_size);
       for (unsigned i = 0; i < instr->def.num_components; ++i)
          values.push_back(ConstantInt::get(scalar, instr->value[i].u64));
-      return ConstantVector::get(values);
+      return ConstantStruct::getAnon(values);
    }
 
    Value *lowerDeref(nir_deref_instr *deref)
@@ -995,10 +1087,9 @@ private:
       case nir_op_vec3:
       case nir_op_vec4: {
          unsigned count = alu->op == nir_op_vec2 ? 2 : alu->op == nir_op_vec3 ? 3 : 4;
-         Value *vec = ConstantAggregateZero::get(FixedVectorType::get(i32, count));
-         for (unsigned i = 0; i < count; ++i)
-            vec = builder.CreateInsertElement(vec, asInt32(src(i)), i);
-         return vec;
+         return buildVector(count, i32, [&](unsigned i) {
+            return asInt32(src(i));
+         });
       }
       default:
          if (debugLowering)
@@ -1042,6 +1133,10 @@ private:
          Value *offset = asInt32(value(intrin->src[1]));
          return loadGlobalForDef(base, offset, &intrin->def);
       }
+      case nir_intrinsic_load_global: {
+         return loadGlobalForDef(value(intrin->src[0]), ConstantInt::get(i32, 0),
+                                &intrin->def);
+      }
       case nir_intrinsic_image_deref_store:
       case nir_intrinsic_image_store: {
          storeStorageImage(value(intrin->src[1]), value(intrin->src[3]));
@@ -1049,15 +1144,16 @@ private:
       }
       case nir_intrinsic_image_deref_size:
       case nir_intrinsic_image_size: {
-         Type *vecType = FixedVectorType::get(i32, 3);
-         Value *vec = ConstantAggregateZero::get(vecType);
-         vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH), uint64_t(0));
-         vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT), uint64_t(1));
-         vec = builder.CreateInsertElement(
-         vec, dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH), uint64_t(2));
-         return vec;
+         return buildVector(3, i32, [&](unsigned i) {
+            switch (i) {
+            case 0:
+               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+            case 1:
+               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT);
+            default:
+               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH);
+            }
+         });
       }
       case nir_intrinsic_load_deref: {
          if (intrin->src[0].ssa) {
@@ -1079,12 +1175,12 @@ private:
          Value *ptr = value(intrin->src[0]);
          if (!ptr->getType()->isPointerTy())
             return loadGlobalForDef(ptr, ConstantInt::get(i32, 0), &intrin->def);
-         return builder.CreateLoad(defType(&intrin->def), ptr);
+         return loadLocalValue(ptr, &intrin->def);
       }
       case nir_intrinsic_store_deref: {
          Value *ptr = value(intrin->src[0]);
          if (ptr->getType()->isPointerTy())
-            builder.CreateStore(asStorageBits(value(intrin->src[1])), ptr);
+            storeLocalValue(ptr, value(intrin->src[1]));
          return nullptr;
       }
       case nir_intrinsic_load_shared: {

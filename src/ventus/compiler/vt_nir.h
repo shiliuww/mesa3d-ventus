@@ -105,6 +105,8 @@ struct vt_nir_rt_result {
    nir_def *sbt_index;
    nir_def *instance_sbt_record_offset;
    nir_def *geometry_index;
+   nir_def *hit_shader_record_ptr;
+   nir_def *miss_shader_record_ptr;
    nir_def *shader_record_ptr;
 };
 

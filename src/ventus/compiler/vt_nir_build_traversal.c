@@ -236,6 +236,19 @@ load_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
    return nir_ventus_rt_load_slot(b, 1, 32, slot_offset(b, base, word));
 }
 
+static nir_def *
+load_traversal_status(nir_builder *b, nir_def *base)
+{
+   nir_def *raw_status = load_word(b, base, VT_RT_SLOT_STATUS);
+   nir_def *complete_hit = nir_imm_int(b, VT_RT_TRAVERSAL_COMPLETE_HIT);
+   nir_def *complete_miss = nir_imm_int(b, VT_RT_TRAVERSAL_COMPLETE_MISS);
+
+   return nir_bcsel(b, nir_ieq_imm(b, raw_status, VT_RT_STATUS_HIT),
+                    complete_hit,
+                    nir_bcsel(b, nir_ieq_imm(b, raw_status, VT_RT_STATUS_MISS),
+                               complete_miss, raw_status));
+}
+
 static void
 store_vec3(nir_builder *b, nir_def *base, enum vt_rt_slot_word first_word, nir_def *value)
 {
@@ -337,7 +350,8 @@ vt_nir_build_traversal(nir_builder *b,
    store_word(b, base, VT_RT_SLOT_TMAX, params->tmax);
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
 
-   nir_def *status = nir_ventus_rt_traverse(b, base);
+   nir_ventus_rt_traverse(b, base);
+   nir_def *status = load_traversal_status(b, base);
    nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
    nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
    nir_def *candidate_non_opaque_triangle =
@@ -453,6 +467,8 @@ vt_nir_build_traversal(nir_builder *b,
       .sbt_index = sbt_index,
       .instance_sbt_record_offset = instance_sbt_record_offset,
       .geometry_index = geometry_index,
+      .hit_shader_record_ptr = hit_shader_record_ptr,
+      .miss_shader_record_ptr = miss_shader_record_ptr,
       .shader_record_ptr = shader_record_ptr,
    };
    return result;
