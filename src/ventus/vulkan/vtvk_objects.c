@@ -4,6 +4,7 @@
 
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
+#include "vk_common_entrypoints.h"
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 
@@ -32,6 +33,27 @@ struct vtvk_image {
 struct vtvk_image_view {
    VkImage image;
    VkFormat format;
+};
+
+struct vtvk_sampler {
+   uint32_t unused;
+};
+
+struct vtvk_render_pass {
+   uint32_t attachment_count;
+   uint32_t subpass_count;
+};
+
+struct vtvk_framebuffer {
+   VkRenderPass render_pass;
+   uint32_t attachment_count;
+   uint32_t width;
+   uint32_t height;
+   uint32_t layers;
+};
+
+struct vtvk_pipeline_cache {
+   uint32_t unused;
 };
 
 struct vtvk_fence {
@@ -110,6 +132,22 @@ static uint64_t
 vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
+}
+
+static VkPipelineBindPoint
+vtvk_bind_point_from_shader_stages(VkShaderStageFlags stage_flags)
+{
+   const VkShaderStageFlags rt_stages =
+      VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+      VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+      VK_SHADER_STAGE_MISS_BIT_KHR |
+      VK_SHADER_STAGE_INTERSECTION_BIT_KHR |
+      VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+
+   return (stage_flags & rt_stages) ?
+             VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR :
+             VK_PIPELINE_BIND_POINT_GRAPHICS;
 }
 
 VkDeviceAddress
@@ -443,6 +481,178 @@ vtvk_DestroyImageView(VkDevice _device,
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    vk_free(alloc, vtvk_handle_to_ptr((uint64_t)imageView));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreateSampler(VkDevice _device,
+                   const VkSamplerCreateInfo *pCreateInfo,
+                   const VkAllocationCallbacks *pAllocator,
+                   VkSampler *pSampler)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   (void)pCreateInfo;
+
+   struct vtvk_sampler *sampler =
+      vk_zalloc(alloc, sizeof(*sampler), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!sampler)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   *pSampler = (VkSampler)vtvk_ptr_to_handle(sampler);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_DestroySampler(VkDevice _device,
+                    VkSampler sampler,
+                    const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   vk_free(alloc, vtvk_handle_to_ptr((uint64_t)sampler));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreateShaderModule(VkDevice device,
+                        const VkShaderModuleCreateInfo *pCreateInfo,
+                        const VkAllocationCallbacks *pAllocator,
+                        VkShaderModule *pShaderModule)
+{
+   return vk_common_CreateShaderModule(device, pCreateInfo, pAllocator,
+                                       pShaderModule);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_DestroyShaderModule(VkDevice device,
+                         VkShaderModule shaderModule,
+                         const VkAllocationCallbacks *pAllocator)
+{
+   vk_common_DestroyShaderModule(device, shaderModule, pAllocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreatePipelineCache(VkDevice _device,
+                         const VkPipelineCacheCreateInfo *pCreateInfo,
+                         const VkAllocationCallbacks *pAllocator,
+                         VkPipelineCache *pPipelineCache)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   (void)pCreateInfo;
+
+   struct vtvk_pipeline_cache *cache =
+      vk_zalloc(alloc, sizeof(*cache), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!cache)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   *pPipelineCache = (VkPipelineCache)vtvk_ptr_to_handle(cache);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_DestroyPipelineCache(VkDevice _device,
+                          VkPipelineCache pipelineCache,
+                          const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   vk_free(alloc, vtvk_handle_to_ptr((uint64_t)pipelineCache));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreateRenderPass(VkDevice _device,
+                      const VkRenderPassCreateInfo *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator,
+                      VkRenderPass *pRenderPass)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+
+   struct vtvk_render_pass *render_pass =
+      vk_zalloc(alloc, sizeof(*render_pass), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!render_pass)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   render_pass->attachment_count = pCreateInfo->attachmentCount;
+   render_pass->subpass_count = pCreateInfo->subpassCount;
+   *pRenderPass = (VkRenderPass)vtvk_ptr_to_handle(render_pass);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreateRenderPass2(VkDevice _device,
+                       const VkRenderPassCreateInfo2 *pCreateInfo,
+                       const VkAllocationCallbacks *pAllocator,
+                       VkRenderPass *pRenderPass)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+
+   struct vtvk_render_pass *render_pass =
+      vk_zalloc(alloc, sizeof(*render_pass), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!render_pass)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   render_pass->attachment_count = pCreateInfo->attachmentCount;
+   render_pass->subpass_count = pCreateInfo->subpassCount;
+   *pRenderPass = (VkRenderPass)vtvk_ptr_to_handle(render_pass);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_DestroyRenderPass(VkDevice _device,
+                       VkRenderPass renderPass,
+                       const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   vk_free(alloc, vtvk_handle_to_ptr((uint64_t)renderPass));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_GetRenderAreaGranularity(VkDevice device,
+                              VkRenderPass renderPass,
+                              VkExtent2D *pGranularity)
+{
+   (void)device;
+   (void)renderPass;
+   *pGranularity = (VkExtent2D){ 1, 1 };
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vtvk_CreateFramebuffer(VkDevice _device,
+                       const VkFramebufferCreateInfo *pCreateInfo,
+                       const VkAllocationCallbacks *pAllocator,
+                       VkFramebuffer *pFramebuffer)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+
+   struct vtvk_framebuffer *framebuffer =
+      vk_zalloc(alloc, sizeof(*framebuffer), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!framebuffer)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   framebuffer->render_pass = pCreateInfo->renderPass;
+   framebuffer->attachment_count = pCreateInfo->attachmentCount;
+   framebuffer->width = pCreateInfo->width;
+   framebuffer->height = pCreateInfo->height;
+   framebuffer->layers = pCreateInfo->layers;
+   *pFramebuffer = (VkFramebuffer)vtvk_ptr_to_handle(framebuffer);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_DestroyFramebuffer(VkDevice _device,
+                        VkFramebuffer framebuffer,
+                        const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(vtvk_device, device, _device);
+   const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   vk_free(alloc, vtvk_handle_to_ptr((uint64_t)framebuffer));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1020,6 +1230,253 @@ vtvk_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
       if (set < VTVK_MAX_BOUND_DESCRIPTOR_SETS)
          cmd->bound_descriptor_sets[set] = pDescriptorSets[i];
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
+                            const VkBindDescriptorSetsInfo *pBindDescriptorSetsInfo)
+{
+   vtvk_CmdBindDescriptorSets(commandBuffer,
+                              vtvk_bind_point_from_shader_stages(
+                                 pBindDescriptorSetsInfo->stageFlags),
+                              pBindDescriptorSetsInfo->layout,
+                              pBindDescriptorSetsInfo->firstSet,
+                              pBindDescriptorSetsInfo->descriptorSetCount,
+                              pBindDescriptorSetsInfo->pDescriptorSets,
+                              pBindDescriptorSetsInfo->dynamicOffsetCount,
+                              pBindDescriptorSetsInfo->pDynamicOffsets);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdPushConstants(VkCommandBuffer commandBuffer,
+                      VkPipelineLayout layout,
+                      VkShaderStageFlags stageFlags,
+                      uint32_t offset,
+                      uint32_t size,
+                      const void *pValues)
+{
+   (void)commandBuffer;
+   (void)layout;
+   (void)stageFlags;
+   (void)offset;
+   (void)size;
+   (void)pValues;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
+                       const VkPushConstantsInfo *pPushConstantsInfo)
+{
+   (void)commandBuffer;
+   (void)pPushConstantsInfo;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdSetViewport(VkCommandBuffer commandBuffer,
+                    uint32_t firstViewport,
+                    uint32_t viewportCount,
+                    const VkViewport *pViewports)
+{
+   (void)commandBuffer;
+   (void)firstViewport;
+   (void)viewportCount;
+   (void)pViewports;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdSetScissor(VkCommandBuffer commandBuffer,
+                   uint32_t firstScissor,
+                   uint32_t scissorCount,
+                   const VkRect2D *pScissors)
+{
+   (void)commandBuffer;
+   (void)firstScissor;
+   (void)scissorCount;
+   (void)pScissors;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBindVertexBuffers(VkCommandBuffer commandBuffer,
+                          uint32_t firstBinding,
+                          uint32_t bindingCount,
+                          const VkBuffer *pBuffers,
+                          const VkDeviceSize *pOffsets)
+{
+   (void)commandBuffer;
+   (void)firstBinding;
+   (void)bindingCount;
+   (void)pBuffers;
+   (void)pOffsets;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+                           uint32_t firstBinding,
+                           uint32_t bindingCount,
+                           const VkBuffer *pBuffers,
+                           const VkDeviceSize *pOffsets,
+                           const VkDeviceSize *pSizes,
+                           const VkDeviceSize *pStrides)
+{
+   (void)pSizes;
+   (void)pStrides;
+   vtvk_CmdBindVertexBuffers(commandBuffer, firstBinding, bindingCount,
+                             pBuffers, pOffsets);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
+                        VkBuffer buffer,
+                        VkDeviceSize offset,
+                        VkIndexType indexType)
+{
+   (void)commandBuffer;
+   (void)buffer;
+   (void)offset;
+   (void)indexType;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer,
+                         VkBuffer buffer,
+                         VkDeviceSize offset,
+                         VkDeviceSize size,
+                         VkIndexType indexType)
+{
+   (void)size;
+   vtvk_CmdBindIndexBuffer(commandBuffer, buffer, offset, indexType);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdDraw(VkCommandBuffer commandBuffer,
+             uint32_t vertexCount,
+             uint32_t instanceCount,
+             uint32_t firstVertex,
+             uint32_t firstInstance)
+{
+   (void)commandBuffer;
+   (void)vertexCount;
+   (void)instanceCount;
+   (void)firstVertex;
+   (void)firstInstance;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+                    uint32_t indexCount,
+                    uint32_t instanceCount,
+                    uint32_t firstIndex,
+                    int32_t vertexOffset,
+                    uint32_t firstInstance)
+{
+   (void)commandBuffer;
+   (void)indexCount;
+   (void)instanceCount;
+   (void)firstIndex;
+   (void)vertexOffset;
+   (void)firstInstance;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdDrawIndirect(VkCommandBuffer commandBuffer,
+                     VkBuffer buffer,
+                     VkDeviceSize offset,
+                     uint32_t drawCount,
+                     uint32_t stride)
+{
+   (void)commandBuffer;
+   (void)buffer;
+   (void)offset;
+   (void)drawCount;
+   (void)stride;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+                            VkBuffer buffer,
+                            VkDeviceSize offset,
+                            uint32_t drawCount,
+                            uint32_t stride)
+{
+   (void)commandBuffer;
+   (void)buffer;
+   (void)offset;
+   (void)drawCount;
+   (void)stride;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
+                        const VkRenderPassBeginInfo *pRenderPassBegin,
+                        VkSubpassContents contents)
+{
+   (void)commandBuffer;
+   (void)pRenderPassBegin;
+   (void)contents;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                         const VkRenderPassBeginInfo *pRenderPassBegin,
+                         const VkSubpassBeginInfo *pSubpassBeginInfo)
+{
+   (void)pSubpassBeginInfo;
+   vtvk_CmdBeginRenderPass(commandBuffer, pRenderPassBegin,
+                           VK_SUBPASS_CONTENTS_INLINE);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdNextSubpass(VkCommandBuffer commandBuffer,
+                    VkSubpassContents contents)
+{
+   (void)commandBuffer;
+   (void)contents;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdNextSubpass2(VkCommandBuffer commandBuffer,
+                     const VkSubpassBeginInfo *pSubpassBeginInfo,
+                     const VkSubpassEndInfo *pSubpassEndInfo)
+{
+   (void)commandBuffer;
+   (void)pSubpassBeginInfo;
+   (void)pSubpassEndInfo;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdEndRenderPass(VkCommandBuffer commandBuffer)
+{
+   (void)commandBuffer;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+                       const VkSubpassEndInfo *pSubpassEndInfo)
+{
+   (void)pSubpassEndInfo;
+   vtvk_CmdEndRenderPass(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                       const VkRenderingInfo *pRenderingInfo)
+{
+   (void)commandBuffer;
+   (void)pRenderingInfo;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdEndRendering(VkCommandBuffer commandBuffer)
+{
+   (void)commandBuffer;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+                         const VkRenderingEndInfoKHR *pRenderingEndInfo)
+{
+   (void)pRenderingEndInfo;
+   vtvk_CmdEndRendering(commandBuffer);
 }
 
 VKAPI_ATTR void VKAPI_CALL

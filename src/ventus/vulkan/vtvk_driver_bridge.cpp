@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <algorithm>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -240,6 +241,49 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
           api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
 }
 
+static bool
+vtvk_driver_dump_image_ppm(const char *path, const void *data,
+                           uint32_t width, uint32_t height, VkFormat format)
+{
+   if (!path || !path[0] || !data || !width || !height)
+      return true;
+
+   FILE *file = fopen(path, "wb");
+   if (!file) {
+      mesa_loge("ventus-vk: failed to open image dump %s", path);
+      return false;
+   }
+
+   fprintf(file, "P6\n%u %u\n255\n", width, height);
+   const uint8_t *pixels = (const uint8_t *)data;
+   for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+         const uint8_t *p = pixels + ((uint64_t)y * width + x) * 4;
+         uint8_t rgb[3];
+         switch (format) {
+         case VK_FORMAT_B8G8R8A8_UNORM:
+            rgb[0] = p[2];
+            rgb[1] = p[1];
+            rgb[2] = p[0];
+            break;
+         default:
+            rgb[0] = p[0];
+            rgb[1] = p[1];
+            rgb[2] = p[2];
+            break;
+         }
+         fwrite(rgb, 1, sizeof(rgb), file);
+      }
+   }
+
+   bool ok = fclose(file) == 0;
+   if (ok)
+      mesa_logi("ventus-vk: dumped Spike storage image to %s", path);
+   else
+      mesa_loge("ventus-vk: failed to write image dump %s", path);
+   return ok;
+}
+
 static void
 vtvk_driver_log_u32_words(const char *name, const void *data, uint64_t size,
                           uint32_t max_words)
@@ -454,6 +498,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                  (uint64_t)64 * 1024),
                             4096);
    struct vtvk_driver_kernel_metadata kernel = {};
+   const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
    if (!vtvk_driver_upload_as(&driver, info->tlas, &uploads)) {
       mesa_loge("ventus-vk: driver bridge failed to upload TLAS");
@@ -583,6 +628,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                 "%08x %08x %08x %08x",
                 pixels[0], pixels[1], pixels[2], pixels[3]);
    }
+
+   if (!vtvk_driver_dump_image_ppm(dump_image, info->storage_image_data,
+                                   image_width, image_height,
+                                   info->image_format))
+      goto out;
 
    mesa_logi("ventus-vk: driver bridge executed raygen kernel %s",
              kernel_path);
