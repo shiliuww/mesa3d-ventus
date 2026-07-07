@@ -11,12 +11,23 @@ vtvk_entrypoints = custom_target(
 )
 
 libvtvk_files = files(
+  'vtvk_acceleration_structure.cpp',
+  'vtvk_cmd_buffer.c',
+  'vtvk_descriptors.c',
   'vtvk_device.c',
+  'vtvk_driver_bridge.cpp',
   'vtvk_instance.c',
+  'vtvk_memory.c',
   'vtvk_objects.c',
   'vtvk_physical_device.c',
-  'vtvk_driver_bridge.cpp',
   'vtvk_pipeline.cpp',
+  'vtvk_pipeline_graphics.cpp',
+  'vtvk_pipeline_rt.cpp',
+  'vtvk_render_compat.c',
+  'vtvk_rt_unsupported.cpp',
+  'vtvk_shader.c',
+  'vtvk_sync.c',
+  'vtvk_trace.cpp',
 )
 
 libvulkan_ventus = shared_library(
