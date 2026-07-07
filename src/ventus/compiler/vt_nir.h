@@ -247,6 +247,8 @@ bool vt_nir_lower_rt_control(nir_shader *shader,
 bool vt_nir_lower_shader_scratch(nir_shader *shader,
                                  const struct vt_nir_rt_config *config);
 
+bool vt_nir_lower_descriptors(nir_shader *shader);
+
 void vt_nir_pipeline_scratch_init(struct vt_nir_pipeline_scratch_info *info);
 
 void vt_nir_pipeline_scratch_include_shader(struct vt_nir_pipeline_scratch_info *info,
@@ -281,7 +283,22 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE = 136,
    VT_NIR_RT_DISPATCH_ARG_CAMERA_SIZE = 140,
    VT_NIR_RT_DISPATCH_ARG_SCRATCH_STRIDE = 144,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 152,
+   VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR = 152,
+   VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_COUNT = 160,
+   VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE = 164,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 168,
+};
+
+enum vt_nir_rt_descriptor_record {
+   VT_NIR_RT_DESCRIPTOR_RECORD_TYPE = 0,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SET = 4,
+   VT_NIR_RT_DESCRIPTOR_RECORD_BINDING = 8,
+   VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT = 12,
+   VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR = 16,
+   VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE = 24,
+   VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE = 32,
+   VT_NIR_RT_DESCRIPTOR_RECORD_AUX = 36,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 40,
 };
 
 #ifdef __cplusplus

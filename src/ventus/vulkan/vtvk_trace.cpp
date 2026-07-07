@@ -1,6 +1,7 @@
 #include "vtvk_pipeline.h"
 
 #include <cstdint>
+#include <vector>
 
 #include "util/log.h"
 #include "vtvk_driver_bridge.h"
@@ -10,6 +11,42 @@ static void *
 vtvk_handle_to_ptr(uint64_t handle)
 {
    return (void *)(uintptr_t)handle;
+}
+
+static bool
+vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
+                           std::vector<vtvk_rt_descriptor_source> *out)
+{
+   struct vtvk_descriptor_binding_info info = {};
+   if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info))
+      return false;
+
+   struct vtvk_rt_descriptor_source desc = {};
+   desc.type = info.type;
+   desc.set = 0;
+   desc.binding = binding;
+
+   switch (info.type) {
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+      desc.acceleration_structure = info.acceleration_structure;
+      break;
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      desc.image = info.image;
+      break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      desc.buffer = info.buffer.buffer;
+      desc.offset = info.buffer.offset;
+      desc.range = info.buffer.range;
+      break;
+   default:
+      mesa_loge("ventus-vk: unsupported RT descriptor set=0 binding=%u type=%u",
+                binding, (unsigned)info.type);
+      return false;
+   }
+
+   out->push_back(desc);
+   return true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -46,6 +83,11 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    void *camera_data =
       vtvk_descriptor_set_buffer_ptr(descriptor_set, 2, &camera_range);
 
+   std::vector<vtvk_rt_descriptor_source> descriptors;
+   descriptors.reserve(5);
+   for (uint32_t binding = 0; binding <= 4; binding++)
+      vtvk_collect_rt_descriptor(descriptor_set, binding, &descriptors);
+
    if (!pipeline || !tlas || !tlas->address || !storage_image_data ||
        !camera_data) {
       mesa_loge("ventus-vk: vkCmdTraceRaysKHR missing Spike dispatch state "
@@ -59,11 +101,11 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
       logged = true;
       mesa_logi("ventus-vk: vkCmdTraceRaysKHR collected Spike dispatch state "
                 "%ux%ux%u tlas=0x%" PRIx64 " image=%ux%u format=%u "
-                "scratch=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
+                "descriptors=%zu scratch=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
                 ",hit:0x%" PRIx64 "}",
                 width, height, depth, (uint64_t)tlas->address,
                 image_extent.width, image_extent.height, image_format,
-                pipeline->per_lane_scratch_size,
+                descriptors.size(), pipeline->per_lane_scratch_size,
                 pRaygenShaderBindingTable ?
                    (uint64_t)pRaygenShaderBindingTable->deviceAddress : 0,
                 pMissShaderBindingTable ?
@@ -89,6 +131,8 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.per_lane_scratch_size = pipeline->per_lane_scratch_size;
    trace.kernel_path = pipeline->generated_kernel_path;
    trace.kernel_entry = pipeline->generated_kernel_entry;
+   trace.descriptors = descriptors.data();
+   trace.descriptor_count = descriptors.size();
 
    vtvk_driver_trace_rays(&trace);
 }

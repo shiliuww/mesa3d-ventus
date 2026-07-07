@@ -5,6 +5,8 @@
 
 #include "vt_nir.h"
 
+#define VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT 0x8u
+
 struct lower_rt_io_state {
    const struct vt_nir_rt_config *config;
 };
@@ -19,6 +21,13 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
    nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
    nir_builder_instr_insert(b, &intrin->instr);
    return &intrin->def;
+}
+
+static bool
+trace_ray_has_const_flag(nir_intrinsic_instr *intrin, uint32_t flag)
+{
+   return nir_src_is_const(intrin->src[1]) &&
+          (nir_src_as_uint(intrin->src[1]) & flag) != 0;
 }
 
 static bool
@@ -67,12 +76,14 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
    nir_def *candidate_procedural =
       nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
+   bool skip_closest_hit =
+      trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
 
    if (config && config->enable_monolithic_shader_callbacks &&
        (config->emit_closest_hit || config->emit_miss ||
         config->emit_any_hit || config->emit_intersection)) {
       nir_push_if(b, complete_hit);
-      if (config->emit_closest_hit)
+      if (!skip_closest_hit && config->emit_closest_hit)
          config->emit_closest_hit(b, &params, &result, config->callback_data);
 
       nir_push_else(b, NULL);
@@ -119,9 +130,16 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
       .config = config,
    };
 
-   bool progress =
-      nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,
-                                 &state);
+   bool progress = false;
+   for (uint32_t i = 0; i < 8; i++) {
+      bool pass_progress =
+         nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,
+                                    &state);
+      progress |= pass_progress;
+      if (!pass_progress)
+         break;
+   }
+
    if (progress) {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);
       if (impl) {

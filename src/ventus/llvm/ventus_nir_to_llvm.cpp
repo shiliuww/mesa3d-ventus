@@ -255,18 +255,29 @@ private:
                              def);
    }
 
+   Value *descriptorRecordBase(Value *binding)
+   {
+      Value *table = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR);
+      Value *stride =
+         dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE);
+      return builder.CreateAdd(
+         table, builder.CreateMul(asInt32(binding), stride));
+   }
+
+   Value *descriptorRecordI32(Value *binding, uint32_t offset)
+   {
+      return loadI32Global(descriptorRecordBase(binding), offset);
+   }
+
+   Value *descriptorAddressForBinding(Value *binding, const nir_def *def)
+   {
+      (void)def;
+      return descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
+   }
+
    Value *descriptorAddressForBinding(uint32_t binding, const nir_def *def)
    {
-      switch (binding) {
-      case 0:
-         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_TLAS_ADDR);
-      case 1:
-         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR);
-      case 2:
-         return dispatchArg(def, VT_NIR_RT_DISPATCH_ARG_CAMERA_ADDR);
-      default:
-         return ConstantInt::get(i32, 0);
-      }
+      return descriptorAddressForBinding(ConstantInt::get(i32, binding), def);
    }
 
    Value *descriptorValueForDef(const nir_def *def, Value *addr)
@@ -742,9 +753,13 @@ private:
 
    void storeStorageImage(Value *coord, Value *rgba)
    {
-      Value *imageBase = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_ADDR);
-      Value *stride = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE);
-      Value *format = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_IMAGE_FORMAT);
+      Value *imageBinding = ConstantInt::get(i32, 1);
+      Value *imageBase =
+         descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
+      Value *stride =
+         descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
+      Value *format =
+         descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *x = asInt32(component(coord, 0));
       Value *y = (isa<FixedVectorType>(coord->getType()) ||
                   isa<StructType>(coord->getType())) ?
@@ -849,6 +864,20 @@ private:
          return intBin([&](Value *a, Value *b) { return builder.CreateSub(a, b); });
       case nir_op_imul:
          return intBin([&](Value *a, Value *b) { return builder.CreateMul(a, b); });
+      case nir_op_idiv:
+         return intBin([&](Value *a, Value *b) { return builder.CreateSDiv(a, b); });
+      case nir_op_udiv:
+         return intBin([&](Value *a, Value *b) { return builder.CreateUDiv(a, b); });
+      case nir_op_imod:
+         return intBin([&](Value *a, Value *b) { return builder.CreateSRem(a, b); });
+      case nir_op_umod:
+         return intBin([&](Value *a, Value *b) { return builder.CreateURem(a, b); });
+      case nir_op_udiv_aligned_4:
+         return intResult(&alu->def, [&](unsigned i) {
+            unsigned bits = alu->def.bit_size == 64 ? 64 : 32;
+            return builder.CreateLShr(asInteger(src(0, i), bits),
+                                      ConstantInt::get(bits == 64 ? i64 : i32, 2));
+         });
       case nir_op_iand:
          return intBin([&](Value *a, Value *b) { return builder.CreateAnd(a, b); });
       case nir_op_ior:
@@ -1121,12 +1150,8 @@ private:
       }
       case nir_intrinsic_load_vulkan_descriptor: {
          Value *bindingValue = asInt32(value(intrin->src[0]));
-         if (auto *bindingConst = dyn_cast<ConstantInt>(bindingValue)) {
-            Value *addr =
-               descriptorAddressForBinding(bindingConst->getZExtValue(), &intrin->def);
-            return descriptorValueForDef(&intrin->def, addr);
-         }
-         return descriptorValueForDef(&intrin->def, ConstantInt::get(i32, 0));
+         Value *addr = descriptorAddressForBinding(bindingValue, &intrin->def);
+         return descriptorValueForDef(&intrin->def, addr);
       }
       case nir_intrinsic_load_ubo: {
          Value *base = asInt32(value(intrin->src[0]));

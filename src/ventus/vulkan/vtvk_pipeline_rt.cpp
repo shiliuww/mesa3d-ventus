@@ -571,6 +571,8 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    vt_nir_rt_config_apply_abi_layout(&config, &abi);
 
+   NIR_PASS(_, *nir_out, nir_lower_system_values);
+   NIR_PASS(_, *nir_out, vt_nir_lower_descriptors);
    NIR_PASS(_, *nir_out, vt_nir_lower_rt_abi, &config);
    nir_validate_shader(*nir_out, "after Ventus RT lowering");
    if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
@@ -729,6 +731,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
       NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
                &rt_io_config);
+      NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_descriptors);
    }
 
    pipeline->per_lane_scratch_size =

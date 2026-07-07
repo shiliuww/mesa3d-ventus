@@ -17,6 +17,11 @@
 
 #include "util/log.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "ventus/compiler/vt_nir.h"
+
+static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
+              VT_NIR_RT_DESCRIPTOR_RECORD_SIZE,
+              "RT descriptor ABI size mismatch");
 
 struct vtvk_driver_kernel_metadata {
    uint64_t kernel_id;
@@ -453,6 +458,94 @@ vtvk_driver_upload_sbt_region(struct vtvk_driver_api *api,
    return true;
 }
 
+static uint32_t
+vtvk_driver_descriptor_table_slots(const struct vtvk_driver_trace_rays_info *info)
+{
+   uint32_t slots = 5;
+   for (uint32_t i = 0; i < info->descriptor_count; i++)
+      slots = std::max(slots, info->descriptors[i].binding + 1);
+   return slots;
+}
+
+static bool
+vtvk_driver_upload_descriptor(
+   struct vtvk_driver_api *api,
+   const struct vtvk_rt_descriptor_source *src,
+   struct vtvk_rt_descriptor_record *record,
+   std::unordered_map<struct vtvk_acceleration_structure *,
+                      struct vtvk_driver_upload> *as_uploads)
+{
+   memset(record, 0, sizeof(*record));
+   record->type = src->type;
+   record->set = src->set;
+   record->binding = src->binding;
+
+   switch (src->type) {
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+      struct vtvk_acceleration_structure *as =
+         (struct vtvk_acceleration_structure *)
+            (uintptr_t)(uint64_t)src->acceleration_structure;
+      if (!as || !vtvk_driver_upload_as(api, as, as_uploads)) {
+         mesa_loge("ventus-vk: failed to upload AS descriptor binding=%u",
+                   src->binding);
+         return false;
+      }
+      record->device_addr = (*as_uploads)[as].dev_addr;
+      record->byte_size = (*as_uploads)[as].size;
+      break;
+   }
+
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+      VkExtent3D extent = {};
+      VkFormat format = VK_FORMAT_UNDEFINED;
+      void *host = vtvk_image_host_ptr(src->image, &extent, &format);
+      uint32_t bpp = vtvk_bridge_format_bytes_per_pixel(format);
+      uint32_t stride = extent.width * bpp;
+      uint64_t size = (uint64_t)stride * extent.height *
+                      (extent.depth ? extent.depth : 1);
+      if (!host || !vtvk_driver_alloc_copy(api, host, size, &record->device_addr)) {
+         mesa_loge("ventus-vk: failed to upload storage image descriptor binding=%u",
+                   src->binding);
+         return false;
+      }
+      record->byte_size = size;
+      record->format = format;
+      record->stride = stride;
+      record->aux = extent.width;
+      break;
+   }
+
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+      void *host = vtvk_buffer_host_ptr(src->buffer, src->offset, src->range);
+      if (!host || !vtvk_driver_alloc_copy(api, host, src->range,
+                                           &record->device_addr)) {
+         mesa_loge("ventus-vk: failed to upload buffer descriptor binding=%u "
+                   "range=%" PRIu64,
+                   src->binding, (uint64_t)src->range);
+         return false;
+      }
+      record->byte_size = src->range;
+      break;
+   }
+
+   default:
+      mesa_loge("ventus-vk: unsupported RT descriptor binding=%u type=%u",
+                src->binding, (unsigned)src->type);
+      return false;
+   }
+
+   if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG")) {
+      mesa_logi("ventus-vk: descriptor set=%u binding=%u type=%u "
+                "addr=0x%" PRIx64 " size=%" PRIu64 " stride=%u format=%u aux=%u",
+                record->set, record->binding, record->type,
+                record->device_addr, record->byte_size,
+                record->stride, record->format, record->aux);
+   }
+
+   return true;
+}
+
 extern "C" bool
 vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
 {
@@ -481,6 +574,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t tlas_dev_addr = 0;
    uint64_t image_dev_addr = 0;
    uint64_t camera_dev_addr = 0;
+   uint64_t descriptor_table_dev_addr = 0;
    uint64_t args_dev_addr = 0;
    uint64_t metadata_dev_addr = 0;
    uint64_t pds_dev_addr = 0;
@@ -491,6 +585,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t image_bytes =
       (uint64_t)image_width * image_height * image_depth * image_bpp;
    struct vtvk_rt_dispatch_args args = {};
+   std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
    uint32_t metadata[VTVK_KNL_MAX_METADATA_SIZE / 4] = {};
    uint64_t lanes = (uint64_t)info->width * info->height * MAX2(info->depth, 1u);
    uint64_t pds_size =
@@ -500,23 +595,61 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
-   if (!vtvk_driver_upload_as(&driver, info->tlas, &uploads)) {
-      mesa_loge("ventus-vk: driver bridge failed to upload TLAS");
-      goto out;
+   if (info->descriptor_count) {
+      uint32_t slots = vtvk_driver_descriptor_table_slots(info);
+      descriptor_table.resize(slots);
+      for (uint32_t binding = 0; binding < slots; binding++) {
+         descriptor_table[binding].set = 0;
+         descriptor_table[binding].binding = binding;
+      }
+
+      for (uint32_t i = 0; i < info->descriptor_count; i++) {
+         const struct vtvk_rt_descriptor_source *src = &info->descriptors[i];
+         if (src->set != 0 || src->binding >= slots) {
+            mesa_loge("ventus-vk: unsupported RT descriptor set=%u binding=%u",
+                      src->set, src->binding);
+            goto out;
+         }
+         if (!vtvk_driver_upload_descriptor(&driver, src,
+                                            &descriptor_table[src->binding],
+                                            &uploads))
+            goto out;
+      }
+
+      if (slots > 0)
+         tlas_dev_addr = descriptor_table[0].device_addr;
+      if (slots > 1)
+         image_dev_addr = descriptor_table[1].device_addr;
+      if (slots > 2)
+         camera_dev_addr = descriptor_table[2].device_addr;
+
+      if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
+                                  descriptor_table.size() *
+                                     sizeof(descriptor_table[0]),
+                                  &descriptor_table_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to upload descriptor table");
+         goto out;
+      }
+   } else {
+      if (!vtvk_driver_upload_as(&driver, info->tlas, &uploads)) {
+         mesa_loge("ventus-vk: driver bridge failed to upload TLAS");
+         goto out;
+      }
+
+      tlas_dev_addr = uploads[info->tlas].dev_addr;
+      if (!vtvk_driver_alloc_copy(&driver, info->storage_image_data, image_bytes,
+                                  &image_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to upload storage image");
+         goto out;
+      }
+
+      if (!vtvk_driver_alloc_copy(&driver, info->camera_data, info->camera_range,
+                                  &camera_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to upload camera UBO");
+         goto out;
+      }
    }
 
-   tlas_dev_addr = uploads[info->tlas].dev_addr;
-   if (!vtvk_driver_alloc_copy(&driver, info->storage_image_data, image_bytes,
-                               &image_dev_addr)) {
-      mesa_loge("ventus-vk: driver bridge failed to upload storage image");
-      goto out;
-   }
-
-   if (!vtvk_driver_alloc_copy(&driver, info->camera_data, info->camera_range,
-                               &camera_dev_addr)) {
-      mesa_loge("ventus-vk: driver bridge failed to upload camera UBO");
-      goto out;
-   }
    vtvk_driver_log_u32_words("camera", info->camera_data, info->camera_range,
                              32);
 
@@ -540,6 +673,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
    args.scratch_stride = info->per_lane_scratch_size;
+   args.descriptor_table_addr = descriptor_table_dev_addr;
+   args.descriptor_count = descriptor_table.size();
+   args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
    vtvk_driver_log_u32_words("dispatch_args", &args, sizeof(args), 40);
 
    if (!vtvk_driver_alloc_copy(&driver, &args, sizeof(args), &args_dev_addr)) {
@@ -575,10 +711,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if (!kernel_path || !kernel_path[0]) {
       mesa_logi("ventus-vk: driver bridge staged device memory "
                 "tlas=0x%" PRIx64 " image=0x%" PRIx64
-                " camera=0x%" PRIx64 " args=0x%" PRIx64
+                " camera=0x%" PRIx64 " descriptors=0x%" PRIx64
+                " args=0x%" PRIx64
                 " pds=0x%" PRIx64 "; VENTUS_VK_RAYGEN_ELF is not set",
-                tlas_dev_addr, image_dev_addr, camera_dev_addr, args_dev_addr,
-                pds_dev_addr);
+                tlas_dev_addr, image_dev_addr, camera_dev_addr,
+                descriptor_table_dev_addr, args_dev_addr, pds_dev_addr);
       ok = true;
       staged_without_kernel = true;
       goto out;

@@ -38,6 +38,16 @@ load_ray_state_word(nir_builder *b, const struct vt_nir_rt_config *config,
                             sp->ray_state_base_bytes + word * 4);
 }
 
+static nir_def *
+load_ray_state_vec3(nir_builder *b, const struct vt_nir_rt_config *config,
+                    enum vt_rt_shader_layout layout, enum vt_rt_slot_word first_word)
+{
+   return nir_vec3(b,
+                   load_ray_state_word(b, config, layout, first_word),
+                   load_ray_state_word(b, config, layout, first_word + 1),
+                   load_ray_state_word(b, config, layout, first_word + 2));
+}
+
 static void
 store_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
                    enum vt_rt_shader_layout layout, uint32_t byte_offset,
@@ -267,6 +277,15 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
    b->cursor = nir_before_instr(&intrin->instr);
 
    switch (intrin->intrinsic) {
+   case nir_intrinsic_load_ray_world_origin:
+   case nir_intrinsic_load_ray_object_origin:
+      replacement = load_ray_state_vec3(b, config, layout, VT_RT_SLOT_ORIGIN_X);
+      break;
+   case nir_intrinsic_load_ray_world_direction:
+   case nir_intrinsic_load_ray_object_direction:
+      replacement = load_ray_state_vec3(b, config, layout,
+                                        VT_RT_SLOT_DIRECTION_X);
+      break;
    case nir_intrinsic_load_ray_t_max:
       replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_HIT_T, 32);

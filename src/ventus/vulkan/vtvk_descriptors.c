@@ -84,6 +84,56 @@ vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
    return vtvk_buffer_host_ptr(info->buffer, info->offset, range);
 }
 
+bool
+vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
+                                uint32_t binding,
+                                struct vtvk_descriptor_binding_info *out)
+{
+   struct vtvk_descriptor_set *set =
+      vtvk_handle_to_ptr((uint64_t)descriptorSet);
+   if (!out)
+      return false;
+   memset(out, 0, sizeof(*out));
+   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+      return false;
+
+   out->type = set->bindings[binding].type;
+   out->acceleration_structure = set->bindings[binding].acceleration_structure;
+   out->image_info = set->bindings[binding].image;
+   out->buffer = set->bindings[binding].buffer;
+
+   struct vtvk_image_view *view =
+      vtvk_handle_to_ptr((uint64_t)out->image_info.imageView);
+   out->image = view ? view->image : VK_NULL_HANDLE;
+
+   if (out->buffer.range == VK_WHOLE_SIZE) {
+      struct vtvk_buffer *buffer =
+         vtvk_handle_to_ptr((uint64_t)out->buffer.buffer);
+      out->buffer.range =
+         buffer && out->buffer.offset <= buffer->size ?
+            buffer->size - out->buffer.offset : 0;
+   }
+
+   switch (out->type) {
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+      out->valid = out->acceleration_structure != VK_NULL_HANDLE;
+      break;
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      out->valid = out->image != VK_NULL_HANDLE;
+      break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      out->valid = out->buffer.buffer != VK_NULL_HANDLE &&
+                   out->buffer.range != 0;
+      break;
+   default:
+      out->valid = false;
+      break;
+   }
+
+   return out->valid;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_CreateDescriptorSetLayout(VkDevice _device,
                                const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -255,4 +305,3 @@ vtvk_UpdateDescriptorSets(VkDevice device,
       dst->bindings[copy->dstBinding] = src->bindings[copy->srcBinding];
    }
 }
-

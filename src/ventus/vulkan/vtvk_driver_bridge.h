@@ -34,6 +34,31 @@ struct vtvk_rt_dispatch_args {
    uint32_t camera_size;
    uint32_t scratch_stride;
    uint32_t reserved;
+   uint64_t descriptor_table_addr;
+   uint32_t descriptor_count;
+   uint32_t descriptor_record_stride;
+};
+
+struct vtvk_rt_descriptor_record {
+   uint32_t type;
+   uint32_t set;
+   uint32_t binding;
+   uint32_t format;
+   uint64_t device_addr;
+   uint64_t byte_size;
+   uint32_t stride;
+   uint32_t aux;
+};
+
+struct vtvk_rt_descriptor_source {
+   VkDescriptorType type;
+   uint32_t set;
+   uint32_t binding;
+   VkAccelerationStructureKHR acceleration_structure;
+   VkImage image;
+   VkBuffer buffer;
+   VkDeviceSize offset;
+   VkDeviceSize range;
 };
 
 struct vtvk_driver_trace_rays_info {
@@ -53,6 +78,8 @@ struct vtvk_driver_trace_rays_info {
    uint32_t per_lane_scratch_size;
    const char *kernel_path;
    uint64_t kernel_entry;
+   const struct vtvk_rt_descriptor_source *descriptors;
+   uint32_t descriptor_count;
 };
 
 bool vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info);

@@ -33,6 +33,45 @@ addresses, not host `VkDeviceAddress` handles.
 | 136 | `uint32_t image_stride` |
 | 140 | `uint32_t camera_size` |
 | 144 | `uint32_t scratch_stride` |
+| 148 | `uint32_t reserved` |
+| 152 | `uint64_t descriptor_table_addr` |
+| 160 | `uint32_t descriptor_count` |
+| 164 | `uint32_t descriptor_record_stride` |
+
+The legacy `tlas_addr`, `image_addr`, and `camera_addr` fields are retained for
+older probes. RT shader descriptor accesses use `descriptor_table_addr`.
+
+## Descriptor Records
+
+`descriptor_table_addr` points at an array indexed by set-0 binding number for
+the current restricted ABI. Each record is 40 bytes:
+
+| Offset | Field |
+| ---: | --- |
+| 0 | `uint32_t type` (`VkDescriptorType`) |
+| 4 | `uint32_t set` |
+| 8 | `uint32_t binding` |
+| 12 | `uint32_t format` |
+| 16 | `uint64_t device_addr` |
+| 24 | `uint64_t byte_size` |
+| 32 | `uint32_t stride` |
+| 36 | `uint32_t aux` |
+
+Supported bindings for the `raytracingshadows` RT path are:
+
+| Binding | Resource | Record semantics |
+| ---: | --- | --- |
+| 0 | `accelerationStructureEXT` | `device_addr` is the uploaded TLAS address |
+| 1 | `storage image2D` | `device_addr` is pixel memory, `format` is `VkFormat`, `stride` is row bytes |
+| 2 | UBO | `device_addr` is uploaded buffer data at descriptor offset |
+| 3 | vertices SSBO | `device_addr` is uploaded buffer data at descriptor offset |
+| 4 | indices SSBO | `device_addr` is uploaded buffer data at descriptor offset |
+
+Vulkan object addresses may remain host fake addresses until trace time. The
+bridge owns conversion to backend physical addresses and patches descriptor
+records only after uploading the referenced resource to the selected backend.
+Descriptor arrays, dynamic offsets, sampled images, and texel buffers are not
+part of this ABI revision.
 
 ## Per-Lane Scratch
 
@@ -83,9 +122,10 @@ stride rules.
 ## Driver Bridge
 
 The Vulkan object layer can keep host-style fake `VkDeviceAddress` values.
-At trace time, `vtvk_driver_bridge` resolves each SBT region back to a host
-buffer range, uploads only that range to the selected backend, and writes the
-backend device address into dispatch args.
+At trace time, `vtvk_driver_bridge` resolves each SBT region and descriptor
+resource back to a host object/range, uploads only that data to the selected
+backend, and writes backend device addresses into dispatch args and descriptor
+records.
 
 Backend selection is controlled by `VENTUS_VK_DRIVER_BACKEND=spike|rtlsim|cyclesim`
 or an explicit `VENTUS_VK_DRIVER_LIB` override.

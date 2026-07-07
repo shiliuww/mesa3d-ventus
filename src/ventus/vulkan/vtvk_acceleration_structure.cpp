@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -121,6 +122,25 @@ vtvk_header_aabb(const uint8_t *as_data)
 }
 
 static void
+vtvk_log_aabb(const char *name, const struct vtvk_aabb *aabb)
+{
+   mesa_logi("ventus-vk: %s aabb min=(%.6g %.6g %.6g) max=(%.6g %.6g %.6g)",
+             name, aabb->min[0], aabb->min[1], aabb->min[2],
+             aabb->max[0], aabb->max[1], aabb->max[2]);
+}
+
+static void
+vtvk_log_transform(const char *name, const float matrix[3][4])
+{
+   mesa_logi("ventus-vk: %s [%.6g %.6g %.6g %.6g] "
+             "[%.6g %.6g %.6g %.6g] [%.6g %.6g %.6g %.6g]",
+             name,
+             matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3],
+             matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3],
+             matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3]);
+}
+
+static void
 vtvk_write_header(uint8_t *dst, enum ventus_as_type type, uint32_t root_ref,
                   uint32_t node_count, uint32_t node_region_size,
                   uint32_t primitive_count, uint32_t instance_count,
@@ -177,6 +197,20 @@ vtvk_next_node_offset(uint32_t *cursor, uint32_t size)
    uint32_t offset = *cursor;
    *cursor += size;
    return offset;
+}
+
+static uint64_t
+vtvk_internal_box_count(uint64_t leaf_count)
+{
+   uint64_t total = 0;
+   uint64_t level_count = leaf_count;
+
+   while (level_count > 1) {
+      level_count = (level_count + 3) / 4;
+      total += level_count;
+   }
+
+   return total;
 }
 
 static struct vtvk_build_node
@@ -269,6 +303,48 @@ vtvk_transform_point(const VkTransformMatrixKHR *m, const float in[3],
    }
 }
 
+static bool
+vtvk_invert_transform(const VkTransformMatrixKHR *m, float inv[3][4])
+{
+   const float a00 = m->matrix[0][0], a01 = m->matrix[0][1],
+               a02 = m->matrix[0][2];
+   const float a10 = m->matrix[1][0], a11 = m->matrix[1][1],
+               a12 = m->matrix[1][2];
+   const float a20 = m->matrix[2][0], a21 = m->matrix[2][1],
+               a22 = m->matrix[2][2];
+   const float det =
+      a00 * (a11 * a22 - a12 * a21) -
+      a01 * (a10 * a22 - a12 * a20) +
+      a02 * (a10 * a21 - a11 * a20);
+
+   if (std::fabs(det) < 1.0e-12f)
+      return false;
+
+   const float inv_det = 1.0f / det;
+   inv[0][0] = (a11 * a22 - a12 * a21) * inv_det;
+   inv[0][1] = (a02 * a21 - a01 * a22) * inv_det;
+   inv[0][2] = (a01 * a12 - a02 * a11) * inv_det;
+   inv[1][0] = (a12 * a20 - a10 * a22) * inv_det;
+   inv[1][1] = (a00 * a22 - a02 * a20) * inv_det;
+   inv[1][2] = (a02 * a10 - a00 * a12) * inv_det;
+   inv[2][0] = (a10 * a21 - a11 * a20) * inv_det;
+   inv[2][1] = (a01 * a20 - a00 * a21) * inv_det;
+   inv[2][2] = (a00 * a11 - a01 * a10) * inv_det;
+
+   const float t[3] = {
+      m->matrix[0][3],
+      m->matrix[1][3],
+      m->matrix[2][3],
+   };
+   for (unsigned row = 0; row < 3; row++) {
+      inv[row][3] = -(inv[row][0] * t[0] +
+                      inv[row][1] * t[1] +
+                      inv[row][2] * t[2]);
+   }
+
+   return true;
+}
+
 static struct vtvk_aabb
 vtvk_transform_aabb(const VkTransformMatrixKHR *m, const struct vtvk_aabb *in)
 {
@@ -332,12 +408,14 @@ vtvk_write_instance_leaf(uint8_t *dst, uint32_t offset,
    memcpy(node + VENTUS_INSTANCE_OBJECT_TO_WORLD, instance->transform.matrix,
           sizeof(instance->transform.matrix));
 
-   float identity[3][4] = {
+   float world_to_object[3][4] = {
       { 1.0f, 0.0f, 0.0f, 0.0f },
       { 0.0f, 1.0f, 0.0f, 0.0f },
       { 0.0f, 0.0f, 1.0f, 0.0f },
    };
-   memcpy(node + VENTUS_INSTANCE_WORLD_TO_OBJECT, identity, sizeof(identity));
+   (void)vtvk_invert_transform(&instance->transform, world_to_object);
+   memcpy(node + VENTUS_INSTANCE_WORLD_TO_OBJECT, world_to_object,
+          sizeof(world_to_object));
 }
 
 static VkResult
@@ -421,8 +499,8 @@ vtvk_build_blas(struct vtvk_device *device,
          vtvk_next_node_offset(&cursor, VENTUS_AS_TRIANGLE_NODE_SIZE);
       vtvk_write_triangle_leaf(dst, offset, v0, v1, v2, p, 0, 0,
                                geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
-                               triangles->vertexData.deviceAddress +
-                                  (VkDeviceAddress)p * triangles->vertexStride);
+                               index_addr + (VkDeviceAddress)p * 3 *
+                                  sizeof(uint32_t));
       node_count++;
       leaves.push_back({
          ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_TRIANGLE),
@@ -435,6 +513,11 @@ vtvk_build_blas(struct vtvk_device *device,
    vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
                      &root.bounds);
+   if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
+      mesa_logi("ventus-vk: BLAS primitive_count=%u node_count=%u root=0x%x",
+                primitive_count, node_count, root.ref);
+      vtvk_log_aabb("BLAS root", &root.bounds);
+   }
    as->address = (VkDeviceAddress)(uintptr_t)as->data;
    return VK_SUCCESS;
 }
@@ -489,12 +572,21 @@ vtvk_build_tlas(struct vtvk_device *device,
       uint32_t offset =
          vtvk_next_node_offset(&cursor, VENTUS_AS_INSTANCE_NODE_SIZE);
       vtvk_write_instance_leaf(dst, offset, inst, i);
-      if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS"))
+      if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
          mesa_logi("ventus-vk: TLAS instance %u node=0x%x blas_ref=0x%" PRIx64
                    " stored=0x%" PRIx64,
                    i, offset,
                    (uint64_t)inst->accelerationStructureReference,
                    vtvk_load_u64(dst + offset, VENTUS_INSTANCE_BLAS_ADDR_LO));
+         vtvk_log_transform("TLAS object_to_world",
+                            inst->transform.matrix);
+         float world_to_object[3][4];
+         memcpy(world_to_object, dst + offset + VENTUS_INSTANCE_WORLD_TO_OBJECT,
+                sizeof(world_to_object));
+         vtvk_log_transform("TLAS world_to_object", world_to_object);
+         vtvk_log_aabb("TLAS instance object bounds", &blas_bounds);
+         vtvk_log_aabb("TLAS instance world bounds", &bounds);
+      }
       node_count++;
       leaves.push_back({
          ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_INSTANCE),
@@ -507,6 +599,11 @@ vtvk_build_tlas(struct vtvk_device *device,
    vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE, 0, instance_count,
                      &root.bounds);
+   if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
+      mesa_logi("ventus-vk: TLAS instance_count=%u node_count=%u root=0x%x",
+                instance_count, node_count, root.ref);
+      vtvk_log_aabb("TLAS root", &root.bounds);
+   }
    as->address = (VkDeviceAddress)(uintptr_t)as->data;
    return VK_SUCCESS;
 }
@@ -650,7 +747,7 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
    uint64_t leaf_size =
       pBuildInfo && pBuildInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
          ? VENTUS_AS_INSTANCE_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE;
-   uint64_t internal_count = primitive_count > 1 ? (primitive_count + 2) / 3 : 0;
+   uint64_t internal_count = vtvk_internal_box_count(primitive_count);
    uint64_t internal_bytes = internal_count * VENTUS_AS_BOX4_NODE_SIZE;
    uint64_t primitive_bytes = primitive_count * leaf_size;
 
@@ -722,4 +819,3 @@ vtvk_BuildAccelerationStructuresKHR(
    }
    return VK_SUCCESS;
 }
-

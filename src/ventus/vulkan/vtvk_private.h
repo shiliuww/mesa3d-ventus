@@ -61,6 +61,15 @@ struct vtvk_acceleration_structure {
    VkDeviceSize snapshot_size;
 };
 
+struct vtvk_descriptor_binding_info {
+   bool valid;
+   VkDescriptorType type;
+   VkAccelerationStructureKHR acceleration_structure;
+   VkImage image;
+   VkDescriptorImageInfo image_info;
+   VkDescriptorBufferInfo buffer;
+};
+
 VK_DEFINE_HANDLE_CASTS(vtvk_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
 VK_DEFINE_HANDLE_CASTS(vtvk_physical_device, vk.base, VkPhysicalDevice,
@@ -88,6 +97,9 @@ VkImage vtvk_descriptor_set_image(VkDescriptorSet descriptorSet,
 void *vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet,
                                      uint32_t binding,
                                      VkDeviceSize *range_out);
+bool vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
+                                     uint32_t binding,
+                                     struct vtvk_descriptor_binding_info *out);
 void *vtvk_image_host_ptr(VkImage image, VkExtent3D *extent_out,
                           VkFormat *format_out);
 struct vtvk_acceleration_structure *
