@@ -71,6 +71,176 @@ vtvk_env_enabled(const char *name)
           strcmp(value, "OFF") != 0;
 }
 
+struct vtvk_rt_nir_stats {
+   unsigned trace_ray;
+   unsigned load_vulkan_descriptor;
+   unsigned vulkan_resource_index;
+   unsigned vulkan_resource_reindex;
+   unsigned load_deref;
+   unsigned store_deref;
+   unsigned load_ubo;
+   unsigned load_ssbo;
+   unsigned image_store;
+   unsigned load_ray_world_origin;
+   unsigned load_ray_world_direction;
+   unsigned load_ray_object_origin;
+   unsigned load_ray_object_direction;
+   unsigned load_ray_t_min;
+   unsigned load_ray_t_max;
+   unsigned load_primitive_id;
+   unsigned function_temp_vars;
+   unsigned shader_call_data_vars;
+   unsigned ray_hit_attrib_vars;
+};
+
+static void
+vtvk_rt_count_variable(nir_variable *var, vtvk_rt_nir_stats *stats)
+{
+   if (var->data.mode == nir_var_function_temp)
+      stats->function_temp_vars++;
+   if (var->data.mode == nir_var_shader_call_data)
+      stats->shader_call_data_vars++;
+   if (var->data.mode == nir_var_ray_hit_attrib)
+      stats->ray_hit_attrib_vars++;
+}
+
+static void
+vtvk_rt_count_intrinsic(nir_intrinsic_instr *intrin, vtvk_rt_nir_stats *stats)
+{
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_trace_ray:
+      stats->trace_ray++;
+      break;
+   case nir_intrinsic_load_vulkan_descriptor:
+      stats->load_vulkan_descriptor++;
+      break;
+   case nir_intrinsic_vulkan_resource_index:
+      stats->vulkan_resource_index++;
+      break;
+   case nir_intrinsic_vulkan_resource_reindex:
+      stats->vulkan_resource_reindex++;
+      break;
+   case nir_intrinsic_load_deref:
+      stats->load_deref++;
+      break;
+   case nir_intrinsic_store_deref:
+      stats->store_deref++;
+      break;
+   case nir_intrinsic_load_ubo:
+      stats->load_ubo++;
+      break;
+   case nir_intrinsic_load_ssbo:
+      stats->load_ssbo++;
+      break;
+   case nir_intrinsic_image_store:
+      stats->image_store++;
+      break;
+   case nir_intrinsic_load_ray_world_origin:
+      stats->load_ray_world_origin++;
+      break;
+   case nir_intrinsic_load_ray_world_direction:
+      stats->load_ray_world_direction++;
+      break;
+   case nir_intrinsic_load_ray_object_origin:
+      stats->load_ray_object_origin++;
+      break;
+   case nir_intrinsic_load_ray_object_direction:
+      stats->load_ray_object_direction++;
+      break;
+   case nir_intrinsic_load_ray_t_min:
+      stats->load_ray_t_min++;
+      break;
+   case nir_intrinsic_load_ray_t_max:
+      stats->load_ray_t_max++;
+      break;
+   case nir_intrinsic_load_primitive_id:
+      stats->load_primitive_id++;
+      break;
+   default:
+      break;
+   }
+}
+
+static void
+vtvk_rt_log_nir_stats(nir_shader *shader, const char *checkpoint)
+{
+   if (!vtvk_env_enabled("VENTUS_VK_NIR_PROBE") &&
+       !vtvk_env_enabled("VENTUS_VK_PROBE_LOG"))
+      return;
+
+   vtvk_rt_nir_stats stats = {};
+   nir_foreach_variable_in_shader(var, shader)
+      vtvk_rt_count_variable(var, &stats);
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_variable_in_list(var, &impl->locals)
+         vtvk_rt_count_variable(var, &stats);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic)
+               vtvk_rt_count_intrinsic(nir_instr_as_intrinsic(instr), &stats);
+         }
+      }
+   }
+
+   mesa_logi("ventus-vk: NIR %s stage=%s trace_ray=%u desc_load=%u "
+             "res_index=%u res_reindex=%u load_deref=%u store_deref=%u "
+             "ubo=%u ssbo=%u image_store=%u ray_world=(%u,%u) "
+             "ray_object=(%u,%u) ray_t=(%u,%u) primitive_id=%u "
+             "vars={func:%u call:%u hitattr:%u} scratch=%u",
+             checkpoint, _mesa_shader_stage_to_string(shader->info.stage),
+             stats.trace_ray, stats.load_vulkan_descriptor,
+             stats.vulkan_resource_index, stats.vulkan_resource_reindex,
+             stats.load_deref, stats.store_deref, stats.load_ubo,
+             stats.load_ssbo, stats.image_store,
+             stats.load_ray_world_origin, stats.load_ray_world_direction,
+             stats.load_ray_object_origin, stats.load_ray_object_direction,
+             stats.load_ray_t_min, stats.load_ray_t_max,
+             stats.load_primitive_id, stats.function_temp_vars,
+             stats.shader_call_data_vars, stats.ray_hit_attrib_vars,
+             shader->scratch_size);
+}
+
+static void
+vtvk_rt_finalize_abi(nir_shader *shader,
+                     const struct vt_nir_rt_config *config)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return;
+
+   enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
+   shader->scratch_size =
+      MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
+
+   nir_shader_gather_info(shader, impl);
+}
+
+static void
+vtvk_rt_lower_abi_with_probe(nir_shader *shader,
+                             const struct vt_nir_rt_config *config)
+{
+   vtvk_rt_log_nir_stats(shader, "before vt_nir_lower_rt_payload");
+   NIR_PASS(_, shader, vt_nir_lower_rt_payload, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_rt_payload");
+
+   NIR_PASS(_, shader, vt_nir_lower_rt_hit_record, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_rt_hit_record");
+
+   NIR_PASS(_, shader, vt_nir_lower_rt_control, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_rt_control");
+
+   NIR_PASS(_, shader, vt_nir_lower_shader_record_ptr, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_shader_record_ptr");
+
+   NIR_PASS(_, shader, vt_nir_lower_shader_scratch, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_shader_scratch");
+
+   vtvk_rt_finalize_abi(shader, config);
+   vtvk_rt_log_nir_stats(shader, "after vt_nir_rt_abi_finalize");
+}
+
 static std::string
 vtvk_shell_quote(const char *text)
 {
@@ -571,9 +741,12 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    vt_nir_rt_config_apply_abi_layout(&config, &abi);
 
+   vtvk_rt_log_nir_stats(*nir_out, "after spirv_to_nir");
    NIR_PASS(_, *nir_out, nir_lower_system_values);
+   vtvk_rt_log_nir_stats(*nir_out, "after nir_lower_system_values");
    NIR_PASS(_, *nir_out, vt_nir_lower_descriptors);
-   NIR_PASS(_, *nir_out, vt_nir_lower_rt_abi, &config);
+   vtvk_rt_log_nir_stats(*nir_out, "after vt_nir_lower_descriptors");
+   vtvk_rt_lower_abi_with_probe(*nir_out, &config);
    nir_validate_shader(*nir_out, "after Ventus RT lowering");
    if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
       nir_print_shader(*nir_out, stderr);
@@ -729,9 +902,15 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       };
       rt_io_config.callback_data = &cb_data;
 
+      vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                            "raygen before vt_nir_lower_rt_io_monolithic");
       NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
                &rt_io_config);
+      vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                            "raygen after vt_nir_lower_rt_io_monolithic");
       NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_descriptors);
+      vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                            "raygen after monolithic vt_nir_lower_descriptors");
    }
 
    pipeline->per_lane_scratch_size =
