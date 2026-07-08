@@ -388,11 +388,18 @@ private:
 
    void allocateVariables(nir_shader *shader, nir_function_impl *impl)
    {
+      auto storageWords = [](const glsl_type *type) -> unsigned {
+         unsigned bytes = glsl_get_explicit_size(type, false);
+         if (!bytes)
+            bytes = glsl_get_cl_size(type);
+         return std::max(4u, (bytes + 3u) / 4u);
+      };
+
       auto allocVar = [&](nir_variable *var) {
          if (!var || variables.count(var))
             return;
          AllocaInst *alloca =
-            builder.CreateAlloca(ArrayType::get(i32, 4), nullptr,
+            builder.CreateAlloca(ArrayType::get(i32, storageWords(var->type)), nullptr,
                                  var->name ? var->name : "nir.var");
          alloca->setAlignment(Align(16));
          variables[var] = alloca;
@@ -613,11 +620,24 @@ private:
       return vec;
    }
 
+   Value *localPtrOffset(Value *ptr, Value *byteOffset)
+   {
+      Value *wordOffset =
+         builder.CreateUDiv(asInt32(byteOffset), ConstantInt::get(i32, 4));
+      return builder.CreateInBoundsGEP(i32, ptr, wordOffset);
+   }
+
+   Value *localPtrOffset(Value *ptr, unsigned byteOffset)
+   {
+      if (!byteOffset)
+         return ptr;
+      return localPtrOffset(ptr, ConstantInt::get(i32, byteOffset));
+   }
+
    Value *localSlotPtr(Value *ptr, unsigned component)
    {
-      return builder.CreateInBoundsGEP(
-         ArrayType::get(i32, 4), ptr,
-         {ConstantInt::get(i32, 0), ConstantInt::get(i32, component)});
+      return builder.CreateInBoundsGEP(i32, ptr,
+                                       ConstantInt::get(i32, component));
    }
 
    Value *loadLocalValue(Value *ptr, const nir_def *def)
@@ -802,20 +822,32 @@ private:
       case nir_deref_type_cast:
          return asInt32(value(deref->parent));
       case nir_deref_type_struct: {
-         Value *base = asInt32(value(deref->parent));
+         Value *baseValue = value(deref->parent);
          nir_deref_instr *parent = nir_deref_instr_parent(deref);
          int offset = parent ? glsl_get_struct_field_offset(parent->type,
                                                             deref->strct.index)
                              : -1;
+         if (baseValue->getType()->isPointerTy())
+            return localPtrOffset(baseValue, offset > 0 ? (unsigned)offset : 0);
+
+         Value *base = asInt32(baseValue);
          if (offset > 0)
             base = builder.CreateAdd(base, ConstantInt::get(i32, offset));
          return base;
       }
       case nir_deref_type_array:
       case nir_deref_type_ptr_as_array: {
-         Value *base = asInt32(value(deref->parent));
+         Value *baseValue = value(deref->parent);
          unsigned stride = nir_deref_instr_array_stride(deref);
          Value *index = asInt32(value(deref->arr.index));
+         if (baseValue->getType()->isPointerTy()) {
+            if (!stride)
+               return baseValue;
+            return localPtrOffset(
+               baseValue, builder.CreateMul(index, ConstantInt::get(i32, stride)));
+         }
+
+         Value *base = asInt32(baseValue);
          if (stride)
             base = builder.CreateAdd(
                base, builder.CreateMul(index, ConstantInt::get(i32, stride)));
@@ -884,6 +916,16 @@ private:
          return intBin([&](Value *a, Value *b) { return builder.CreateOr(a, b); });
       case nir_op_ixor:
          return intBin([&](Value *a, Value *b) { return builder.CreateXor(a, b); });
+      case nir_op_inot:
+         if (alu->def.bit_size == 1) {
+            return boolResult(&alu->def, [&](unsigned i) {
+               return builder.CreateNot(asBool(src(0, i)));
+            });
+         }
+         return intResult(&alu->def, [&](unsigned i) {
+            unsigned bits = alu->def.bit_size == 64 ? 64 : 32;
+            return builder.CreateNot(asInteger(src(0, i), bits));
+         });
       case nir_op_ishl:
          return intBin([&](Value *a, Value *b) { return builder.CreateShl(a, b); });
       case nir_op_ushr:

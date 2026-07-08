@@ -455,6 +455,13 @@ vtvk_driver_upload_sbt_region(struct vtvk_driver_api *api,
 
    dst->size = src->size;
    dst->stride = src->stride;
+   if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG")) {
+      mesa_logi("ventus-vk: driver bridge %s SBT host=0x%" PRIx64
+                " dev=0x%" PRIx64 " size=%" PRIu64 " stride=%" PRIu64,
+                name, (uint64_t)src->deviceAddress, dst->addr,
+                (uint64_t)src->size, (uint64_t)src->stride);
+      vtvk_driver_log_u32_words(name, host, src->size, 16);
+   }
    return true;
 }
 
