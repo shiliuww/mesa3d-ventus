@@ -27,6 +27,7 @@
 
 struct vt_rt_intrinsic_counts {
    unsigned trace_ray;
+   unsigned jump_break;
    unsigned load_shared;
    unsigned store_shared;
    unsigned ventus_rt_load_slot;
@@ -49,6 +50,45 @@ struct vt_rt_intrinsic_counts {
    unsigned ventus_rt_traverse;
    unsigned ventus_rt_release;
 };
+
+static inline unsigned
+vt_rt_count_loops_in_cf_list(struct exec_list *list)
+{
+   unsigned loops = 0;
+
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         loops += vt_rt_count_loops_in_cf_list(&nif->then_list);
+         loops += vt_rt_count_loops_in_cf_list(&nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         loops++;
+         loops += vt_rt_count_loops_in_cf_list(&loop->body);
+         loops += vt_rt_count_loops_in_cf_list(&loop->continue_list);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+
+   return loops;
+}
+
+static inline unsigned
+vt_rt_count_loops(nir_shader *shader)
+{
+   unsigned loops = 0;
+
+   nir_foreach_function_impl(impl, shader)
+      loops += vt_rt_count_loops_in_cf_list(&impl->body);
+
+   return loops;
+}
 
 static inline bool
 vt_rt_shader_has_imul_any(nir_shader *shader)
@@ -109,6 +149,12 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_jump) {
+               if (nir_instr_as_jump(instr)->type == nir_jump_break)
+                  counts->jump_break++;
+               continue;
+            }
+
             if (instr->type != nir_instr_type_intrinsic)
                continue;
 

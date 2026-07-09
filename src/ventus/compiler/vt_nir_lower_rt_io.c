@@ -30,6 +30,104 @@ trace_ray_has_const_flag(nir_intrinsic_instr *intrin, uint32_t flag)
           (nir_src_as_uint(intrin->src[1]) & flag) != 0;
 }
 
+static void
+store_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
+                     enum vt_rt_control_word word, nir_def *value)
+{
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, value);
+}
+
+static nir_def *
+load_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
+                    enum vt_rt_control_word word)
+{
+   return vt_nir_load_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, 32);
+}
+
+static void
+accept_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
+{
+   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_true(b));
+   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
+   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+}
+
+static void
+ignore_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
+{
+   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_false(b));
+   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_true(b));
+   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+}
+
+static void
+emit_trace_callbacks(nir_builder *b,
+                     const struct vt_nir_rt_config *config,
+                     const struct vt_nir_rt_trace_params *params,
+                     const struct vt_nir_rt_result *result,
+                     nir_def *complete_hit,
+                     nir_def *complete_miss,
+                     nir_def *candidate_non_opaque,
+                     nir_def *candidate_procedural,
+                     bool skip_closest_hit)
+{
+   const bool callbacks_enabled =
+      config && config->enable_monolithic_shader_callbacks;
+   const bool has_callbacks =
+      callbacks_enabled &&
+      (config->emit_closest_hit || config->emit_miss ||
+       config->emit_any_hit || config->emit_intersection);
+
+   if (!has_callbacks) {
+      nir_push_if(b, candidate_non_opaque);
+      accept_candidate_hit(b, config);
+      nir_push_else(b, NULL);
+      nir_push_if(b, candidate_procedural);
+      ignore_candidate_hit(b, config);
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
+      return;
+   }
+
+   nir_push_if(b, complete_hit);
+   if (!skip_closest_hit && config->emit_closest_hit)
+      config->emit_closest_hit(b, params, result, config->callback_data);
+
+   nir_push_else(b, NULL);
+   nir_push_if(b, complete_miss);
+   if (config->emit_miss)
+      config->emit_miss(b, params, result, config->callback_data);
+   nir_push_else(b, NULL);
+
+   nir_push_if(b, candidate_non_opaque);
+   /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
+   accept_candidate_hit(b, config);
+   if (config->emit_any_hit)
+      config->emit_any_hit(b, params, result, config->callback_data);
+   nir_push_else(b, NULL);
+
+   nir_push_if(b, candidate_procedural);
+   /* Normal intersection return reports no hit; reportIntersection overrides it. */
+   ignore_candidate_hit(b, config);
+   if (config->emit_intersection)
+      config->emit_intersection(b, params, result, config->callback_data);
+   if (config->emit_any_hit) {
+      nir_def *reported =
+         nir_i2b(b, load_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT));
+      nir_push_if(b, reported);
+      /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
+      accept_candidate_hit(b, config);
+      config->emit_any_hit(b, params, result, config->callback_data);
+      nir_pop_if(b, NULL);
+   }
+
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+
 static bool
 lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
@@ -63,54 +161,45 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .payload = intrin->src[10].ssa,
    };
 
-   struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
-   nir_def *complete_hit =
-      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_HIT);
-   nir_def *complete_miss =
-      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_MISS);
-   nir_def *terminated =
-      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_TERMINATED);
-   nir_def *terminal = nir_ior(b, nir_ior(b, complete_hit, complete_miss),
-                               terminated);
-   nir_def *candidate_non_opaque =
-      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
-   nir_def *candidate_procedural =
-      nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
 
-   if (config && config->enable_monolithic_shader_callbacks &&
-       (config->emit_closest_hit || config->emit_miss ||
-        config->emit_any_hit || config->emit_intersection)) {
-      nir_push_if(b, complete_hit);
-      if (!skip_closest_hit && config->emit_closest_hit)
-         config->emit_closest_hit(b, &params, &result, config->callback_data);
+   nir_loop *loop = nir_push_loop(b);
+   {
+      struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
+      nir_def *complete_hit =
+         nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_HIT);
+      nir_def *complete_miss =
+         nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_MISS);
+      nir_def *terminated =
+         nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_TERMINATED);
+      nir_def *terminal = nir_ior(b, nir_ior(b, complete_hit, complete_miss),
+                                  terminated);
+      nir_def *candidate_non_opaque =
+         nir_ieq_imm(b, result.status,
+                     VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
+      nir_def *candidate_procedural =
+         nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
+      nir_def *candidate =
+         nir_ior(b, candidate_non_opaque, candidate_procedural);
 
+      emit_trace_callbacks(b, config, &params, &result, complete_hit,
+                           complete_miss, candidate_non_opaque,
+                           candidate_procedural, skip_closest_hit);
+
+      nir_push_if(b, terminal);
+      nir_ventus_rt_release(b, result.slot_base);
+      nir_jump(b, nir_jump_break);
       nir_push_else(b, NULL);
-      nir_push_if(b, complete_miss);
-      if (config->emit_miss)
-         config->emit_miss(b, &params, &result, config->callback_data);
-      nir_push_else(b, NULL);
 
-      nir_push_if(b, candidate_non_opaque);
-      if (config->emit_any_hit)
-         config->emit_any_hit(b, &params, &result, config->callback_data);
-      nir_push_else(b, NULL);
-
-      nir_push_if(b, candidate_procedural);
-      if (config->emit_intersection)
-         config->emit_intersection(b, &params, &result, config->callback_data);
-
-      nir_pop_if(b, NULL);
+      nir_push_if(b, nir_inot(b, candidate));
+      nir_ventus_rt_release(b, result.slot_base);
+      nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
-      nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
    }
-
-   nir_push_if(b, terminal);
-   nir_ventus_rt_release(b, result.slot_base);
-   nir_pop_if(b, NULL);
+   nir_pop_loop(b, loop);
 
    nir_instr_remove(&intrin->instr);
    return true;

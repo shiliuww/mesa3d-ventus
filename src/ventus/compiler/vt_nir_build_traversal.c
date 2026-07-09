@@ -236,19 +236,6 @@ load_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
    return nir_ventus_rt_load_slot(b, 1, 32, slot_offset(b, base, word));
 }
 
-static nir_def *
-load_traversal_status(nir_builder *b, nir_def *base)
-{
-   nir_def *raw_status = load_word(b, base, VT_RT_SLOT_STATUS);
-   nir_def *complete_hit = nir_imm_int(b, VT_RT_TRAVERSAL_COMPLETE_HIT);
-   nir_def *complete_miss = nir_imm_int(b, VT_RT_TRAVERSAL_COMPLETE_MISS);
-
-   return nir_bcsel(b, nir_ieq_imm(b, raw_status, VT_RT_STATUS_HIT),
-                    complete_hit,
-                    nir_bcsel(b, nir_ieq_imm(b, raw_status, VT_RT_STATUS_MISS),
-                               complete_miss, raw_status));
-}
-
 static void
 store_vec3(nir_builder *b, nir_def *base, enum vt_rt_slot_word first_word, nir_def *value)
 {
@@ -350,16 +337,24 @@ vt_nir_build_traversal(nir_builder *b,
    store_word(b, base, VT_RT_SLOT_TMAX, params->tmax);
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
 
-   nir_ventus_rt_traverse(b, base);
-   nir_def *status = load_traversal_status(b, base);
-   nir_def *hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
-   nir_def *sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
+   nir_def *status = nir_ventus_rt_traverse(b, base);
+   nir_def *raw_hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
+   nir_def *raw_sbt_index = load_word(b, base, VT_RT_SLOT_SBT_INDEX);
    nir_def *candidate_non_opaque_triangle =
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
    nir_def *candidate_procedural_aabb =
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB);
    nir_def *is_candidate =
       nir_ior(b, candidate_non_opaque_triangle, candidate_procedural_aabb);
+   nir_def *candidate_hit_t =
+      vt_nir_load_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                            VT_RT_HIT_RECORD_HIT_T, 32);
+   nir_def *candidate_sbt_index =
+      vt_nir_load_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                            VT_RT_HIT_RECORD_SBT_INDEX, 32);
+   nir_def *hit_t = nir_bcsel(b, is_candidate, candidate_hit_t, raw_hit_t);
+   nir_def *sbt_index =
+      nir_bcsel(b, is_candidate, candidate_sbt_index, raw_sbt_index);
    nir_def *candidate_instance_sbt_record_offset =
       vt_nir_load_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                             VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET,
@@ -393,6 +388,10 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *opaque = nir_inot(b, candidate_non_opaque_triangle);
    nir_def *need_software_opacity =
       candidate_non_opaque_triangle;
+   nir_def *hit_record_valid = nir_ior(b, complete_hit, is_candidate);
+   nir_def *hit_record_status =
+      nir_bcsel(b, hit_record_valid, nir_imm_int(b, VT_RT_STATUS_HIT),
+                nir_imm_int(b, VT_RT_STATUS_IDLE));
 
    vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
                              VT_RT_CONTROL_DONE,
@@ -420,7 +419,8 @@ vt_nir_build_traversal(nir_builder *b,
                              VT_RT_CONTROL_SKIP_CLOSEST_HIT, nir_imm_false(b));
 
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                          VT_RT_HIT_RECORD_STATUS, status);
+                                          VT_RT_HIT_RECORD_STATUS,
+                                          hit_record_status);
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                           VT_RT_HIT_RECORD_HIT_T, hit_t);
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
@@ -439,8 +439,9 @@ vt_nir_build_traversal(nir_builder *b,
                                           VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
                                           need_software_opacity);
 
+   nir_push_if(b, complete_hit);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                VT_RT_HIT_RECORD_STATUS, status);
+                                VT_RT_HIT_RECORD_STATUS, hit_record_status);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_HIT_T, hit_t);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
@@ -458,6 +459,13 @@ vt_nir_build_traversal(nir_builder *b,
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
                                 need_software_opacity);
+   nir_push_else(b, NULL);
+   nir_push_if(b, complete_miss);
+   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                VT_RT_HIT_RECORD_STATUS,
+                                nir_imm_int(b, VT_RT_STATUS_IDLE));
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
 
    struct vt_nir_rt_result result = {
       .slot_base = base,

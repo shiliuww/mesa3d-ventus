@@ -128,9 +128,10 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
+   VT_RT_CHECK(abi.continuation_size_bytes == 640);
+   VT_RT_CHECK(abi.total_size_bytes == 992);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
-   VT_RT_CHECK(abi.continuation_size_bytes == 0);
 
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
@@ -146,8 +147,10 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
    VT_RT_CHECK(after.trace_ray == 0);
+   VT_RT_CHECK(vt_rt_count_loops(raygen) >= 1);
+   VT_RT_CHECK(after.jump_break >= 1);
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
-   VT_RT_CHECK(after.ventus_rt_release == 1);
+   VT_RT_CHECK(after.ventus_rt_release >= 1);
    VT_RT_CHECK(vt_rt_all_releases_are_conditional(raygen));
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);

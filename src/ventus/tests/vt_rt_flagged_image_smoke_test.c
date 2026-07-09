@@ -281,6 +281,8 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts after;
    vt_rt_count_intrinsics(raygen, &after);
    VT_RT_CHECK(after.trace_ray == 0);
+   VT_RT_CHECK(vt_rt_count_loops(raygen) >= 1);
+   VT_RT_CHECK(after.jump_break >= 1);
    VT_RT_CHECK(after.ventus_rt_store_slot > before.ventus_rt_store_slot);
    VT_RT_CHECK(after.ventus_rt_load_slot > before.ventus_rt_load_slot);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));

@@ -75,7 +75,7 @@ part of this ABI revision.
 
 ## Per-Lane Scratch
 
-The stable per-lane scratch layout remains 352 bytes:
+The stable per-lane scratch layout is 992 bytes:
 
 | Byte Range | Region |
 | ---: | --- |
@@ -89,9 +89,20 @@ The stable per-lane scratch layout remains 352 bytes:
 | 272..303 | hit attributes |
 | 304..347 | payload |
 | 348..351 | alignment |
+| 352..367 | continuation header |
+| 368..463 | continuation contexts, 2 x 48 bytes |
+| 464..975 | continuation stack, 32 x 16-byte entries |
+| 976..991 | continuation alignment/reserved |
 
 Hit record word 18 lives in the extension gap and stores
 `instance_sbt_record_offset`. Existing fields are not moved.
+
+Continuation state is fixed per lane for hardware compatibility. Header word 0
+stores active/overflow/done flags, word 1 stores stack count, word 2 stores the
+current context id, and word 3 is used by linear fallback traversal as a resume
+index. Each context stores AS base, object ray origin/direction, instance id,
+instance SBT offset, and instance address. Each stack entry stores node ref,
+AS base, and context id.
 
 ## SBT Record Pointer Rules
 
