@@ -111,10 +111,10 @@ vt_rt_shader_has_imul_any(nir_shader *shader)
 }
 
 static inline bool
-vt_rt_all_releases_are_conditional(nir_shader *shader)
+vt_rt_all_releases_are_outside_loops(nir_shader *shader)
 {
    unsigned releases = 0;
-   unsigned conditional_releases = 0;
+   unsigned outside_loop_releases = 0;
 
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
@@ -127,18 +127,21 @@ vt_rt_all_releases_are_conditional(nir_shader *shader)
                continue;
 
             releases++;
+            bool inside_loop = false;
             for (nir_cf_node *parent = block->cf_node.parent; parent;
                  parent = parent->parent) {
-               if (parent->type == nir_cf_node_if) {
-                  conditional_releases++;
+               if (parent->type == nir_cf_node_loop) {
+                  inside_loop = true;
                   break;
                }
             }
+            if (!inside_loop)
+               outside_loop_releases++;
          }
       }
    }
 
-   return releases > 0 && releases == conditional_releases;
+   return releases > 0 && releases == outside_loop_releases;
 }
 
 static inline void

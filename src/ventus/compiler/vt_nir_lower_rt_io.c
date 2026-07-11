@@ -164,6 +164,12 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
 
+   const struct vt_nir_scratchpad_layout *raygen =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   nir_def *slot_base =
+      vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
+                             raygen->ray_state_base_bytes);
+
    nir_loop *loop = nir_push_loop(b);
    {
       struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
@@ -188,18 +194,17 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
                            candidate_procedural, skip_closest_hit);
 
       nir_push_if(b, terminal);
-      nir_ventus_rt_release(b, result.slot_base);
       nir_jump(b, nir_jump_break);
       nir_push_else(b, NULL);
 
       nir_push_if(b, nir_inot(b, candidate));
-      nir_ventus_rt_release(b, result.slot_base);
       nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
       nir_pop_if(b, NULL);
    }
    nir_pop_loop(b, loop);
+   nir_ventus_rt_release(b, slot_base);
 
    nir_instr_remove(&intrin->instr);
    return true;
