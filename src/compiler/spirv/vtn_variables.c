@@ -1696,7 +1696,9 @@ var_decoration_cb(struct vtn_builder *b, struct vtn_value *val, int member,
                  vtn_var->mode == vtn_variable_mode_output) {
          location += VARYING_SLOT_VAR0;
       } else if (vtn_var->mode == vtn_variable_mode_call_data ||
-                 vtn_var->mode == vtn_variable_mode_ray_payload) {
+                 vtn_var->mode == vtn_variable_mode_call_data_in ||
+                 vtn_var->mode == vtn_variable_mode_ray_payload ||
+                 vtn_var->mode == vtn_variable_mode_ray_payload_in) {
          /* This location is fine as-is */
       } else if (vtn_var->mode != vtn_variable_mode_uniform &&
                  vtn_var->mode != vtn_variable_mode_image) {
@@ -2212,7 +2214,9 @@ vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
        * going to be call payloads.  See get_call_payload_deref.
        */
       if (storage_class == SpvStorageClassCallableDataKHR ||
-          storage_class == SpvStorageClassRayPayloadKHR)
+          storage_class == SpvStorageClassIncomingCallableDataKHR ||
+          storage_class == SpvStorageClassRayPayloadKHR ||
+          storage_class == SpvStorageClassIncomingRayPayloadKHR)
          var->var->data.explicit_location = true;
 
       var->var->data.mode = nir_mode;

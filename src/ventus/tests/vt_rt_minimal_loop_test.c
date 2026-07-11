@@ -91,6 +91,60 @@ build_abi_probe_terminating_any_hit(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static nir_shader *
+build_payload_location_probe(const nir_shader_compiler_options *options)
+{
+   nir_builder b =
+      nir_builder_init_simple_shader(MESA_SHADER_CLOSEST_HIT, options,
+                                     "vt_rt_payload_location_probe");
+
+   nir_variable *hit_value =
+      nir_local_variable_create(b.impl, glsl_vec_type(3), "hitValue");
+   hit_value->data.explicit_location = true;
+   hit_value->data.location = 0;
+
+   nir_variable *shadowed =
+      nir_local_variable_create(b.impl, glsl_bool_type(), "shadowed");
+   shadowed->data.explicit_location = true;
+   shadowed->data.location = 2;
+
+   nir_store_var(&b, hit_value,
+                 nir_vec3(&b, nir_imm_float(&b, 1.0f),
+                          nir_imm_float(&b, 0.5f),
+                          nir_imm_float(&b, 0.25f)),
+                 0x7);
+   nir_store_var(&b, shadowed, nir_imm_bool(&b, false), 0x1);
+
+   return b.shader;
+}
+
+static unsigned
+count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
+{
+   unsigned count = 0;
+
+   NIR_PASS(_, shader, nir_opt_constant_folding);
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot)
+               continue;
+
+            if (nir_src_is_const(intrin->src[1]) &&
+                nir_src_as_uint(intrin->src[1]) == addr)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -110,6 +164,8 @@ main(int argc, char **argv)
    nir_shader *intersection = build_abi_probe_intersection(&options);
    nir_shader *terminating_any_hit =
       build_abi_probe_terminating_any_hit(&options);
+   nir_shader *payload_location_probe =
+      build_payload_location_probe(&options);
 
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(abi.control_base_bytes >=
@@ -123,6 +179,7 @@ main(int argc, char **argv)
                abi.hit_record_base_bytes + abi.hit_record_size_bytes);
    VT_RT_CHECK(abi.payload_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
+   VT_RT_CHECK(abi.payload_size_bytes == 48);
    VT_RT_CHECK(abi.continuation_base_bytes >=
                abi.payload_base_bytes + abi.payload_size_bytes);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
@@ -231,6 +288,17 @@ main(int argc, char **argv)
                intersection_before.ventus_rt_load_slot);
    VT_RT_CHECK(intersection_after.ventus_rt_store_slot >
                intersection_before.ventus_rt_store_slot);
+
+   progress = vt_nir_lower_rt_payload(payload_location_probe, &config);
+   VT_RT_CHECK(progress);
+   VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
+                                             abi.payload_base_bytes + 0) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
+                                             abi.payload_base_bytes + 4) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
+                                             abi.payload_base_bytes + 8) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
+                                             abi.payload_base_bytes + 32) == 1);
 
    nir_shader *pipeline[] = {
       raygen, miss, closest_hit, any_hit, intersection, terminating_any_hit,

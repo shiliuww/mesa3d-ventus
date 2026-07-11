@@ -8,11 +8,26 @@
 #include "compiler/glsl_types.h"
 #include "nir/nir_deref.h"
 
+#define VT_RT_MAX_PAYLOAD_LOCATIONS 32
+
+struct vt_payload_location {
+   int location;
+   uint32_t offset;
+   uint32_t size;
+   uint32_t align;
+};
+
+struct vt_payload_location_map {
+   struct vt_payload_location entries[VT_RT_MAX_PAYLOAD_LOCATIONS];
+   uint32_t count;
+};
+
 struct vt_lower_rt_var_state {
    const struct vt_nir_rt_config *config;
    nir_variable_mode mode;
    uint32_t base_offset;
    bool require_explicit_location;
+   const struct vt_payload_location_map *payload_locations;
 };
 
 static enum vt_rt_shader_layout
@@ -73,6 +88,114 @@ store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                       state->base_offset + word * 4, value);
 }
 
+static struct vt_payload_location *
+find_payload_location(struct vt_payload_location_map *map, int location)
+{
+   for (uint32_t i = 0; i < map->count; ++i) {
+      if (map->entries[i].location == location)
+         return &map->entries[i];
+   }
+
+   return NULL;
+}
+
+static const struct vt_payload_location *
+lookup_payload_location(const struct vt_payload_location_map *map, int location)
+{
+   for (uint32_t i = 0; map && i < map->count; ++i) {
+      if (map->entries[i].location == location)
+         return &map->entries[i];
+   }
+
+   return NULL;
+}
+
+static void
+add_payload_location_var(struct vt_payload_location_map *map,
+                         nir_variable *var)
+{
+   if (!var->data.explicit_location || var->data.location < 0)
+      return;
+
+   struct vt_payload_location *entry =
+      find_payload_location(map, var->data.location);
+   if (!entry) {
+      if (map->count >= VT_RT_MAX_PAYLOAD_LOCATIONS) {
+         assert(!"too many RT payload locations");
+         return;
+      }
+
+      entry = &map->entries[map->count++];
+      *entry = (struct vt_payload_location) {
+         .location = var->data.location,
+      };
+   }
+
+   unsigned size = 0;
+   unsigned align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   entry->size = MAX2(entry->size, size);
+   entry->align = MAX2(entry->align, align);
+}
+
+static void
+collect_payload_locations_from_list(struct vt_payload_location_map *map,
+                                    struct exec_list *vars,
+                                    nir_variable_mode mode)
+{
+   nir_foreach_variable_in_list(var, vars) {
+      if (var->data.mode == mode)
+         add_payload_location_var(map, var);
+   }
+}
+
+static void
+assign_payload_location_offsets(struct vt_payload_location_map *map)
+{
+   for (uint32_t i = 0; i < map->count; ++i) {
+      if (map->entries[i].location >= 0)
+         map->entries[i].offset =
+            map->entries[i].location * VT_RT_ABI_ALIGNMENT_BYTES;
+   }
+}
+
+static struct vt_payload_location_map
+build_payload_location_map(nir_shader *shader, nir_variable_mode modes)
+{
+   struct vt_payload_location_map map = {0};
+
+   if (modes & nir_var_shader_temp)
+      collect_payload_locations_from_list(&map, &shader->variables,
+                                          nir_var_shader_temp);
+   if (modes & nir_var_shader_call_data)
+      collect_payload_locations_from_list(&map, &shader->variables,
+                                          nir_var_shader_call_data);
+
+   if (modes & nir_var_function_temp) {
+      nir_foreach_function_impl(impl, shader) {
+         collect_payload_locations_from_list(&map, &impl->locals,
+                                             nir_var_function_temp);
+      }
+   }
+
+   assign_payload_location_offsets(&map);
+   return map;
+}
+
+static uint32_t
+rt_var_driver_location(const struct vt_lower_rt_var_state *state,
+                       nir_variable *var)
+{
+   if (var->data.explicit_location) {
+      const struct vt_payload_location *entry =
+         lookup_payload_location(state->payload_locations, var->data.location);
+      if (entry)
+         return entry->offset;
+   }
+
+   return var->data.driver_location;
+}
+
 static bool
 lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -100,7 +223,7 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
    b->cursor = nir_after_instr(instr);
 
    uint32_t location =
-      state->base_offset + var->data.driver_location +
+      rt_var_driver_location(state, var) +
       nir_deref_instr_get_const_offset(deref, glsl_get_natural_size_align_bytes);
 
    if (intrin->intrinsic == nir_intrinsic_load_deref) {
@@ -186,7 +309,8 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
 static bool
 lower_rt_vars(nir_shader *shader, nir_variable_mode mode,
               const struct vt_nir_rt_config *config, uint32_t base_offset,
-              bool require_explicit_location)
+              bool require_explicit_location,
+              const struct vt_payload_location_map *payload_locations)
 {
    bool progress = false;
 
@@ -200,6 +324,7 @@ lower_rt_vars(nir_shader *shader, nir_variable_mode mode,
       .mode = mode,
       .base_offset = base_offset,
       .require_explicit_location = require_explicit_location,
+      .payload_locations = payload_locations,
    };
    progress |= nir_shader_instructions_pass(shader, lower_rt_var_deref,
                                             nir_metadata_control_flow, &state);
@@ -224,15 +349,21 @@ vt_nir_lower_rt_payload(nir_shader *shader,
 
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
    uint32_t payload_base = config->scratchpad[layout].payload_base_bytes;
+   nir_variable_mode payload_modes =
+      nir_var_function_temp | nir_var_shader_call_data;
+   if (shader->info.stage == MESA_SHADER_RAYGEN)
+      payload_modes |= nir_var_shader_temp;
+   struct vt_payload_location_map payload_locations =
+      build_payload_location_map(shader, payload_modes);
 
    bool progress = false;
    if (shader->info.stage == MESA_SHADER_RAYGEN)
       progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
-                                payload_base, false);
+                                payload_base, false, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_function_temp, config,
-                             payload_base, true);
+                             payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,
-                             payload_base, false);
+                             payload_base, false, &payload_locations);
    return progress;
 }
 
@@ -437,7 +568,7 @@ vt_nir_lower_rt_control(nir_shader *shader,
       config->scratchpad[layout].hit_attrib_base_bytes;
 
    progress |= lower_rt_vars(shader, nir_var_ray_hit_attrib, config,
-                             hit_attrib_base, false);
+                             hit_attrib_base, false, NULL);
    progress |= nir_shader_intrinsics_pass(shader, lower_rt_control_intrinsic,
                                           nir_metadata_control_flow,
                                           (void *)config);
