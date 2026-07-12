@@ -164,12 +164,6 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
 
-   const struct vt_nir_scratchpad_layout *raygen =
-      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
-   nir_def *slot_base =
-      vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
-                             raygen->ray_state_base_bytes);
-
    nir_loop *loop = nir_push_loop(b);
    {
       struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
@@ -204,10 +198,44 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
    }
    nir_pop_loop(b, loop);
-   nir_ventus_rt_release(b, slot_base);
 
    nir_instr_remove(&intrin->instr);
    return true;
+}
+
+static bool
+insert_raygen_release_before_returns(nir_shader *shader,
+                                     const struct vt_nir_rt_config *config)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return false;
+
+   const struct vt_nir_scratchpad_layout *raygen =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_jump)
+            continue;
+
+         nir_jump_instr *jump = nir_instr_as_jump(instr);
+         if (jump->type != nir_jump_return && jump->type != nir_jump_halt)
+            continue;
+
+         b.cursor = nir_before_instr(instr);
+         nir_def *slot_base =
+            vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
+                                   raygen->ray_state_base_bytes);
+         nir_ventus_rt_release(&b, slot_base);
+         progress = true;
+      }
+   }
+
+   return progress;
 }
 
 bool
@@ -233,6 +261,9 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
       if (!pass_progress)
          break;
    }
+
+   if (progress)
+      progress |= insert_raygen_release_before_returns(shader, config);
 
    if (progress) {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);

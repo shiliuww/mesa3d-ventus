@@ -219,6 +219,8 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
       return false;
    if (state->require_explicit_location && !var->data.explicit_location)
       return false;
+   if (var->data.explicit_location && var->data.location < 0)
+      return false;
 
    b->cursor = nir_after_instr(instr);
 
@@ -350,16 +352,13 @@ vt_nir_lower_rt_payload(nir_shader *shader,
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
    uint32_t payload_base = config->scratchpad[layout].payload_base_bytes;
    nir_variable_mode payload_modes =
-      nir_var_function_temp | nir_var_shader_call_data;
-   if (shader->info.stage == MESA_SHADER_RAYGEN)
-      payload_modes |= nir_var_shader_temp;
+      nir_var_function_temp | nir_var_shader_call_data | nir_var_shader_temp;
    struct vt_payload_location_map payload_locations =
       build_payload_location_map(shader, payload_modes);
 
    bool progress = false;
-   if (shader->info.stage == MESA_SHADER_RAYGEN)
-      progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
-                                payload_base, false, &payload_locations);
+   progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
+                             payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_function_temp, config,
                              payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,

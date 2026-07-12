@@ -11,7 +11,12 @@ bool
 vt_nir_lower_shader_scratch(nir_shader *shader,
                             const struct vt_nir_rt_config *config)
 {
-   (void)config;
+   if (config) {
+      enum vt_rt_shader_layout layout =
+         vt_nir_layout_for_stage(shader->info.stage);
+      shader->scratch_size =
+         MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
+   }
 
    unsigned before = shader->scratch_size;
    bool progress = nir_lower_vars_to_scratch(shader, 0,

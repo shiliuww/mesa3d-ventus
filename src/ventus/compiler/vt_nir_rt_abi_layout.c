@@ -51,6 +51,7 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
    }
 
    for (unsigned i = 0; i < VT_RT_LAYOUT_COUNT; ++i) {
+      config->scratchpad[i].base_bytes = VT_RT_ABI_PDS_BASE_BYTES;
       config->scratchpad[i].ray_state_base_bytes =
          layout->ray_state_base_bytes;
       config->scratchpad[i].payload_base_bytes =

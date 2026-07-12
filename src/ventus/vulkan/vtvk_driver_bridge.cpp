@@ -594,9 +594,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_rt_dispatch_args args = {};
    std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
    uint32_t metadata[VTVK_KNL_MAX_METADATA_SIZE / 4] = {};
-   uint64_t lanes = (uint64_t)info->width * info->height * MAX2(info->depth, 1u);
+   uint64_t raygen_wg_x = DIV_ROUND_UP(info->width, 32);
+   uint64_t raygen_wg_y = MAX2(info->height, 1u);
+   uint64_t raygen_wg_z = MAX2(info->depth, 1u);
+   uint64_t raygen_wg_count = raygen_wg_x * raygen_wg_y * raygen_wg_z;
+   uint64_t pds_resident_lanes = raygen_wg_count * 32;
    uint64_t pds_size =
-      vtvk_bridge_align_u64(MAX2((uint64_t)info->per_lane_scratch_size * lanes,
+      vtvk_bridge_align_u64(MAX2((uint64_t)info->per_lane_scratch_size *
+                                    pds_resident_lanes,
                                  (uint64_t)64 * 1024),
                             4096);
    struct vtvk_driver_kernel_metadata kernel = {};
@@ -734,9 +739,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    }
 
    kernel.kernel_id = 0;
-   kernel.kernel_size[0] = DIV_ROUND_UP(info->width, 32);
-   kernel.kernel_size[1] = MAX2(info->height, 1u);
-   kernel.kernel_size[2] = MAX2(info->depth, 1u);
+   kernel.kernel_size[0] = raygen_wg_x;
+   kernel.kernel_size[1] = raygen_wg_y;
+   kernel.kernel_size[2] = raygen_wg_z;
    kernel.wf_size = 32;
    kernel.wg_size = 1;
    kernel.metaDataBaseAddr = metadata_dev_addr;
@@ -750,8 +755,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.num_thread_local[1] = 1;
    kernel.num_thread_local[2] = 1;
    kernel.kernel_name = "ventus_vk_raygen";
-   kernel.pdsResidentWgCount =
-      kernel.kernel_size[0] * kernel.kernel_size[1] * kernel.kernel_size[2];
+   kernel.pdsResidentWgCount = raygen_wg_count;
 
    if (driver.vt_start(driver.device, &kernel, 0) != 0 ||
        driver.vt_ready_wait(driver.device, 60 * 60 * 1000) != 0) {

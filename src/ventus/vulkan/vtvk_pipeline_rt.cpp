@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "compiler/spirv/nir_spirv.h"
+#include "compiler/glsl_types.h"
 #include "nir/nir.h"
 #include "util/hash_table.h"
 #include "util/log.h"
@@ -570,6 +571,112 @@ struct vtvk_rt_pipeline_callback_data {
    const vtvk_rt_callback_shaders *shaders;
 };
 
+struct vtvk_rt_payload_location_candidate {
+   int location;
+   unsigned size;
+   unsigned align;
+   const char *name;
+};
+
+static bool
+vtvk_rt_is_payload_variable(const nir_variable *var)
+{
+   return var && var->data.explicit_location &&
+          (var->data.mode == nir_var_shader_temp ||
+           var->data.mode == nir_var_shader_call_data);
+}
+
+static void
+vtvk_rt_collect_payload_location_candidates(
+   nir_shader *shader, std::vector<vtvk_rt_payload_location_candidate> *out)
+{
+   if (!shader || !out)
+      return;
+
+   nir_foreach_variable_in_shader(var, shader) {
+      if (!vtvk_rt_is_payload_variable(var) || var->data.location < 0)
+         continue;
+
+      unsigned size = 0;
+      unsigned align = 0;
+      glsl_get_natural_size_align_bytes(var->type, &size, &align);
+      out->push_back({var->data.location, size, align, var->name});
+   }
+}
+
+static int
+vtvk_rt_unique_payload_location_for_var(
+   nir_variable *var,
+   const std::vector<vtvk_rt_payload_location_candidate> &candidates)
+{
+   unsigned size = 0;
+   unsigned align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+
+   int shape_location = -1;
+   int name_location = -1;
+   bool shape_ambiguous = false;
+   bool name_ambiguous = false;
+
+   for (const auto &candidate : candidates) {
+      if (candidate.size != size || candidate.align != align)
+         continue;
+
+      if (shape_location < 0)
+         shape_location = candidate.location;
+      else if (shape_location != candidate.location)
+         shape_ambiguous = true;
+
+      if (var->name && candidate.name && strcmp(var->name, candidate.name) == 0) {
+         if (name_location < 0)
+            name_location = candidate.location;
+         else if (name_location != candidate.location)
+            name_ambiguous = true;
+      }
+   }
+
+   if (name_location >= 0 && !name_ambiguous)
+      return name_location;
+   if (shape_location >= 0 && !shape_ambiguous)
+      return shape_location;
+
+   return -1;
+}
+
+static void
+vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
+                                        uint32_t shader_count)
+{
+   std::vector<vtvk_rt_payload_location_candidate> candidates;
+   for (uint32_t i = 0; i < shader_count; i++)
+      vtvk_rt_collect_payload_location_candidates(shaders[i], &candidates);
+
+   if (candidates.empty())
+      return;
+
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader)
+         continue;
+
+      nir_foreach_variable_in_shader(var, shader) {
+         if (!vtvk_rt_is_payload_variable(var) || var->data.location >= 0)
+            continue;
+
+         int location =
+            vtvk_rt_unique_payload_location_for_var(var, candidates);
+         if (location < 0)
+            continue;
+
+         var->data.location = location;
+         if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+            mesa_logi("ventus-vk: inferred RT payload location %d for %s",
+                      location, var->name ? var->name : "<unnamed>");
+         }
+      }
+   }
+}
+
 static void
 vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
 {
@@ -737,19 +844,12 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   struct vt_nir_rt_config config = vt_nir_rt_default_config();
-   struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-   vt_nir_rt_config_apply_abi_layout(&config, &abi);
-
    vtvk_rt_log_nir_stats(*nir_out, "after spirv_to_nir");
    NIR_PASS(_, *nir_out, nir_lower_system_values);
    vtvk_rt_log_nir_stats(*nir_out, "after nir_lower_system_values");
    NIR_PASS(_, *nir_out, vt_nir_lower_descriptors);
    vtvk_rt_log_nir_stats(*nir_out, "after vt_nir_lower_descriptors");
-   vtvk_rt_lower_abi_with_probe(*nir_out, &config);
-   nir_validate_shader(*nir_out, "after Ventus RT lowering");
-   if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
-      nir_print_shader(*nir_out, stderr);
+   nir_validate_shader(*nir_out, "after Ventus RT pre-lowering");
 
    return VK_SUCCESS;
 }
@@ -883,6 +983,22 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_rt_callback_shaders cb_shaders = {};
    vtvk_collect_rt_callback_shaders(info, pipeline->shaders, pipeline->shader_count,
                                    &cb_shaders);
+
+   vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
+                                           pipeline->shader_count);
+
+   {
+      struct vt_nir_rt_config config = vt_nir_rt_default_config();
+      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
+      vt_nir_rt_config_apply_abi_layout(&config, &abi);
+
+      for (uint32_t s = 0; s < pipeline->shader_count; s++) {
+         vtvk_rt_lower_abi_with_probe(pipeline->shaders[s], &config);
+         nir_validate_shader(pipeline->shaders[s], "after Ventus RT lowering");
+         if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
+            nir_print_shader(pipeline->shaders[s], stderr);
+      }
+   }
 
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();

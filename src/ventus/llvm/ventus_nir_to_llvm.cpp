@@ -69,6 +69,10 @@ public:
         i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
+        debugImageCoords(envEnabled("VENTUS_VK_DEBUG_IMAGE_COORDS")),
+        debugImageDirectDispatch(envEnabled("VENTUS_VK_DEBUG_IMAGE_DIRECT_DISPATCH")),
+        debugEntryImageCoords(envEnabled("VENTUS_VK_DEBUG_ENTRY_IMAGE_COORDS")),
+        debugEntryImageOnly(envEnabled("VENTUS_VK_DEBUG_ENTRY_IMAGE_ONLY")),
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
 
    void translate(nir_shader *shader)
@@ -89,18 +93,45 @@ public:
          return;
       }
 
+      initializeRaygenLaunchId(shader);
+
       mapBlocks(fn, impl);
       allocateVariables(shader, impl);
 
       BasicBlock *first = firstBlock(&impl->body);
-      if (first)
-         builder.CreateBr(first);
+      if (first) {
+         BasicBlock *target = first;
+         if (debugEntryImageCoords && shader->info.stage == MESA_SHADER_RAYGEN) {
+            target = BasicBlock::Create(context, "raygen.debug.entry.store", fn);
+         }
+         if (needsRaygenLaunchGuard(shader)) {
+            returnTarget = BasicBlock::Create(context, "raygen.exit", fn);
+            builder.CreateCondBr(raygenLaunchIdInBounds(), target, returnTarget);
+         } else {
+            builder.CreateBr(target);
+         }
+
+         if (target != first) {
+            builder.SetInsertPoint(target);
+            emitDebugEntryImageStore();
+            builder.CreateBr(debugEntryImageOnly && returnTarget ? returnTarget : first);
+         }
+      }
 
       visitCFList(&impl->body);
       finishPhis();
 
-      if (builder.GetInsertBlock() && !builder.GetInsertBlock()->getTerminator())
+      if (returnTarget) {
+         if (builder.GetInsertBlock() &&
+             !builder.GetInsertBlock()->getTerminator())
+            builder.CreateBr(returnTarget);
+         builder.SetInsertPoint(returnTarget);
+         if (!returnTarget->getTerminator())
+            emitFunctionExit();
+      } else if (builder.GetInsertBlock() &&
+                 !builder.GetInsertBlock()->getTerminator()) {
          emitReturn();
+      }
 
       verifyFunction(*fn, &errs());
    }
@@ -115,6 +146,10 @@ private:
    Type *f32;
    bool noopRtIntrinsics;
    bool earlyExit;
+   bool debugImageCoords;
+   bool debugImageDirectDispatch;
+   bool debugEntryImageCoords;
+   bool debugEntryImageOnly;
    bool debugLowering;
 
    std::unordered_map<const nir_def *, Value *> defs;
@@ -125,6 +160,8 @@ private:
    std::vector<std::pair<nir_phi_instr *, PHINode *>> phis;
    std::vector<BasicBlock *> breakTargets;
    std::vector<BasicBlock *> continueTargets;
+   BasicBlock *returnTarget = nullptr;
+   Value *raygenLaunchId[3] = {nullptr, nullptr, nullptr};
 
    static bool envEnabled(const char *name)
    {
@@ -142,6 +179,10 @@ private:
       phis.clear();
       breakTargets.clear();
       continueTargets.clear();
+      returnTarget = nullptr;
+      raygenLaunchId[0] = nullptr;
+      raygenLaunchId[1] = nullptr;
+      raygenLaunchId[2] = nullptr;
    }
 
    Type *scalarType(unsigned bitSize, bool preferFloat = false)
@@ -197,6 +238,44 @@ private:
       return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
    }
 
+   Value *rtScratchBase()
+   {
+      /* addrspace(5) constants are private-frame relative in the current
+       * backend. RT scratch offsets are PDS-logical absolute offsets, so force
+       * a dynamic zero base that instruction selection cannot fold back into
+       * the private frame register.
+       */
+      Value *a = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+      Value *b = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+      return builder.CreateSub(a, b);
+   }
+
+   Value *rtScratchPtr(Value *offset)
+   {
+      return privatePtr(builder.CreateAdd(rtScratchBase(), asInt32(offset)));
+   }
+
+   Value *rtSlotOffset(enum vt_rt_slot_word word)
+   {
+      return ConstantInt::get(i32,
+                              VT_RT_ABI_PDS_BASE_BYTES +
+                                 word * VT_RT_ABI_WORD_BYTES);
+   }
+
+   Value *loadI32PrivateSlot(enum vt_rt_slot_word word)
+   {
+      LoadInst *load = builder.CreateLoad(i32, rtScratchPtr(rtSlotOffset(word)));
+      load->setAlignment(Align(4));
+      return load;
+   }
+
+   void storeI32PrivateSlot(enum vt_rt_slot_word word, Value *value)
+   {
+      StoreInst *store =
+         builder.CreateStore(asInt32(value), rtScratchPtr(rtSlotOffset(word)));
+      store->setAlignment(Align(4));
+   }
+
    Value *loadI32Global(Value *base, uint32_t offset)
    {
       Value *addr = asInt32(base);
@@ -204,6 +283,17 @@ private:
          addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
       LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
       load->setAlignment(Align(4));
+      return load;
+   }
+
+   Value *loadI32GlobalVolatile(Value *base, uint32_t offset)
+   {
+      Value *addr = asInt32(base);
+      if (offset)
+         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+      LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
+      load->setAlignment(Align(4));
+      load->setVolatile(true);
       return load;
    }
 
@@ -219,6 +309,64 @@ private:
       return loadI32Global(dispatchArgsBase(), offset);
    }
 
+   Value *dispatchArgI32Volatile(uint32_t offset)
+   {
+      return loadI32GlobalVolatile(dispatchArgsBase(), offset);
+   }
+
+   Value *primaryDispatchPixelComponent(unsigned i)
+   {
+      switch (i) {
+      case 0:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.dispatch.id.x");
+      case 1:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.dispatch.id.y");
+      default:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.dispatch.id.z");
+      }
+   }
+
+   Value *raygenLaunchIdComponent(unsigned i)
+   {
+      assert(i < 3);
+      if (!raygenLaunchId[i])
+         raygenLaunchId[i] = primaryDispatchPixelComponent(i);
+      return raygenLaunchId[i];
+   }
+
+   bool needsRaygenLaunchGuard(nir_shader *shader)
+   {
+      return !noopRtIntrinsics && shader->info.stage == MESA_SHADER_RAYGEN;
+   }
+
+   Value *raygenLaunchIdInBounds()
+   {
+      Value *x = raygenLaunchIdComponent(0);
+      Value *y = raygenLaunchIdComponent(1);
+      Value *z = raygenLaunchIdComponent(2);
+      Value *width = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+      Value *height = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT);
+      Value *depth = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH);
+
+      Value *validXY = builder.CreateAnd(builder.CreateICmpULT(x, width),
+                                         builder.CreateICmpULT(y, height));
+      return builder.CreateAnd(validXY, builder.CreateICmpULT(z, depth));
+   }
+
+   void initializeRaygenLaunchId(nir_shader *shader)
+   {
+      if (noopRtIntrinsics || shader->info.stage != MESA_SHADER_RAYGEN)
+         return;
+
+      for (unsigned i = 0; i < 3; ++i) {
+         raygenLaunchId[i] = primaryDispatchPixelComponent(i);
+      }
+
+      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
+      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
+      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
+   }
+
    Value *rayLaunchId()
    {
       if (noopRtIntrinsics)
@@ -226,11 +374,11 @@ private:
       return buildVector(3, i32, [&](unsigned i) {
          switch (i) {
          case 0:
-            return callI32Intrinsic("llvm.riscv.workitem.id.x");
+            return loadI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X);
          case 1:
-            return callI32Intrinsic("llvm.riscv.workitem.id.y");
+            return loadI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y);
          default:
-            return callI32Intrinsic("llvm.riscv.workitem.id.z");
+            return loadI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z);
          }
       });
    }
@@ -360,6 +508,15 @@ private:
    }
 
    void emitReturn()
+   {
+      if (returnTarget) {
+         branchTo(returnTarget);
+         return;
+      }
+      emitFunctionExit();
+   }
+
+   void emitFunctionExit()
    {
       if (isKernelMain())
          emitEndprg();
@@ -780,14 +937,23 @@ private:
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
       Value *format =
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
-      Value *x = asInt32(component(coord, 0));
-      Value *y = (isa<FixedVectorType>(coord->getType()) ||
-                  isa<StructType>(coord->getType())) ?
-                    asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
+      Value *x = debugImageDirectDispatch ?
+                    primaryDispatchPixelComponent(0) :
+                    asInt32(component(coord, 0));
+      Value *y = debugImageDirectDispatch ?
+                    primaryDispatchPixelComponent(1) :
+                    ((isa<FixedVectorType>(coord->getType()) ||
+                      isa<StructType>(coord->getType())) ?
+                        asInt32(component(coord, 1)) : ConstantInt::get(i32, 0));
       Function *fn = declare("llvm.riscv.ventus.image.store.rgba8",
                              builder.getVoidTy(),
                              {i32, i32, i32, i32, i32});
 
+      if (debugImageCoords) {
+         Value *packed = ConstantInt::get(i32, 0xff00ff00u);
+         builder.CreateCall(fn, {imageBase, x, y, stride, packed});
+         return;
+      }
       Value *packedRgba = packRGBA8(rgba, 0, 1, 2, 3);
       Value *packedBgra = packRGBA8(rgba, 2, 1, 0, 3);
       Value *isBgra = builder.CreateICmpEQ(
@@ -795,6 +961,16 @@ private:
 
       Value *packed = builder.CreateSelect(isBgra, packedBgra, packedRgba);
       builder.CreateCall(fn, {imageBase, x, y, stride, packed});
+   }
+
+   void emitDebugEntryImageStore()
+   {
+      Value *coord = rayLaunchId();
+      Value *one = ConstantInt::get(i32, 1065353216);
+      Value *rgba = buildVector(4, i32, [&](unsigned i) -> Value * {
+         return i == 3 ? one : ConstantInt::get(i32, 0);
+      });
+      storeStorageImage(coord, rgba);
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
@@ -1261,11 +1437,11 @@ private:
       }
       case nir_intrinsic_ventus_rt_load_slot: {
          return builder.CreateLoad(defType(&intrin->def),
-                                   privatePtr(value(intrin->src[0])));
+                                   rtScratchPtr(value(intrin->src[0])));
       }
       case nir_intrinsic_ventus_rt_store_slot: {
          builder.CreateStore(asInt32(value(intrin->src[0])),
-                             privatePtr(value(intrin->src[1])));
+                             rtScratchPtr(value(intrin->src[1])));
          return nullptr;
       }
       case nir_intrinsic_ventus_rt_traverse: {

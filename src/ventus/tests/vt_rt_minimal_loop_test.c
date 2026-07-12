@@ -186,7 +186,18 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.continuation_size_bytes == 640);
-   VT_RT_CHECK(abi.total_size_bytes == 992);
+   VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
+   VT_RT_CHECK(abi.control_base_bytes == 96);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 128);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 208);
+   VT_RT_CHECK(abi.hit_attrib_base_bytes == 288);
+   VT_RT_CHECK(abi.payload_base_bytes == 320);
+   VT_RT_CHECK(abi.continuation_base_bytes == 368);
+   VT_RT_CHECK(abi.total_size_bytes ==
+               VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
 
@@ -291,14 +302,16 @@ main(int argc, char **argv)
 
    progress = vt_nir_lower_rt_payload(payload_location_probe, &config);
    VT_RT_CHECK(progress);
+   uint32_t absolute_payload_base =
+      VT_RT_ABI_PDS_BASE_BYTES + abi.payload_base_bytes;
    VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
-                                             abi.payload_base_bytes + 0) == 1);
+                                             absolute_payload_base + 0) == 1);
    VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
-                                             abi.payload_base_bytes + 4) == 1);
+                                             absolute_payload_base + 4) == 1);
    VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
-                                             abi.payload_base_bytes + 8) == 1);
+                                             absolute_payload_base + 8) == 1);
    VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
-                                             abi.payload_base_bytes + 32) == 1);
+                                             absolute_payload_base + 32) == 1);
 
    nir_shader *pipeline[] = {
       raygen, miss, closest_hit, any_hit, intersection, terminating_any_hit,
