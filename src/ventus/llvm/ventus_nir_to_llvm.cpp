@@ -69,10 +69,6 @@ public:
         i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
-        debugImageCoords(envEnabled("VENTUS_VK_DEBUG_IMAGE_COORDS")),
-        debugImageDirectDispatch(envEnabled("VENTUS_VK_DEBUG_IMAGE_DIRECT_DISPATCH")),
-        debugEntryImageCoords(envEnabled("VENTUS_VK_DEBUG_ENTRY_IMAGE_COORDS")),
-        debugEntryImageOnly(envEnabled("VENTUS_VK_DEBUG_ENTRY_IMAGE_ONLY")),
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
 
    void translate(nir_shader *shader)
@@ -100,21 +96,11 @@ public:
 
       BasicBlock *first = firstBlock(&impl->body);
       if (first) {
-         BasicBlock *target = first;
-         if (debugEntryImageCoords && shader->info.stage == MESA_SHADER_RAYGEN) {
-            target = BasicBlock::Create(context, "raygen.debug.entry.store", fn);
-         }
          if (needsRaygenLaunchGuard(shader)) {
             returnTarget = BasicBlock::Create(context, "raygen.exit", fn);
-            builder.CreateCondBr(raygenLaunchIdInBounds(), target, returnTarget);
+            builder.CreateCondBr(raygenLaunchIdInBounds(), first, returnTarget);
          } else {
-            builder.CreateBr(target);
-         }
-
-         if (target != first) {
-            builder.SetInsertPoint(target);
-            emitDebugEntryImageStore();
-            builder.CreateBr(debugEntryImageOnly && returnTarget ? returnTarget : first);
+            builder.CreateBr(first);
          }
       }
 
@@ -146,10 +132,6 @@ private:
    Type *f32;
    bool noopRtIntrinsics;
    bool earlyExit;
-   bool debugImageCoords;
-   bool debugImageDirectDispatch;
-   bool debugEntryImageCoords;
-   bool debugEntryImageOnly;
    bool debugLowering;
 
    std::unordered_map<const nir_def *, Value *> defs;
@@ -240,10 +222,9 @@ private:
 
    Value *rtScratchBase()
    {
-      /* addrspace(5) constants are private-frame relative in the current
-       * backend. RT scratch offsets are PDS-logical absolute offsets, so force
-       * a dynamic zero base that instruction selection cannot fold back into
-       * the private frame register.
+      /* Current backend lowers addrspace(5) constants relative to the private
+       * frame base. RT scratch offsets are PDS-logical absolute offsets, so use
+       * a runtime zero until RT slot load/store gets a first-class lowering.
        */
       Value *a = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
       Value *b = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
@@ -937,23 +918,14 @@ private:
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
       Value *format =
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
-      Value *x = debugImageDirectDispatch ?
-                    primaryDispatchPixelComponent(0) :
-                    asInt32(component(coord, 0));
-      Value *y = debugImageDirectDispatch ?
-                    primaryDispatchPixelComponent(1) :
-                    ((isa<FixedVectorType>(coord->getType()) ||
-                      isa<StructType>(coord->getType())) ?
-                        asInt32(component(coord, 1)) : ConstantInt::get(i32, 0));
+      Value *x = asInt32(component(coord, 0));
+      Value *y = (isa<FixedVectorType>(coord->getType()) ||
+                  isa<StructType>(coord->getType())) ?
+                    asInt32(component(coord, 1)) : ConstantInt::get(i32, 0);
       Function *fn = declare("llvm.riscv.ventus.image.store.rgba8",
                              builder.getVoidTy(),
                              {i32, i32, i32, i32, i32});
 
-      if (debugImageCoords) {
-         Value *packed = ConstantInt::get(i32, 0xff00ff00u);
-         builder.CreateCall(fn, {imageBase, x, y, stride, packed});
-         return;
-      }
       Value *packedRgba = packRGBA8(rgba, 0, 1, 2, 3);
       Value *packedBgra = packRGBA8(rgba, 2, 1, 0, 3);
       Value *isBgra = builder.CreateICmpEQ(
@@ -961,16 +933,6 @@ private:
 
       Value *packed = builder.CreateSelect(isBgra, packedBgra, packedRgba);
       builder.CreateCall(fn, {imageBase, x, y, stride, packed});
-   }
-
-   void emitDebugEntryImageStore()
-   {
-      Value *coord = rayLaunchId();
-      Value *one = ConstantInt::get(i32, 1065353216);
-      Value *rgba = buildVector(4, i32, [&](unsigned i) -> Value * {
-         return i == 3 ? one : ConstantInt::get(i32, 0);
-      });
-      storeStorageImage(coord, rgba);
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
