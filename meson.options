@@ -7,6 +7,14 @@ option(
   value : 'disabled',
   description : 'split debug information (-gsplit-dwarf compile flag) and debug information in the gdb index format (--gdb-index)',
 )
+
+option(
+  'ventus_rt_resident_warps',
+  type : 'integer',
+  value : 8,
+  min : 1,
+  description : 'Number of 32-lane Ventus RT warps resident in the Spike bridge.'
+)
 option(
   'platforms',
   type : 'array',

@@ -37,6 +37,18 @@ current_layout(nir_builder *b)
 }
 
 static nir_def *
+load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
+{
+   nir_intrinsic_instr *intrin =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_ventus_rt_dispatch_arg);
+   intrin->src[0] = nir_src_for_ssa(nir_imm_int(b, offset));
+
+   nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
+   nir_builder_instr_insert(b, &intrin->instr);
+   return &intrin->def;
+}
+
+static nir_def *
 load_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
                   enum vt_rt_shader_layout layout, uint32_t byte_offset)
 {
@@ -585,8 +597,27 @@ lower_shader_record_ptr_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(b->shader->info.stage);
 
    b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *ptr = load_hit_record_u64(b, config, layout,
-                                      VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO);
+   nir_def *ptr;
+   if (layout == VT_RT_LAYOUT_RAYGEN) {
+      ptr = nir_iadd_imm(
+         b, load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_ADDR, 64),
+         config->shader_group_handle_size);
+   } else if (layout == VT_RT_LAYOUT_MISS) {
+      nir_def *miss_index = nir_u2u64(
+         b, load_ray_state_word(b, config, layout, VT_RT_SLOT_MISS_INDEX));
+      nir_def *miss_stride =
+         load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_STRIDE, 64);
+      nir_def *miss_offset = nir_iadd_imm(
+         b, nir_imul(b, miss_index, miss_stride),
+         config->shader_group_handle_size);
+      ptr = nir_iadd(b,
+                     load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_ADDR,
+                                       64),
+                     miss_offset);
+   } else {
+      ptr = load_hit_record_u64(b, config, layout,
+                                VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO);
+   }
    nir_def_rewrite_uses(&intrin->def, ptr);
    nir_instr_remove(&intrin->instr);
    return true;

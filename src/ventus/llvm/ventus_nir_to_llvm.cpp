@@ -12,6 +12,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,22 @@ stage_name(mesa_shader_stage stage)
    }
 }
 
+struct unsupported_source_state {
+   const std::unordered_set<const nir_def *> *defs;
+   bool found;
+};
+
+static bool
+source_is_unsupported(nir_src *src, void *data)
+{
+   auto *state = static_cast<unsupported_source_state *>(data);
+   if (src->ssa && state->defs->count(src->ssa)) {
+      state->found = true;
+      return false;
+   }
+   return true;
+}
+
 class VentusNirToLlvm {
 public:
    VentusNirToLlvm(LLVMContext &context, Module &module)
@@ -71,11 +88,11 @@ public:
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
 
-   void translate(nir_shader *shader)
+   bool translate(nir_shader *shader)
    {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);
       if (!impl)
-         return;
+         return true;
 
       resetFunctionState();
 
@@ -86,7 +103,7 @@ public:
       if (earlyExit && fn->getName() == "main") {
          emitEndprg();
          verifyFunction(*fn, &errs());
-         return;
+         return true;
       }
 
       initializeRaygenLaunchId(shader);
@@ -104,7 +121,8 @@ public:
          }
       }
 
-      visitCFList(&impl->body);
+      if (!visitCFList(&impl->body))
+         return false;
       finishPhis();
 
       if (returnTarget) {
@@ -120,6 +138,7 @@ public:
       }
 
       verifyFunction(*fn, &errs());
+      return true;
    }
 
 private:
@@ -133,8 +152,10 @@ private:
    bool noopRtIntrinsics;
    bool earlyExit;
    bool debugLowering;
+   bool translationFailed = false;
 
    std::unordered_map<const nir_def *, Value *> defs;
+   std::unordered_set<const nir_def *> unsupportedDefs;
    std::unordered_map<const nir_variable *, Value *> variables;
    std::unordered_map<const nir_def *, const nir_variable *> derefVars;
    std::unordered_map<const nir_block *, BasicBlock *> blocks;
@@ -154,6 +175,7 @@ private:
    void resetFunctionState()
    {
       defs.clear();
+      unsupportedDefs.clear();
       variables.clear();
       derefVars.clear();
       blocks.clear();
@@ -165,6 +187,35 @@ private:
       raygenLaunchId[0] = nullptr;
       raygenLaunchId[1] = nullptr;
       raygenLaunchId[2] = nullptr;
+      translationFailed = false;
+   }
+
+   bool instructionUsesUnsupportedDef(nir_instr *instr) const
+   {
+      unsupported_source_state state = {
+         .defs = &unsupportedDefs,
+         .found = false,
+      };
+      nir_foreach_src(instr, source_is_unsupported, &state);
+      return state.found;
+   }
+
+   void failUnsupportedControlFlow(const nir_def *def)
+   {
+      if (translationFailed)
+         return;
+
+      const char *operation = "unknown";
+      const nir_instr *instr = nir_def_instr(def);
+      if (instr && instr->type == nir_instr_type_alu)
+         operation = nir_op_infos[nir_instr_as_alu(instr)->op].name;
+      else if (instr && instr->type == nir_instr_type_intrinsic)
+         operation = nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name;
+
+      fprintf(stderr,
+              "ventus-nir-to-llvm: unsupported value from %s reached control flow\n",
+              operation);
+      translationFailed = true;
    }
 
    Type *scalarType(unsigned bitSize, bool preferFloat = false)
@@ -843,6 +894,29 @@ private:
       });
    }
 
+   Value *reduceBooleanComparison(nir_alu_instr *alu, bool all,
+                                  bool floatSources, bool equal)
+   {
+      const unsigned components = alu->src[0].src.ssa
+                                    ? alu->src[0].src.ssa->num_components
+                                    : 1;
+      Value *reduced = ConstantInt::get(i1, all);
+      for (unsigned i = 0; i < components; i++) {
+         Value *lhs = floatSources ? asFloat(aluSrcScalar(alu, 0, i))
+                                   : asInt32(aluSrcScalar(alu, 0, i));
+         Value *rhs = floatSources ? asFloat(aluSrcScalar(alu, 1, i))
+                                   : asInt32(aluSrcScalar(alu, 1, i));
+         Value *comparison = floatSources
+                               ? (equal ? builder.CreateFCmpOEQ(lhs, rhs)
+                                        : builder.CreateFCmpONE(lhs, rhs))
+                               : (equal ? builder.CreateICmpEQ(lhs, rhs)
+                                        : builder.CreateICmpNE(lhs, rhs));
+         reduced = all ? builder.CreateAnd(reduced, comparison)
+                       : builder.CreateOr(reduced, comparison);
+      }
+      return boolResult(&alu->def, [&](unsigned) { return reduced; });
+   }
+
    Function *unaryFloatIntrinsic(StringRef name)
    {
       return declare(("llvm." + name + ".f32").str(), f32, {f32});
@@ -1193,6 +1267,34 @@ private:
          return cmpBin([&](Value *a, Value *b) {
             return builder.CreateICmpUGE(a, b);
          }, false);
+      case nir_op_ball_fequal2:
+      case nir_op_ball_fequal3:
+      case nir_op_ball_fequal4:
+      case nir_op_b32all_fequal2:
+      case nir_op_b32all_fequal3:
+      case nir_op_b32all_fequal4:
+         return reduceBooleanComparison(alu, true, true, true);
+      case nir_op_ball_iequal2:
+      case nir_op_ball_iequal3:
+      case nir_op_ball_iequal4:
+      case nir_op_b32all_iequal2:
+      case nir_op_b32all_iequal3:
+      case nir_op_b32all_iequal4:
+         return reduceBooleanComparison(alu, true, false, true);
+      case nir_op_bany_fnequal2:
+      case nir_op_bany_fnequal3:
+      case nir_op_bany_fnequal4:
+      case nir_op_b32any_fnequal2:
+      case nir_op_b32any_fnequal3:
+      case nir_op_b32any_fnequal4:
+         return reduceBooleanComparison(alu, false, true, false);
+      case nir_op_bany_inequal2:
+      case nir_op_bany_inequal3:
+      case nir_op_bany_inequal4:
+      case nir_op_b32any_inequal2:
+      case nir_op_b32any_inequal3:
+      case nir_op_b32any_inequal4:
+         return reduceBooleanComparison(alu, false, false, false);
       case nir_op_b2i32:
          return intResult(&alu->def, [&](unsigned i) {
             return builder.CreateZExt(asBool(src(0, i)), i32);
@@ -1304,6 +1406,7 @@ private:
          if (debugLowering)
             fprintf(stderr, "ventus-nir-to-llvm: unsupported ALU op %s\n",
                     nir_op_infos[alu->op].name);
+         unsupportedDefs.insert(&alu->def);
          return undefFor(&alu->def);
       }
    }
@@ -1421,6 +1524,8 @@ private:
          return nullptr;
       }
       default:
+         if (nir_intrinsic_infos[intrin->intrinsic].has_dest)
+            unsupportedDefs.insert(&intrin->def);
          return nir_intrinsic_infos[intrin->intrinsic].has_dest ? undefFor(&intrin->def) : nullptr;
       }
    }
@@ -1468,6 +1573,8 @@ private:
 
       if (result && def)
          defs[def] = result;
+      if (def && instructionUsesUnsupportedDef(instr))
+         unsupportedDefs.insert(def);
       return true;
    }
 
@@ -1514,11 +1621,18 @@ private:
    {
       PHINode *llvmPhi = builder.CreatePHI(defType(&phi->def), 0, "nir.phi");
       defs[&phi->def] = llvmPhi;
+      if (instructionUsesUnsupportedDef(&phi->instr))
+         unsupportedDefs.insert(&phi->def);
       phis.push_back({phi, llvmPhi});
    }
 
    bool visitIf(nir_if *ifStmt)
    {
+      if (ifStmt->condition.ssa && unsupportedDefs.count(ifStmt->condition.ssa)) {
+         failUnsupportedControlFlow(ifStmt->condition.ssa);
+         return false;
+      }
+
       Function *fn = builder.GetInsertBlock()->getParent();
       BasicBlock *thenBB = firstBlock(&ifStmt->then_list);
       BasicBlock *elseBB = firstBlock(&ifStmt->else_list);
@@ -1533,13 +1647,15 @@ private:
 
       if (!exec_list_is_empty(&ifStmt->then_list)) {
          builder.SetInsertPoint(thenBB);
-         visitCFList(&ifStmt->then_list);
+         if (!visitCFList(&ifStmt->then_list))
+            return false;
          branchTo(mergeBB);
       }
 
       if (!exec_list_is_empty(&ifStmt->else_list)) {
          builder.SetInsertPoint(elseBB);
-         visitCFList(&ifStmt->else_list);
+         if (!visitCFList(&ifStmt->else_list))
+            return false;
          branchTo(mergeBB);
       }
 
@@ -1560,7 +1676,11 @@ private:
       breakTargets.push_back(after);
       continueTargets.push_back(header);
       builder.SetInsertPoint(header);
-      visitCFList(&loop->body);
+      if (!visitCFList(&loop->body)) {
+         continueTargets.pop_back();
+         breakTargets.pop_back();
+         return false;
+      }
       branchTo(header);
       continueTargets.pop_back();
       breakTargets.pop_back();
@@ -1585,8 +1705,10 @@ private:
 
    bool visitCFList(struct exec_list *list)
    {
-      foreach_list_typed(nir_cf_node, node, node, list)
-         visitCFNode(node);
+      foreach_list_typed(nir_cf_node, node, node, list) {
+         if (!visitCFNode(node))
+            return false;
+      }
       return true;
    }
 
@@ -1633,8 +1755,10 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
 
    VentusNirToLlvm translator(context, *module);
    for (unsigned i = 0; i < shader_count; ++i) {
-      if (shaders[i])
-         translator.translate(shaders[i]);
+      if (shaders[i] && !translator.translate(shaders[i])) {
+         delete module;
+         return nullptr;
+      }
    }
 
    return module;

@@ -48,7 +48,14 @@ libvulkan_ventus = shared_library(
     idep_vulkan_runtime,
     idep_vulkan_wsi,
   ],
-  c_args : [no_override_init_args, soong_compat_c_args],
+  c_args : [
+    no_override_init_args,
+    soong_compat_c_args,
+    '-DVENTUS_RT_RESIDENT_WARPS=' + get_option('ventus_rt_resident_warps').to_string(),
+  ],
+  cpp_args : [
+    '-DVENTUS_RT_RESIDENT_WARPS=' + get_option('ventus_rt_resident_warps').to_string(),
+  ],
   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
   link_depends : vulkan_icd_link_depends,
   gnu_symbol_visibility : 'hidden',

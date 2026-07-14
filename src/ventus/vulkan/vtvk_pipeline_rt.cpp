@@ -651,8 +651,61 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
    for (uint32_t i = 0; i < shader_count; i++)
       vtvk_rt_collect_payload_location_candidates(shaders[i], &candidates);
 
-   if (candidates.empty())
+   if (candidates.empty()) {
+      const char *name = NULL;
+      unsigned size = 0;
+      unsigned align = 0;
+      bool have_payload = false;
+
+      for (uint32_t i = 0; i < shader_count; i++) {
+         nir_shader *shader = shaders[i];
+         if (!shader)
+            continue;
+
+         nir_foreach_variable_in_shader(var, shader) {
+            if (var->data.mode != nir_var_shader_temp &&
+                var->data.mode != nir_var_shader_call_data)
+               continue;
+
+            unsigned var_size = 0;
+            unsigned var_align = 0;
+            glsl_get_natural_size_align_bytes(var->type, &var_size, &var_align);
+            if (have_payload &&
+                (size != var_size || align != var_align ||
+                 ((name || var->name) &&
+                  (!name || !var->name || strcmp(name, var->name) != 0))))
+               return;
+
+            name = var->name;
+            size = var_size;
+            align = var_align;
+            have_payload = true;
+         }
+      }
+
+      if (!have_payload)
+         return;
+
+      for (uint32_t i = 0; i < shader_count; i++) {
+         nir_shader *shader = shaders[i];
+         if (!shader)
+            continue;
+
+         nir_foreach_variable_in_shader(var, shader) {
+            if (var->data.mode != nir_var_shader_temp &&
+                var->data.mode != nir_var_shader_call_data)
+               continue;
+
+            var->data.location = 0;
+            var->data.explicit_location = true;
+         }
+      }
+
+      if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE"))
+         mesa_logi("ventus-vk: inferred RT payload location 0 for a "
+                   "single unlocated payload interface");
       return;
+   }
 
    for (uint32_t i = 0; i < shader_count; i++) {
       nir_shader *shader = shaders[i];
@@ -1027,6 +1080,14 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_descriptors);
       vtvk_rt_log_nir_stats(cb_shaders.raygen,
                             "raygen after monolithic vt_nir_lower_descriptors");
+
+      /* NIR lowers short-circuit control flow through function-local temporaries.
+       * Keep those values in SSA: Ventus LLVM allocas are not per-lane storage.
+       */
+      NIR_PASS(_, cb_shaders.raygen, nir_lower_vars_to_ssa);
+      NIR_PASS(_, cb_shaders.raygen, nir_opt_copy_prop);
+      nir_validate_shader(cb_shaders.raygen,
+                          "after Ventus RT raygen locals-to-SSA");
    }
 
    pipeline->per_lane_scratch_size =
