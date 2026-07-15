@@ -1097,8 +1097,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                           "after Ventus RT raygen canonicalization");
    }
 
+   /* Callback stages have been inlined into raygen.  Translating their
+    * original NIR as well would compile dead entry points and apply the
+    * per-lane-local legality check to code that is never executed. */
+   nir_shader *monolithic_shaders[] = {cb_shaders.raygen};
    pipeline->per_lane_scratch_size =
-      vt_nir_pipeline_compute_scratch(pipeline->shaders, pipeline->shader_count,
+      vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
 
    struct vt_nir_to_llvm_options llvm_options = {
@@ -1109,7 +1113,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    };
 
    pipeline->llvm_module =
-      vt_nir_to_llvm_translate(pipeline->shaders, pipeline->shader_count,
+      vt_nir_to_llvm_translate(monolithic_shaders, 1,
                                &llvm_options);
    if (!pipeline->llvm_module) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
