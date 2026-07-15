@@ -56,6 +56,17 @@ if prog_glslang.found()
     build_by_default : false,
   )
 
+  vt_nir_rt_canonicalize_test = executable(
+    'vt_nir_rt_canonicalize_test',
+    [
+      'vt_nir_rt_canonicalize_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil],
+    build_by_default : false,
+  )
+
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
@@ -80,6 +91,12 @@ if prog_glslang.found()
       vt_rt_flagged_raygen_spv,
       meson.current_build_dir() / 'vt_rt_flagged_smoke.ppm',
     ],
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_nir_rt_canonicalize',
+    vt_nir_rt_canonicalize_test,
     suite : ['ventus'],
   )
 endif

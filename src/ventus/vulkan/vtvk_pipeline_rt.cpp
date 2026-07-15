@@ -528,6 +528,7 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
    std::string tool_env = vtvk_llvm_tool_env_prefix();
    std::string llc_cmd = tool_env + vtvk_shell_quote(llc) +
                          " -mtriple=riscv32-unknown-elf"
+                         " -mcpu=ventus-gpgpu"
                          " -target-abi=ilp32"
                          " -mattr=+m,+a,+f,+d,+v,+zfh"
                          " -filetype=obj " +
@@ -1081,13 +1082,19 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vtvk_rt_log_nir_stats(cb_shaders.raygen,
                             "raygen after monolithic vt_nir_lower_descriptors");
 
-      /* NIR lowers short-circuit control flow through function-local temporaries.
-       * Keep those values in SSA: Ventus LLVM allocas are not per-lane storage.
-       */
-      NIR_PASS(_, cb_shaders.raygen, nir_lower_vars_to_ssa);
-      NIR_PASS(_, cb_shaders.raygen, nir_opt_copy_prop);
+      struct vt_nir_rt_canonicalize_error canonicalize_error = {};
+      if (vt_nir_canonicalize_rt_for_llvm(cb_shaders.raygen,
+                                          &canonicalize_error) !=
+          VT_NIR_RT_CANONICALIZE_SUCCESS) {
+         mesa_loge("ventus-vk: RT raygen has non-SSA function temporary %s; "
+                   "dynamic or aliased locals are not supported yet",
+                   canonicalize_error.variable_name ?
+                      canonicalize_error.variable_name : "<unnamed>");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+      }
       nir_validate_shader(cb_shaders.raygen,
-                          "after Ventus RT raygen locals-to-SSA");
+                          "after Ventus RT raygen canonicalization");
    }
 
    pipeline->per_lane_scratch_size =
@@ -1098,6 +1105,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       .module_name = "ventus_rt_pipeline",
       .target_triple = "riscv32-unknown-elf",
       .data_layout = "e-m:e-p:32:32-i64:64-n32-S128",
+      .require_ssa_function_temps = true,
    };
 
    pipeline->llvm_module =

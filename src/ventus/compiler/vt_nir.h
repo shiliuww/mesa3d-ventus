@@ -249,6 +249,20 @@ bool vt_nir_lower_shader_scratch(nir_shader *shader,
 
 bool vt_nir_lower_descriptors(nir_shader *shader);
 
+enum vt_nir_rt_canonicalize_status {
+   VT_NIR_RT_CANONICALIZE_SUCCESS = 0,
+   VT_NIR_RT_CANONICALIZE_RESIDUAL_FUNCTION_TEMP,
+};
+
+struct vt_nir_rt_canonicalize_error {
+   const char *variable_name;
+};
+
+enum vt_nir_rt_canonicalize_status
+vt_nir_canonicalize_rt_for_llvm(
+   nir_shader *shader,
+   struct vt_nir_rt_canonicalize_error *error);
+
 void vt_nir_pipeline_scratch_init(struct vt_nir_pipeline_scratch_info *info);
 
 void vt_nir_pipeline_scratch_include_shader(struct vt_nir_pipeline_scratch_info *info,

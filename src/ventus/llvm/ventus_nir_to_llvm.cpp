@@ -78,6 +78,33 @@ source_is_unsupported(nir_src *src, void *data)
    return true;
 }
 
+static const nir_variable *
+residual_function_temp(const nir_shader *shader)
+{
+   nir_foreach_function_impl(impl, const_cast<nir_shader *>(shader)) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            unsigned src_count = nir_intrinsic_infos[intrin->intrinsic].num_srcs;
+            for (unsigned src = 0; src < src_count; ++src) {
+               if (!nir_src_is_deref(intrin->src[src]))
+                  continue;
+
+               nir_variable *var =
+                  nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[src]));
+               if (var && var->data.mode == nir_var_function_temp)
+                  return var;
+            }
+         }
+      }
+   }
+
+   return nullptr;
+}
+
 class VentusNirToLlvm {
 public:
    VentusNirToLlvm(LLVMContext &context, Module &module)
@@ -88,11 +115,22 @@ public:
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
 
-   bool translate(nir_shader *shader)
+   bool translate(nir_shader *shader, bool requireSsaFunctionTemps)
    {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);
       if (!impl)
          return true;
+
+      if (requireSsaFunctionTemps) {
+         const nir_variable *residual = residual_function_temp(shader);
+         if (residual) {
+            fprintf(stderr,
+                    "ventus-nir-to-llvm: RT shader has non-SSA function "
+                    "temporary %s\n",
+                    residual->name ? residual->name : "<unnamed>");
+            return false;
+         }
+      }
 
       resetFunctionState();
 
@@ -101,7 +139,7 @@ public:
       builder.SetInsertPoint(entry);
 
       if (earlyExit && fn->getName() == "main") {
-         emitEndprg();
+         emitKernelReturn();
          verifyFunction(*fn, &errs());
          return true;
       }
@@ -246,6 +284,39 @@ private:
    Value *zeroFor(const nir_def *def, bool preferFloat = false)
    {
       return Constant::getNullValue(defType(def, preferFloat));
+   }
+
+   /*
+    * The Ventus backend represents divergent values in 32-bit VGPRs.  A
+    * plain LLVM i1 PHI, however, has no divergent VGPR register class: LLVM
+    * assigns the PHI a scalar register even when all of its incoming values
+    * are lane-varying comparisons.  Keep the NIR boolean representation at
+    * CFG merge points as canonical 0/1 i32 values.  asBool() turns it back
+    * into an LLVM branch condition at the use site.
+    */
+   Type *phiType(const nir_def *def)
+   {
+      if (def->bit_size != 1)
+         return defType(def);
+
+      if (def->num_components <= 1)
+         return i32;
+
+      std::vector<Type *> fields(def->num_components, i32);
+      return StructType::get(context, fields);
+   }
+
+   Value *coercePhiIncoming(const nir_def *def, Value *incoming)
+   {
+      if (def->bit_size != 1)
+         return incoming;
+
+      if (def->num_components <= 1)
+         return builder.CreateZExt(asBool(incoming), i32);
+
+      return buildVector(def->num_components, i32, [&](unsigned i) {
+         return builder.CreateZExt(asBool(component(incoming, i)), i32);
+      });
    }
 
    Function *declare(StringRef name, Type *ret, ArrayRef<Type *> args)
@@ -521,22 +592,15 @@ private:
       return fn && fn->getName() == "main";
    }
 
-   void emitEndprg()
+   void emitKernelReturn()
    {
-      GlobalVariable *tohost = module.getGlobalVariable("tohost");
-      if (!tohost) {
-         tohost = new GlobalVariable(module, i64, false,
-                                     GlobalValue::ExternalLinkage, nullptr,
-                                     "tohost");
-      }
-
-      builder.CreateStore(ConstantInt::get(i64, 1), tohost);
-
-      Function *fn = builder.GetInsertBlock()->getParent();
-      BasicBlock *loop = BasicBlock::Create(context, "kernel.exit.spin", fn);
-      builder.CreateBr(loop);
-      builder.SetInsertPoint(loop);
-      builder.CreateBr(loop);
+      /*
+       * crt0 calls main and executes endprg after it returns.  Writing the
+       * shared HTIF tohost word here lets the first completed resident warp
+       * stop Spike while divergent warps are still replaying their pending
+       * SIMT paths.
+       */
+      builder.CreateRetVoid();
    }
 
    void emitReturn()
@@ -551,7 +615,7 @@ private:
    void emitFunctionExit()
    {
       if (isKernelMain())
-         emitEndprg();
+         emitKernelReturn();
       else
          builder.CreateRetVoid();
    }
@@ -1619,7 +1683,7 @@ private:
 
    void visitPhi(nir_phi_instr *phi)
    {
-      PHINode *llvmPhi = builder.CreatePHI(defType(&phi->def), 0, "nir.phi");
+      PHINode *llvmPhi = builder.CreatePHI(phiType(&phi->def), 0, "nir.phi");
       defs[&phi->def] = llvmPhi;
       if (instructionUsesUnsupportedDef(&phi->instr))
          unsupportedDefs.insert(&phi->def);
@@ -1636,7 +1700,12 @@ private:
       Function *fn = builder.GetInsertBlock()->getParent();
       BasicBlock *thenBB = firstBlock(&ifStmt->then_list);
       BasicBlock *elseBB = firstBlock(&ifStmt->else_list);
-      BasicBlock *mergeBB = BasicBlock::Create(context, "nir.if.end", fn);
+      BasicBlock *mergeBB = nullptr;
+      nir_cf_node *next = nir_cf_node_next(&ifStmt->cf_node);
+      if (next && next->type == nir_cf_node_block)
+         mergeBB = blocks[nir_cf_node_as_block(next)];
+      if (!mergeBB)
+         mergeBB = BasicBlock::Create(context, "nir.if.end", fn);
 
       if (!thenBB)
          thenBB = mergeBB;
@@ -1732,6 +1801,16 @@ private:
             if (!pred)
                continue;
             Value *incoming = value(src->src);
+
+            /* The conversion belongs to the incoming CFG edge, not to the
+             * block where finishPhis() happens to leave the IRBuilder. */
+            IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
+            if (Instruction *terminator = pred->getTerminator())
+               builder.SetInsertPoint(terminator);
+            else
+               builder.SetInsertPoint(pred);
+            incoming = coercePhiIncoming(&nirPhi->def, incoming);
+            builder.restoreIP(savedInsertPoint);
             if (incoming->getType() != llvmPhi->getType())
                incoming = UndefValue::get(llvmPhi->getType());
             llvmPhi->addIncoming(incoming, pred);
@@ -1755,7 +1834,9 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
 
    VentusNirToLlvm translator(context, *module);
    for (unsigned i = 0; i < shader_count; ++i) {
-      if (shaders[i] && !translator.translate(shaders[i])) {
+      if (shaders[i] && !translator.translate(
+                            shaders[i],
+                            options && options->require_ssa_function_temps)) {
          delete module;
          return nullptr;
       }
