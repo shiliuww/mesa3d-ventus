@@ -1,3 +1,6 @@
+> This is a chronological development log. Earlier “current gap” statements
+> describe their version only. The latest verified state is v14.
+
 # v1
 
 实现内容：
@@ -342,3 +345,24 @@
   Spike backend is not wired yet
 
   所以当前是 full app Vulkan 控制流、ICD、device、pipeline、AS/SBT 地址链条打通；还差最后真正 backend：AS 转 Spike BVH、LLVM code object/ELF 发射、Spike memory 初始化、执行 raygen kernel、storage image 写回。现有 Ventus Mesa RT tests 也已通过：3/3 OK。
+
+# v14
+
+v13 中列出的 backend 缺口已经闭合为一条有界的真实 Spike 出图链路：
+
+  - `CmdBuildAccelerationStructuresKHR` 生成 Ventus BVH ABI v1 的 triangle BLAS
+    和 instance TLAS；
+  - RT pipeline 从 SPIR-V/NIR 经 Ventus lowering 和 LLVM 生成 RISC-V ELF；
+  - `CmdTraceRaysKHR` 收集 TLAS、SBT、descriptor、camera 和 storage image；
+  - `vtvk_driver_bridge` 上传 ELF 与资源并启动 Ventus Spike；
+  - Spike 执行 raygen kernel，storage image 回读为 P6 PPM。
+
+2026-07-19 使用干净提交 Mesa `d413bd2`、LLVM `29da3a1`、driver
+`c5ce8a7`、Spike `b1ef3ef` 运行 SaschaWillems `raytracingshadows`
+160x96 单帧成功。输出包含 136 种颜色，SHA-256 为：
+
+  f43328945bdeb0dda69b3cc5612212170e5596456450184acfa627db8d5d1212
+
+该证据只闭合当前受限 Vulkan/triangle/Spike functional vertical slice；它不代表
+Vulkan RT conformance、AABB/procedural/callable 完整支持、submit-time command
+execution、RTL RTcore 或硬件 timing/backpressure 已完成。

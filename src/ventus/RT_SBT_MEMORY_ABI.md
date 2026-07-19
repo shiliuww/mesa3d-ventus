@@ -75,27 +75,31 @@ part of this ABI revision.
 
 ## Per-Lane Scratch
 
-The stable per-lane scratch layout is 992 bytes:
+The current per-lane scratch stride is 5104 bytes. The first 4096 bytes are
+reserved for compiler-lowered private/local storage; the hardware-visible RT
+ABI region occupies the following 1008 bytes. Offsets in the second column are
+relative to the RT ABI base (`VT_RT_ABI_PDS_BASE_BYTES`):
 
-| Byte Range | Region |
-| ---: | --- |
-| 0..79 | `ray_state`, 20 words |
-| 80..103 | `control`, 6 words |
-| 104..111 | alignment gap |
-| 112..183 | candidate hit record, 18 words |
-| 184..191 | candidate hit record extension gap |
-| 192..263 | committed hit record, 18 words |
-| 264..271 | committed hit record extension gap |
-| 272..303 | hit attributes |
-| 304..347 | payload |
-| 348..351 | alignment |
-| 352..367 | continuation header |
-| 368..463 | continuation contexts, 2 x 48 bytes |
-| 464..975 | continuation stack, 32 x 16-byte entries |
-| 976..991 | continuation alignment/reserved |
+| Per-Lane Offset | RT Region Offset | Region |
+| ---: | ---: | --- |
+| 0..4095 | n/a | compiler private/local reservation |
+| 4096..4187 | 0..91 | `ray_state`, 23 words |
+| 4188..4191 | 92..95 | alignment gap |
+| 4192..4215 | 96..119 | `control`, 6 words |
+| 4216..4223 | 120..127 | alignment gap |
+| 4224..4295 | 128..199 | candidate hit record, 18 words |
+| 4296..4303 | 200..207 | candidate hit record extension gap |
+| 4304..4375 | 208..279 | committed hit record, 18 words |
+| 4376..4383 | 280..287 | committed hit record extension gap |
+| 4384..4415 | 288..319 | hit attributes |
+| 4416..4463 | 320..367 | default payload region |
+| 4464..4479 | 368..383 | continuation header |
+| 4480..4575 | 384..479 | continuation contexts, 2 x 48 bytes |
+| 4576..5087 | 480..991 | continuation stack, 32 x 16-byte entries |
+| 5088..5103 | 992..1007 | continuation alignment/reserved |
 
-Hit record word 18 lives in the extension gap and stores
-`instance_sbt_record_offset`. Existing fields are not moved.
+Hit record word 18 lives in each hit-record extension gap and stores
+`instance_sbt_record_offset`. Existing 18-word fields are not moved.
 
 Continuation state is fixed per lane for hardware compatibility. Header word 0
 stores active/overflow/done flags, word 1 stores stack count, word 2 stores the

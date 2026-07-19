@@ -1,7 +1,9 @@
 # Ventus RT Driver Probe
 
-`probe_write_pixel.ll` is a minimal RV32 Spike-driver kernel for checking the
-Mesa -> driver -> Spike bridge before using generated raygen code.
+`probe_write_pixel.ll` is a minimal RV32 Spike-driver kernel for isolating the
+Mesa -> driver -> Spike bridge from generated raygen code. Generated RT ELF
+execution is now the full-app baseline, so this probe is diagnostic evidence,
+not the current rendering path.
 
 It requests the kernel metadata pointer through
 `llvm.riscv.ventus.kernel.metadata()`, loads `args.image_addr`, and writes four
