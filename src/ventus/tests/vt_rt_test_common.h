@@ -237,6 +237,29 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
    }
 }
 
+static inline unsigned
+vt_rt_count_dispatch_arg_offset(nir_shader *shader, uint32_t offset)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic == nir_intrinsic_ventus_rt_dispatch_arg &&
+                nir_src_is_const(intrin->src[0]) &&
+                nir_src_as_uint(intrin->src[0]) == offset)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
 static inline nir_shader *
 vt_rt_load_raygen_spirv(const char *path,
                         const nir_shader_compiler_options *options)

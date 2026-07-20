@@ -189,10 +189,16 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 2);
+   VT_RT_CHECK(VT_RT_ABI_TAG == 0x56540002u);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
+   VT_RT_CHECK(VT_RT_SLOT_ABI_TAG * 4 == 92);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
+   VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_ABI_CPS_HEADER_BASE_BYTES);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_ABI_TAG == 148);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 184);
    VT_RT_CHECK(abi.control_base_bytes == 112);
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
    VT_RT_CHECK(abi.hit_record_base_bytes == 224);
@@ -223,6 +229,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.jump_break >= 1);
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
    VT_RT_CHECK(after.ventus_rt_release == 1);
+   VT_RT_CHECK(vt_rt_count_dispatch_arg_offset(
+                  raygen, VT_NIR_RT_DISPATCH_ARG_ABI_TAG) == 1);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(raygen));
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);

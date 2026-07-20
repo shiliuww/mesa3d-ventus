@@ -324,6 +324,9 @@ vt_nir_build_traversal(nir_builder *b,
       vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
                              raygen->ray_state_base_bytes);
 
+   store_word(b, base, VT_RT_SLOT_ABI_TAG,
+              params->abi_tag ? params->abi_tag
+                              : nir_imm_int(b, VT_RT_ABI_TAG));
    store_word(b, base, VT_RT_SLOT_STATUS, nir_imm_int(b, VT_RT_STATUS_TRACE_REQUEST));
    store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
    store_word(b, base, VT_RT_SLOT_FLAGS, params->flags);

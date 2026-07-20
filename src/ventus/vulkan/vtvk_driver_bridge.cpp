@@ -29,6 +29,9 @@ static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
 static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
               VT_NIR_RT_DESCRIPTOR_RECORD_SIZE,
               "RT descriptor ABI size mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, abi_tag) ==
+              VT_NIR_RT_DISPATCH_ARG_ABI_TAG,
+              "RT ABI tag dispatch argument mismatch");
 static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_arena_addr) ==
               VT_NIR_RT_DISPATCH_ARG_CONTINUATION_ARENA_ADDR,
               "RT CPS arena argument ABI mismatch");
@@ -705,6 +708,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
    args.scratch_stride = info->per_lane_scratch_size;
+   args.abi_tag = VT_RT_ABI_TAG;
    args.continuation_frame_stride = info->continuation_frame_size;
    args.continuation_context_count = pds_resident_lanes;
    args.descriptor_table_addr = descriptor_table_dev_addr;

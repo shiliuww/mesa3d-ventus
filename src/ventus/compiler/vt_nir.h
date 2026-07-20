@@ -91,6 +91,7 @@ struct vt_nir_rt_trace_params {
    nir_def *direction;
    nir_def *tmax;
    nir_def *payload;
+   nir_def *abi_tag;
 };
 
 struct vt_nir_rt_result {
@@ -293,6 +294,7 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_IMAGE_STRIDE = 136,
    VT_NIR_RT_DISPATCH_ARG_CAMERA_SIZE = 140,
    VT_NIR_RT_DISPATCH_ARG_SCRATCH_STRIDE = 144,
+   VT_NIR_RT_DISPATCH_ARG_ABI_TAG = 148,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR = 152,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_COUNT = 160,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE = 164,

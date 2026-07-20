@@ -159,6 +159,7 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .direction = intrin->src[8].ssa,
       .tmax = intrin->src[9].ssa,
       .payload = intrin->src[10].ssa,
+      .abi_tag = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_ABI_TAG, 32),
    };
 
    bool skip_closest_hit =

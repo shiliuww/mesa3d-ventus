@@ -15,6 +15,7 @@
  */
 
 #define VT_RT_ABI_VERSION 2
+#define VT_RT_ABI_TAG (0x56540000u | VT_RT_ABI_VERSION)
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 /*
@@ -49,7 +50,9 @@ enum vt_rt_slot_word {
    VT_RT_SLOT_LAUNCH_ID_X = 20,
    VT_RT_SLOT_LAUNCH_ID_Y = 21,
    VT_RT_SLOT_LAUNCH_ID_Z = 22,
-   VT_RT_SLOT_WORD_COUNT = 23,
+   /* Runtime/compiler tag consumed by the RTCore compatibility adapter. */
+   VT_RT_SLOT_ABI_TAG = 23,
+   VT_RT_SLOT_WORD_COUNT = 24,
 };
 
 enum vt_rt_status {

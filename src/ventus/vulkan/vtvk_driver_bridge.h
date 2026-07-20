@@ -33,7 +33,7 @@ struct vtvk_rt_dispatch_args {
    uint32_t image_stride;
    uint32_t camera_size;
    uint32_t scratch_stride;
-   uint32_t reserved;
+   uint32_t abi_tag;
    uint64_t descriptor_table_addr;
    uint32_t descriptor_count;
    uint32_t descriptor_record_stride;
