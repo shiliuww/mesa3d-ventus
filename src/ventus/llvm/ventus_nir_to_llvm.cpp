@@ -308,14 +308,20 @@ private:
 
    Value *coercePhiIncoming(const nir_def *def, Value *incoming)
    {
-      if (def->bit_size != 1)
-         return incoming;
+      auto coerceScalar = [&](Value *scalar) -> Value * {
+         if (def->bit_size == 1)
+            return builder.CreateZExt(asBool(scalar), i32);
+         if (def->bit_size == 64)
+            return asInt64(scalar);
+         return asInt32(scalar);
+      };
 
       if (def->num_components <= 1)
-         return builder.CreateZExt(asBool(incoming), i32);
+         return coerceScalar(incoming);
 
-      return buildVector(def->num_components, i32, [&](unsigned i) {
-         return builder.CreateZExt(asBool(component(incoming, i)), i32);
+      Type *scalar = def->bit_size == 64 ? i64 : i32;
+      return buildVector(def->num_components, scalar, [&](unsigned i) {
+         return coerceScalar(component(incoming, i));
       });
    }
 

@@ -67,6 +67,17 @@ if prog_glslang.found()
     build_by_default : false,
   )
 
+  vt_nir_to_llvm_phi_test = executable(
+    'vt_nir_to_llvm_phi_test',
+    [
+      'vt_nir_to_llvm_phi_test.cpp',
+      libventus_llvm_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [dep_llvm, idep_nir, idep_mesautil],
+    build_by_default : false,
+  )
+
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
@@ -97,6 +108,12 @@ if prog_glslang.found()
   test(
     'vt_nir_rt_canonicalize',
     vt_nir_rt_canonicalize_test,
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_nir_to_llvm_phi',
+    vt_nir_to_llvm_phi_test,
     suite : ['ventus'],
   )
 endif

@@ -238,6 +238,11 @@ vtvk_rt_lower_abi_with_probe(nir_shader *shader,
    NIR_PASS(_, shader, vt_nir_lower_shader_scratch, config);
    vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_shader_scratch");
 
+   NIR_PASS(_, shader, nir_remove_dead_variables,
+            nir_var_shader_temp | nir_var_shader_call_data |
+               nir_var_ray_hit_attrib,
+            NULL);
+
    vtvk_rt_finalize_abi(shader, config);
    vtvk_rt_log_nir_stats(shader, "after vt_nir_rt_abi_finalize");
 }
@@ -644,6 +649,17 @@ static void
 vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
                                         uint32_t shader_count)
 {
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (!shaders[i])
+         continue;
+
+      nir_remove_dead_derefs(shaders[i]);
+      nir_remove_dead_variables(shaders[i],
+                                nir_var_shader_temp |
+                                   nir_var_shader_call_data,
+                                NULL);
+   }
+
    std::vector<vtvk_rt_payload_location_candidate> candidates;
    for (uint32_t i = 0; i < shader_count; i++)
       vtvk_rt_collect_payload_location_candidates(shaders[i], &candidates);

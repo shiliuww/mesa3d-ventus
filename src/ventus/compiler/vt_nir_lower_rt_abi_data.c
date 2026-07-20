@@ -523,9 +523,17 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_report_ray_intersection: {
       nir_def *hit_t = intrin->src[0].ssa;
       nir_def *hit_kind = intrin->src[1].ssa;
-      nir_def *current_tmax =
+      nir_def *committed_status =
+         vt_nir_load_hit_record_word(b, config, layout,
+                                     VT_RT_HIT_RECORD_STATUS, 32);
+      nir_def *committed_tmax =
          vt_nir_load_hit_record_word(b, config, layout,
                                      VT_RT_HIT_RECORD_HIT_T, 32);
+      nir_def *ray_tmax =
+         load_ray_state_word(b, config, layout, VT_RT_SLOT_TMAX);
+      nir_def *current_tmax =
+         nir_bcsel(b, nir_ieq_imm(b, committed_status, VT_RT_STATUS_HIT),
+                   committed_tmax, ray_tmax);
       nir_def *tmin = load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
       nir_def *accepted =
          nir_iand(b, nir_fge(b, current_tmax, hit_t),

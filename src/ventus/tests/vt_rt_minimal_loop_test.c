@@ -145,6 +145,33 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
    return count;
 }
 
+static unsigned
+count_load_slot_from_const_addr(nir_shader *shader, uint32_t addr)
+{
+   unsigned count = 0;
+
+   NIR_PASS(_, shader, nir_opt_constant_folding);
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_ventus_rt_load_slot)
+               continue;
+
+            if (nir_src_is_const(intrin->src[0]) &&
+                nir_src_as_uint(intrin->src[0]) == addr)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -311,6 +338,19 @@ main(int argc, char **argv)
                intersection_before.ventus_rt_load_slot);
    VT_RT_CHECK(intersection_after.ventus_rt_store_slot >
                intersection_before.ventus_rt_store_slot);
+   VT_RT_CHECK(count_load_slot_from_const_addr(
+                  intersection,
+                  VT_RT_ABI_PDS_BASE_BYTES + VT_RT_SLOT_TMAX * 4) == 1);
+   VT_RT_CHECK(count_load_slot_from_const_addr(
+                  intersection,
+                  VT_RT_ABI_PDS_BASE_BYTES +
+                     abi.hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_STATUS * 4) == 1);
+   VT_RT_CHECK(count_load_slot_from_const_addr(
+                  intersection,
+                  VT_RT_ABI_PDS_BASE_BYTES +
+                     abi.hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_HIT_T * 4) == 1);
 
    progress = vt_nir_lower_rt_payload(payload_location_probe, &config);
    VT_RT_CHECK(progress);
