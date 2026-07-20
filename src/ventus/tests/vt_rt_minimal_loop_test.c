@@ -225,7 +225,9 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_ABI_CPS_HEADER_BASE_BYTES);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_ABI_TAG == 148);
-   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 184);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_ADDR == 184);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_SIZE == 192);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 200);
    VT_RT_CHECK(abi.control_base_bytes == 112);
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
    VT_RT_CHECK(abi.hit_record_base_bytes == 224);

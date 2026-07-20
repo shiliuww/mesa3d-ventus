@@ -50,6 +50,19 @@ vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
       return VK_NULL_HANDLE;
    return cmd->bound_descriptor_sets[set];
 }
+
+const void *
+vtvk_cmd_buffer_rt_push_constants(VkCommandBuffer commandBuffer,
+                                  uint32_t *size_out,
+                                  VkShaderStageFlags *stages_out)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (size_out)
+      *size_out = cmd ? cmd->rt_push_constant_size : 0;
+   if (stages_out)
+      *stages_out = cmd ? cmd->rt_push_constant_stages : 0;
+   return cmd && cmd->rt_push_constant_size ? cmd->rt_push_constants : NULL;
+}
 static VkResult
 vtvk_cmd_buffer_create(struct vk_command_pool *pool,
                        VkCommandBufferLevel level,
@@ -77,6 +90,13 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
                       VkCommandBufferResetFlags flags)
 {
    (void)flags;
+   struct vtvk_cmd_buffer *cmd =
+      container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
+   cmd->bound_rt_pipeline = VK_NULL_HANDLE;
+   memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
+   memset(cmd->rt_push_constants, 0, sizeof(cmd->rt_push_constants));
+   cmd->rt_push_constant_size = 0;
+   cmd->rt_push_constant_stages = 0;
    vk_command_buffer_reset(cmd_buffer);
 }
 
@@ -201,19 +221,26 @@ vtvk_CmdPushConstants(VkCommandBuffer commandBuffer,
                       uint32_t size,
                       const void *pValues)
 {
-   (void)commandBuffer;
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
    (void)layout;
-   (void)stageFlags;
-   (void)offset;
-   (void)size;
-   (void)pValues;
+   if (!cmd || !pValues || offset > VTVK_MAX_PUSH_CONSTANTS_SIZE ||
+       size > VTVK_MAX_PUSH_CONSTANTS_SIZE - offset)
+      return;
+
+   memcpy(cmd->rt_push_constants + offset, pValues, size);
+   cmd->rt_push_constant_size = MAX2(cmd->rt_push_constant_size, offset + size);
+   cmd->rt_push_constant_stages |= stageFlags;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
                        const VkPushConstantsInfo *pPushConstantsInfo)
 {
-   (void)commandBuffer;
-   (void)pPushConstantsInfo;
+   if (!pPushConstantsInfo)
+      return;
+   vtvk_CmdPushConstants(commandBuffer, pPushConstantsInfo->layout,
+                         pPushConstantsInfo->stageFlags,
+                         pPushConstantsInfo->offset,
+                         pPushConstantsInfo->size,
+                         pPushConstantsInfo->pValues);
 }
-

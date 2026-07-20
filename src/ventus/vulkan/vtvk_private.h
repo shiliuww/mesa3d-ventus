@@ -17,6 +17,7 @@
 #define VTVK_QUEUE_FAMILY 0
 #define VTVK_MAX_DESCRIPTOR_BINDINGS 32
 #define VTVK_MAX_BOUND_DESCRIPTOR_SETS 4
+#define VTVK_MAX_PUSH_CONSTANTS_SIZE 256
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,9 @@ struct vtvk_cmd_buffer {
 
    VkPipeline bound_rt_pipeline;
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+   uint8_t rt_push_constants[VTVK_MAX_PUSH_CONSTANTS_SIZE];
+   uint32_t rt_push_constant_size;
+   VkShaderStageFlags rt_push_constant_stages;
 };
 
 struct vtvk_acceleration_structure {
@@ -86,9 +90,17 @@ void *vtvk_buffer_host_ptr(VkBuffer buffer, VkDeviceSize offset,
                            VkDeviceSize size);
 void *vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address,
                                      VkDeviceSize size);
+bool vtvk_buffer_resolve_device_address(VkDeviceAddress address,
+                                        void **host_base_out,
+                                        VkDeviceAddress *host_address_out,
+                                        VkDeviceSize *size_out,
+                                        VkDeviceSize *offset_out);
 VkPipeline vtvk_cmd_buffer_bound_rt_pipeline(VkCommandBuffer commandBuffer);
 VkDescriptorSet vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
                                                      uint32_t set);
+const void *vtvk_cmd_buffer_rt_push_constants(VkCommandBuffer commandBuffer,
+                                              uint32_t *size_out,
+                                              VkShaderStageFlags *stages_out);
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding);
@@ -102,6 +114,8 @@ bool vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
                                      struct vtvk_descriptor_binding_info *out);
 void *vtvk_image_host_ptr(VkImage image, VkExtent3D *extent_out,
                           VkFormat *format_out);
+uint32_t vtvk_format_bytes_per_pixel(VkFormat format);
+bool vtvk_sampler_is_linear_repeat(VkSampler sampler);
 struct vtvk_acceleration_structure *
 vtvk_find_as_by_address(VkDeviceAddress address);
 

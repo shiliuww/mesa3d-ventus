@@ -8,7 +8,14 @@
 #include "vtvk_entrypoints.h"
 
 struct vtvk_sampler {
-   uint32_t unused;
+   VkFilter mag_filter;
+   VkFilter min_filter;
+   VkSamplerAddressMode address_mode_u;
+   VkSamplerAddressMode address_mode_v;
+   VkBool32 compare_enable;
+   VkBool32 unnormalized_coordinates;
+   float min_lod;
+   float max_lod;
 };
 
 struct vtvk_render_pass {
@@ -46,15 +53,35 @@ vtvk_CreateSampler(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
-   (void)pCreateInfo;
-
    struct vtvk_sampler *sampler =
       vk_zalloc(alloc, sizeof(*sampler), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!sampler)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   sampler->mag_filter = pCreateInfo->magFilter;
+   sampler->min_filter = pCreateInfo->minFilter;
+   sampler->address_mode_u = pCreateInfo->addressModeU;
+   sampler->address_mode_v = pCreateInfo->addressModeV;
+   sampler->compare_enable = pCreateInfo->compareEnable;
+   sampler->unnormalized_coordinates = pCreateInfo->unnormalizedCoordinates;
+   sampler->min_lod = pCreateInfo->minLod;
+   sampler->max_lod = pCreateInfo->maxLod;
+
    *pSampler = (VkSampler)vtvk_ptr_to_handle(sampler);
    return VK_SUCCESS;
+}
+
+bool
+vtvk_sampler_is_linear_repeat(VkSampler _sampler)
+{
+   struct vtvk_sampler *sampler =
+      vtvk_handle_to_ptr((uint64_t)_sampler);
+   return sampler && sampler->mag_filter == VK_FILTER_LINEAR &&
+          sampler->min_filter == VK_FILTER_LINEAR &&
+          sampler->address_mode_u == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+          sampler->address_mode_v == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+          !sampler->compare_enable && !sampler->unnormalized_coordinates &&
+          sampler->min_lod <= 0.0f && sampler->max_lod >= 0.0f;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -562,9 +589,48 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                           const VkBufferImageCopy *pRegions)
 {
    (void)commandBuffer;
-   (void)srcBuffer;
-   (void)dstImage;
    (void)dstImageLayout;
-   (void)regionCount;
-   (void)pRegions;
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)dstImage);
+   if (!image || !image->map || !pRegions)
+      return;
+
+   const uint32_t bpp = vtvk_format_bytes_per_pixel(image->format);
+   for (uint32_t r = 0; r < regionCount; r++) {
+      const VkBufferImageCopy *region = &pRegions[r];
+
+      /* The current image carrier stores the base mip only. */
+      if (region->imageSubresource.mipLevel != 0 ||
+          region->imageSubresource.baseArrayLayer != 0 ||
+          region->imageSubresource.layerCount != 1 ||
+          region->imageOffset.x < 0 || region->imageOffset.y < 0 ||
+          region->imageOffset.z < 0)
+         continue;
+
+      uint32_t row_length = region->bufferRowLength ?
+                               region->bufferRowLength :
+                               region->imageExtent.width;
+      uint32_t image_height = region->bufferImageHeight ?
+                                 region->bufferImageHeight :
+                                 region->imageExtent.height;
+      if (row_length < region->imageExtent.width ||
+          image_height < region->imageExtent.height)
+         continue;
+
+      for (uint32_t z = 0; z < region->imageExtent.depth; z++) {
+         for (uint32_t y = 0; y < region->imageExtent.height; y++) {
+            VkDeviceSize src_offset = region->bufferOffset +
+               (((VkDeviceSize)z * image_height + y) * row_length * bpp);
+            VkDeviceSize dst_offset =
+               (((VkDeviceSize)(region->imageOffset.z + (int32_t)z) *
+                    image->extent.height +
+                  (uint32_t)region->imageOffset.y + y) * image->extent.width +
+                 (uint32_t)region->imageOffset.x) * bpp;
+            VkDeviceSize bytes = (VkDeviceSize)region->imageExtent.width * bpp;
+            void *src = vtvk_buffer_host_ptr(srcBuffer, src_offset, bytes);
+            if (src && dst_offset <= image->size &&
+                bytes <= image->size - dst_offset)
+               memcpy((uint8_t *)image->map + dst_offset, src, bytes);
+         }
+      }
+   }
 }

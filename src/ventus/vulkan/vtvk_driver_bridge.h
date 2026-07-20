@@ -40,6 +40,9 @@ struct vtvk_rt_dispatch_args {
    uint64_t continuation_arena_addr;
    uint32_t continuation_frame_stride;
    uint32_t continuation_context_count;
+   uint64_t push_constant_addr;
+   uint32_t push_constant_size;
+   uint32_t push_constant_reserved;
 };
 
 struct vtvk_rt_descriptor_record {
@@ -59,6 +62,7 @@ struct vtvk_rt_descriptor_source {
    uint32_t binding;
    VkAccelerationStructureKHR acceleration_structure;
    VkImage image;
+   VkSampler sampler;
    VkBuffer buffer;
    VkDeviceSize offset;
    VkDeviceSize range;
@@ -84,6 +88,9 @@ struct vtvk_driver_trace_rays_info {
    uint64_t kernel_entry;
    const struct vtvk_rt_descriptor_source *descriptors;
    uint32_t descriptor_count;
+   const void *push_constant_data;
+   uint32_t push_constant_size;
+   VkShaderStageFlags push_constant_stages;
 };
 
 bool vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info);

@@ -8,7 +8,7 @@
 
 static struct vtvk_buffer *vtvk_buffer_list;
 
-static uint32_t
+uint32_t
 vtvk_format_bytes_per_pixel(VkFormat format)
 {
    switch (format) {
@@ -90,6 +90,36 @@ vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
    }
 
    return NULL;
+}
+
+bool
+vtvk_buffer_resolve_device_address(VkDeviceAddress address,
+                                   void **host_base_out,
+                                   VkDeviceAddress *host_address_out,
+                                   VkDeviceSize *size_out,
+                                   VkDeviceSize *offset_out)
+{
+   for (struct vtvk_buffer *buffer = vtvk_buffer_list; buffer;
+        buffer = buffer->next) {
+      if (!buffer->map)
+         continue;
+
+      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
+      if (address < base || address - base >= buffer->size)
+         continue;
+
+      if (host_base_out)
+         *host_base_out = buffer->map;
+      if (host_address_out)
+         *host_address_out = base;
+      if (size_out)
+         *size_out = buffer->size;
+      if (offset_out)
+         *offset_out = address - base;
+      return true;
+   }
+
+   return false;
 }
 
 void *

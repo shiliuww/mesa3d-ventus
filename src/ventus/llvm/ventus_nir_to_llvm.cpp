@@ -159,7 +159,7 @@ public:
          }
       }
 
-      if (!visitCFList(&impl->body))
+      if (!visitCFList(&impl->body) || translationFailed)
          return false;
       finishPhis();
 
@@ -655,7 +655,8 @@ private:
       };
 
       auto allocVar = [&](nir_variable *var) {
-         if (!var || variables.count(var))
+         if (!var || variables.count(var) ||
+             var->data.mode == nir_var_mem_push_const)
             return;
          AllocaInst *alloca =
             builder.CreateAlloca(ArrayType::get(i32, storageWords(var->type)), nullptr,
@@ -1079,6 +1080,120 @@ private:
       builder.CreateCall(fn, {imageBase, x, y, stride, packed});
    }
 
+   Value *floorToI32(Value *value)
+   {
+      Value *number = asFloat(value);
+      Value *truncated = builder.CreateFPToSI(number, i32);
+      Value *truncatedFloat = builder.CreateSIToFP(truncated, f32);
+      Value *needsAdjustment = builder.CreateFCmpOLT(number, truncatedFloat);
+      return builder.CreateSelect(
+         needsAdjustment,
+         builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
+   }
+
+   Value *wrapRepeatI32(Value *value, Value *extent)
+   {
+      Value *remainder = builder.CreateSRem(asInt32(value), asInt32(extent));
+      return builder.CreateSelect(
+         builder.CreateICmpSLT(remainder, ConstantInt::get(i32, 0)),
+         builder.CreateAdd(remainder, extent), remainder);
+   }
+
+   Value *sampleRgba8Channel(Value *base, Value *stride, Value *x, Value *y,
+                             unsigned channel)
+   {
+      Value *row = builder.CreateMul(y, stride);
+      Value *column = builder.CreateMul(x, ConstantInt::get(i32, 4));
+      Value *pixel = loadI32At(builder.CreateAdd(
+         base, builder.CreateAdd(row, column)));
+      Value *byte = builder.CreateAnd(
+         builder.CreateLShr(pixel, ConstantInt::get(i32, channel * 8)),
+         ConstantInt::get(i32, 0xff));
+      return builder.CreateFDiv(builder.CreateUIToFP(byte, f32),
+                                ConstantFP::get(f32, 255.0));
+   }
+
+   Value *lowerTex(nir_tex_instr *tex)
+   {
+      int coordIndex = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      int lodIndex = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_deref_instr *textureDeref =
+         nir_get_tex_deref(tex, nir_tex_src_texture_deref);
+      nir_variable *textureVar = textureDeref ?
+         nir_deref_instr_get_variable(textureDeref) : nullptr;
+
+      bool supported = tex->op == nir_texop_txl &&
+                       tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+                       tex->coord_components == 2 && !tex->is_array &&
+                       !tex->is_shadow && tex->dest_type == nir_type_float32 &&
+                       tex->def.num_components == 4 && coordIndex >= 0 &&
+                       lodIndex >= 0 &&
+                       nir_src_is_const(tex->src[lodIndex].src) &&
+                       nir_src_as_float(tex->src[lodIndex].src) == 0.0f &&
+                       textureVar && textureVar->data.descriptor_set == 0;
+      if (!supported) {
+         if (debugLowering)
+            fprintf(stderr,
+                    "ventus-nir-to-llvm: unsupported texture operation "
+                    "op=%u dim=%u components=%u\n",
+                    tex->op, tex->sampler_dim, tex->coord_components);
+         unsupportedDefs.insert(&tex->def);
+         translationFailed = true;
+         return undefFor(&tex->def);
+      }
+
+      Value *binding = ConstantInt::get(i32, textureVar->data.binding);
+      Value *base = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
+      Value *byteSize = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE);
+      Value *stride = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
+      Value *width = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_AUX);
+      Value *height = builder.CreateUDiv(byteSize, stride);
+
+      Value *coord = value(tex->src[coordIndex].src);
+      Value *u = asFloat(component(coord, 0));
+      Value *v = asFloat(component(coord, 1));
+      Value *uFloor = builder.CreateSIToFP(floorToI32(u), f32);
+      Value *vFloor = builder.CreateSIToFP(floorToI32(v), f32);
+      Value *uRepeat = builder.CreateFSub(u, uFloor);
+      Value *vRepeat = builder.CreateFSub(v, vFloor);
+
+      Value *xScaled = builder.CreateFSub(
+         builder.CreateFMul(uRepeat, builder.CreateUIToFP(width, f32)),
+         ConstantFP::get(f32, 0.5));
+      Value *yScaled = builder.CreateFSub(
+         builder.CreateFMul(vRepeat, builder.CreateUIToFP(height, f32)),
+         ConstantFP::get(f32, 0.5));
+      Value *xFloor = floorToI32(xScaled);
+      Value *yFloor = floorToI32(yScaled);
+      Value *xWeight = builder.CreateFSub(
+         xScaled, builder.CreateSIToFP(xFloor, f32));
+      Value *yWeight = builder.CreateFSub(
+         yScaled, builder.CreateSIToFP(yFloor, f32));
+      Value *x0 = wrapRepeatI32(xFloor, width);
+      Value *x1 = wrapRepeatI32(
+         builder.CreateAdd(xFloor, ConstantInt::get(i32, 1)), width);
+      Value *y0 = wrapRepeatI32(yFloor, height);
+      Value *y1 = wrapRepeatI32(
+         builder.CreateAdd(yFloor, ConstantInt::get(i32, 1)), height);
+
+      return floatResult(&tex->def, [&](unsigned channel) {
+         Value *c00 = sampleRgba8Channel(base, stride, x0, y0, channel);
+         Value *c10 = sampleRgba8Channel(base, stride, x1, y0, channel);
+         Value *c01 = sampleRgba8Channel(base, stride, x0, y1, channel);
+         Value *c11 = sampleRgba8Channel(base, stride, x1, y1, channel);
+         Value *top = builder.CreateFAdd(
+            c00, builder.CreateFMul(builder.CreateFSub(c10, c00), xWeight));
+         Value *bottom = builder.CreateFAdd(
+            c01, builder.CreateFMul(builder.CreateFSub(c11, c01), xWeight));
+         return builder.CreateFAdd(
+            top, builder.CreateFMul(builder.CreateFSub(bottom, top), yWeight));
+      });
+   }
+
    Value *lowerLoadConst(nir_load_const_instr *instr)
    {
       if (instr->def.num_components == 1)
@@ -1095,6 +1210,8 @@ private:
    {
       if (deref->deref_type == nir_deref_type_var && deref->var) {
          derefVars[&deref->def] = deref->var;
+         if (deref->var->data.mode == nir_var_mem_push_const)
+            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_ADDR);
          auto it = variables.find(deref->var);
          if (it != variables.end())
             return it->second;
@@ -1625,6 +1742,10 @@ private:
             def = &intrin->def;
          break;
       }
+      case nir_instr_type_tex:
+         result = lowerTex(nir_instr_as_tex(instr));
+         def = &nir_instr_as_tex(instr)->def;
+         break;
       case nir_instr_type_undef:
          result = zeroFor(&nir_instr_as_undef(instr)->def);
          def = &nir_instr_as_undef(instr)->def;

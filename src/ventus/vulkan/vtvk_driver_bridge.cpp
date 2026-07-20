@@ -41,6 +41,12 @@ static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_frame_stride) 
 static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_context_count) ==
               VT_NIR_RT_DISPATCH_ARG_CONTINUATION_CONTEXT_COUNT,
               "RT CPS context count argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constant_addr) ==
+              VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_ADDR,
+              "RT push-constant address argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constant_size) ==
+              VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_SIZE,
+              "RT push-constant size argument ABI mismatch");
 static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
               VT_NIR_RT_DISPATCH_ARG_SIZE,
               "RT dispatch argument ABI size mismatch");
@@ -521,7 +527,8 @@ vtvk_driver_upload_descriptor(
       break;
    }
 
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
       VkExtent3D extent = {};
       VkFormat format = VK_FORMAT_UNDEFINED;
       void *host = vtvk_image_host_ptr(src->image, &extent, &format);
@@ -529,8 +536,15 @@ vtvk_driver_upload_descriptor(
       uint32_t stride = extent.width * bpp;
       uint64_t size = (uint64_t)stride * extent.height *
                       (extent.depth ? extent.depth : 1);
+      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+          (format != VK_FORMAT_R8G8B8A8_UNORM || extent.depth > 1 ||
+           !vtvk_sampler_is_linear_repeat(src->sampler))) {
+         mesa_loge("ventus-vk: sampled image binding=%u requires 2D "
+                   "RGBA8 linear-repeat LOD0 state", src->binding);
+         return false;
+      }
       if (!host || !vtvk_driver_alloc_copy(api, host, size, &record->device_addr)) {
-         mesa_loge("ventus-vk: failed to upload storage image descriptor binding=%u",
+         mesa_loge("ventus-vk: failed to upload image descriptor binding=%u",
                    src->binding);
          return false;
       }
@@ -569,6 +583,84 @@ vtvk_driver_upload_descriptor(
                 record->stride, record->format, record->aux);
    }
 
+   return true;
+}
+
+static bool
+vtvk_driver_upload_push_constants(struct vtvk_driver_api *api,
+                                  const struct vtvk_driver_trace_rays_info *info,
+                                  struct vtvk_rt_dispatch_args *args)
+{
+   args->push_constant_addr = 0;
+   args->push_constant_size = 0;
+   if (!info->push_constant_size)
+      return true;
+   if (!info->push_constant_data ||
+       info->push_constant_size > VTVK_MAX_PUSH_CONSTANTS_SIZE) {
+      mesa_loge("ventus-vk: invalid RT push-constant byte image size=%u",
+                info->push_constant_size);
+      return false;
+   }
+
+   std::vector<uint8_t> relocated(info->push_constant_size);
+   memcpy(relocated.data(), info->push_constant_data, relocated.size());
+   std::unordered_map<uint64_t, struct vtvk_driver_upload> buffer_uploads;
+   uint32_t relocation_count = 0;
+
+   for (uint32_t byte = 0; byte + sizeof(uint64_t) <= relocated.size();
+        byte += sizeof(uint64_t)) {
+      uint64_t host_value = 0;
+      memcpy(&host_value, relocated.data() + byte, sizeof(host_value));
+
+      void *host_base = nullptr;
+      VkDeviceAddress host_address = 0;
+      VkDeviceSize buffer_size = 0;
+      VkDeviceSize buffer_offset = 0;
+      if (!vtvk_buffer_resolve_device_address(host_value, &host_base,
+                                              &host_address, &buffer_size,
+                                              &buffer_offset))
+         continue;
+
+      auto existing = buffer_uploads.find(host_address);
+      if (existing == buffer_uploads.end()) {
+         struct vtvk_driver_upload upload = {};
+         upload.size = buffer_size;
+         if (!vtvk_driver_alloc_copy(api, host_base, buffer_size,
+                                     &upload.dev_addr)) {
+            mesa_loge("ventus-vk: failed to upload push-constant buffer "
+                      "host=0x%" PRIx64 " size=%" PRIu64,
+                      (uint64_t)host_address, (uint64_t)buffer_size);
+            return false;
+         }
+         existing = buffer_uploads.emplace(host_address, upload).first;
+      }
+
+      uint64_t device_value = existing->second.dev_addr + buffer_offset;
+      memcpy(relocated.data() + byte, &device_value, sizeof(device_value));
+      relocation_count++;
+      if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG"))
+         mesa_logi("ventus-vk: relocated push[%u] host=0x%" PRIx64
+                   " dev=0x%" PRIx64 " buffer_size=%" PRIu64,
+                   byte, host_value, device_value, (uint64_t)buffer_size);
+   }
+
+   if (!vtvk_driver_alloc_copy(api, relocated.data(), relocated.size(),
+                               &args->push_constant_addr)) {
+      mesa_loge("ventus-vk: failed to upload RT push constants");
+      return false;
+   }
+   args->push_constant_size = relocated.size();
+   static bool logged;
+   if (!logged) {
+      logged = true;
+      mesa_logi("ventus-vk: uploaded RT push constants bytes=%u "
+                "relocated_buffer_addresses=%u stages=0x%x",
+                info->push_constant_size, relocation_count,
+                (unsigned)info->push_constant_stages);
+   }
+   if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG"))
+      vtvk_driver_log_u32_words("push_constants", relocated.data(),
+                                relocated.size(), 64);
    return true;
 }
 
@@ -696,6 +788,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                       &args.hit_sbt, "hit") ||
        !vtvk_driver_upload_sbt_region(&driver, info->callable_sbt,
                                       &args.callable_sbt, "callable"))
+      goto out;
+
+   if (!vtvk_driver_upload_push_constants(&driver, info, &args))
       goto out;
 
    args.tlas_addr = tlas_dev_addr;

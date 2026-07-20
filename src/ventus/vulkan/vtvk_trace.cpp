@@ -33,6 +33,10 @@ vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       desc.image = info.image;
       break;
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      desc.image = info.image;
+      desc.sampler = info.image_info.sampler;
+      break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
       desc.buffer = info.buffer.buffer;
@@ -82,6 +86,11 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    VkDeviceSize camera_range = 0;
    void *camera_data =
       vtvk_descriptor_set_buffer_ptr(descriptor_set, 2, &camera_range);
+   uint32_t push_constant_size = 0;
+   VkShaderStageFlags push_constant_stages = 0;
+   const void *push_constant_data =
+      vtvk_cmd_buffer_rt_push_constants(commandBuffer, &push_constant_size,
+                                        &push_constant_stages);
 
    std::vector<vtvk_rt_descriptor_source> descriptors;
    descriptors.reserve(5);
@@ -102,7 +111,7 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
       mesa_logi("ventus-vk: vkCmdTraceRaysKHR collected Spike dispatch state "
                 "%ux%ux%u tlas=0x%" PRIx64 " image=%ux%u format=%u "
                 "descriptors=%zu scratch=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
-                ",hit:0x%" PRIx64 "}",
+                ",hit:0x%" PRIx64 "} push=%u",
                 width, height, depth, (uint64_t)tlas->address,
                 image_extent.width, image_extent.height, image_format,
                 descriptors.size(), pipeline->per_lane_scratch_size,
@@ -111,7 +120,8 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                 pMissShaderBindingTable ?
                    (uint64_t)pMissShaderBindingTable->deviceAddress : 0,
                 pHitShaderBindingTable ?
-                   (uint64_t)pHitShaderBindingTable->deviceAddress : 0);
+                   (uint64_t)pHitShaderBindingTable->deviceAddress : 0,
+                push_constant_size);
    }
 
    struct vtvk_driver_trace_rays_info trace = {};
@@ -134,6 +144,9 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.kernel_entry = pipeline->generated_kernel_entry;
    trace.descriptors = descriptors.data();
    trace.descriptor_count = descriptors.size();
+   trace.push_constant_data = push_constant_data;
+   trace.push_constant_size = push_constant_size;
+   trace.push_constant_stages = push_constant_stages;
 
    vtvk_driver_trace_rays(&trace);
 }

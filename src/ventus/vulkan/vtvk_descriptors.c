@@ -121,6 +121,10 @@ vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       out->valid = out->image != VK_NULL_HANDLE;
       break;
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      out->valid = out->image != VK_NULL_HANDLE &&
+                   out->image_info.sampler != VK_NULL_HANDLE;
+      break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
       out->valid = out->buffer.buffer != VK_NULL_HANDLE &&
@@ -278,6 +282,7 @@ vtvk_UpdateDescriptorSets(VkDevice device,
          break;
       }
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
          if (write->pImageInfo)
             set->bindings[write->dstBinding].image = write->pImageInfo[0];
          break;
