@@ -389,6 +389,24 @@ vtvk_write_triangle_leaf(uint8_t *dst, uint32_t offset, const float v0[3],
 }
 
 static void
+vtvk_write_aabb_leaf(uint8_t *dst, uint32_t offset,
+                     const struct vtvk_aabb *bounds, uint32_t primitive_id,
+                     uint32_t geometry_id, uint32_t sbt_record_offset,
+                     uint32_t flags, uint64_t primitive_addr)
+{
+   uint8_t *node = dst + offset;
+   memset(node, 0, VENTUS_AS_AABB_NODE_SIZE);
+   memcpy(node + VENTUS_AABB_MIN, bounds->min, sizeof(bounds->min));
+   memcpy(node + VENTUS_AABB_MAX, bounds->max, sizeof(bounds->max));
+   vtvk_store_u32(node, VENTUS_AABB_PRIMITIVE_ID, primitive_id);
+   vtvk_store_u32(node, VENTUS_AABB_GEOMETRY_ID, geometry_id);
+   vtvk_store_u32(node, VENTUS_AABB_SBT_RECORD_OFFSET, sbt_record_offset);
+   vtvk_store_u32(node, VENTUS_AABB_HIT_KIND, 0xff);
+   vtvk_store_u32(node, VENTUS_AABB_FLAGS, flags);
+   vtvk_store_u64(node, VENTUS_AABB_PRIMITIVE_ADDR_LO, primitive_addr);
+}
+
+static void
 vtvk_write_instance_leaf(uint8_t *dst, uint32_t offset,
                          const VkAccelerationStructureInstanceKHR *instance,
                          uint32_t instance_id)
@@ -419,6 +437,91 @@ vtvk_write_instance_leaf(uint8_t *dst, uint32_t offset,
 }
 
 static VkResult
+vtvk_build_aabb_blas(struct vtvk_device *device,
+                     struct vtvk_acceleration_structure *as,
+                     const VkAccelerationStructureGeometryKHR *geom,
+                     const VkAccelerationStructureBuildRangeInfoKHR *range)
+{
+   const VkAccelerationStructureGeometryAabbsDataKHR *aabbs =
+      &geom->geometry.aabbs;
+   const uint32_t primitive_count = range ? range->primitiveCount : 0;
+   if (!primitive_count || aabbs->stride < sizeof(VkAabbPositionsKHR))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   VkDeviceAddress primitive_addr = aabbs->data.deviceAddress;
+   if (range) {
+      if (UINT64_MAX - primitive_addr < range->primitiveOffset)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      primitive_addr += range->primitiveOffset;
+   }
+
+   const uint64_t last_offset =
+      uint64_t(primitive_count - 1) * uint64_t(aabbs->stride);
+   if (last_offset > SIZE_MAX - sizeof(VkAabbPositionsKHR))
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   const size_t source_size =
+      size_t(last_offset) + sizeof(VkAabbPositionsKHR);
+   const uint8_t *source = (const uint8_t *)vtvk_buffer_host_ptr_from_addr(
+      primitive_addr, source_size);
+   if (!source || !as->data)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   uint8_t *dst = (uint8_t *)as->data;
+   memset(dst, 0, as->size);
+   uint32_t cursor = VENTUS_AS_HEADER_SIZE;
+   uint32_t node_count = 0;
+   std::vector<struct vtvk_build_node> leaves;
+   leaves.reserve(primitive_count);
+
+   for (uint32_t p = 0; p < primitive_count; p++) {
+      VkAabbPositionsKHR positions;
+      memcpy(&positions, source + uint64_t(p) * aabbs->stride,
+             sizeof(positions));
+
+      struct vtvk_aabb bounds = {
+         { positions.minX, positions.minY, positions.minZ },
+         { positions.maxX, positions.maxY, positions.maxZ },
+      };
+      for (uint32_t axis = 0; axis < 3; axis++) {
+         if (!std::isfinite(bounds.min[axis]) ||
+             !std::isfinite(bounds.max[axis]) ||
+             bounds.min[axis] > bounds.max[axis])
+            return vk_error(device, VK_ERROR_UNKNOWN);
+      }
+
+      if (cursor > as->size ||
+          VENTUS_AS_AABB_NODE_SIZE > as->size - cursor)
+         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      const uint32_t offset =
+         vtvk_next_node_offset(&cursor, VENTUS_AS_AABB_NODE_SIZE);
+      vtvk_write_aabb_leaf(
+         dst, offset, &bounds, p, 0, 0,
+         geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
+         primitive_addr + uint64_t(p) * aabbs->stride);
+      node_count++;
+      leaves.push_back({
+         ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_AABB),
+         bounds,
+      });
+   }
+
+   struct vtvk_build_node root =
+      vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+   if (cursor > as->size)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
+                     cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
+                     &root.bounds);
+   if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
+      mesa_logi("ventus-vk: AABB BLAS primitive_count=%u node_count=%u root=0x%x",
+                primitive_count, node_count, root.ref);
+      vtvk_log_aabb("AABB BLAS root", &root.bounds);
+   }
+   as->address = (VkDeviceAddress)(uintptr_t)as->data;
+   return VK_SUCCESS;
+}
+
+static VkResult
 vtvk_build_blas(struct vtvk_device *device,
                 struct vtvk_acceleration_structure *as,
                 const VkAccelerationStructureBuildGeometryInfoKHR *info,
@@ -428,6 +531,8 @@ vtvk_build_blas(struct vtvk_device *device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    const VkAccelerationStructureGeometryKHR *geom = vtvk_build_geometry(info, 0);
+   if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR)
+      return vtvk_build_aabb_blas(device, as, geom, range);
    if (geom->geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
@@ -744,9 +849,16 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
    if (pMaxPrimitiveCounts && pBuildInfo && pBuildInfo->geometryCount)
       primitive_count = pMaxPrimitiveCounts[0] ? pMaxPrimitiveCounts[0] : 1;
 
-   uint64_t leaf_size =
-      pBuildInfo && pBuildInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-         ? VENTUS_AS_INSTANCE_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE;
+   uint64_t leaf_size = VENTUS_AS_TRIANGLE_NODE_SIZE;
+   if (pBuildInfo &&
+       pBuildInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+      leaf_size = VENTUS_AS_INSTANCE_NODE_SIZE;
+   } else if (pBuildInfo && pBuildInfo->geometryCount) {
+      const VkAccelerationStructureGeometryKHR *geom =
+         vtvk_build_geometry(pBuildInfo, 0);
+      if (geom && geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR)
+         leaf_size = VENTUS_AS_AABB_NODE_SIZE;
+   }
    uint64_t internal_count = vtvk_internal_box_count(primitive_count);
    uint64_t internal_bytes = internal_count * VENTUS_AS_BOX4_NODE_SIZE;
    uint64_t primitive_bytes = primitive_count * leaf_size;
