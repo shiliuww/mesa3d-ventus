@@ -1745,7 +1745,12 @@ private:
          return true;
 
       Function *fn = builder.GetInsertBlock()->getParent();
-      BasicBlock *after = BasicBlock::Create(context, "nir.loop.end", fn);
+      BasicBlock *after = nullptr;
+      nir_cf_node *next = nir_cf_node_next(&loop->cf_node);
+      if (next && next->type == nir_cf_node_block)
+         after = blocks[nir_cf_node_as_block(next)];
+      if (!after)
+         after = BasicBlock::Create(context, "nir.loop.end", fn);
       branchTo(header);
 
       breakTargets.push_back(after);

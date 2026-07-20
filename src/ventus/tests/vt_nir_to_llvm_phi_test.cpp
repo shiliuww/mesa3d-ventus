@@ -15,6 +15,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 
 #define VT_RT_CHECK(condition)                                                \
    do {                                                                      \
@@ -45,6 +46,40 @@ build_float_phi_shader(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static nir_shader *
+build_loop_exit_phi_shader(const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_RAYGEN, options,
+                                                   "vt_loop_exit_phi");
+   nir_variable *color =
+      nir_local_variable_create(b.impl, glsl_vec_type(3), "color");
+   nir_def *launch_id = nir_load_ray_launch_id(&b);
+
+   nir_loop *loop = nir_push_loop(&b);
+   nir_if *nif =
+      nir_push_if(&b, nir_ieq_imm(&b, nir_channel(&b, launch_id, 0), 0));
+   nir_store_var(&b, color,
+                 nir_vec3(&b, nir_imm_float(&b, 1.0f),
+                          nir_imm_float(&b, 0.5f),
+                          nir_imm_float(&b, 0.25f)),
+                 0x7);
+   nir_jump(&b, nir_jump_break);
+   nir_push_else(&b, nif);
+   nir_store_var(&b, color,
+                 nir_vec3(&b, nir_imm_float(&b, 0.25f),
+                          nir_imm_float(&b, 0.5f),
+                          nir_imm_float(&b, 1.0f)),
+                 0x7);
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, nif);
+   nir_pop_loop(&b, loop);
+
+   nir_def *merged = nir_load_var(&b, color);
+   nir_ventus_rt_store_slot(&b, merged, nir_imm_int(&b, 0));
+   nir_lower_vars_to_ssa(b.shader);
+   return b.shader;
+}
+
 int
 main()
 {
@@ -62,6 +97,7 @@ main()
    llvm::Module *module =
       vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
    VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
 
    bool found_phi = false;
    bool found_float_bits = false;
@@ -86,6 +122,31 @@ main()
 
    VT_RT_CHECK(found_phi);
    VT_RT_CHECK(found_float_bits);
+
+   delete module;
+   ralloc_free(shader);
+
+   shader = build_loop_exit_phi_shader(&nir_options);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
+
+   bool found_loop_exit_phi = false;
+   for (llvm::Function &function : *module) {
+      for (llvm::BasicBlock &block : function) {
+         for (llvm::Instruction &instruction : block) {
+            auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction);
+            if (!phi || !phi->getType()->isStructTy())
+               continue;
+            found_loop_exit_phi = true;
+            VT_RT_CHECK(phi->getNumIncomingValues() == 2);
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+               VT_RT_CHECK(phi->getIncomingBlock(i) != nullptr);
+         }
+      }
+   }
+   VT_RT_CHECK(found_loop_exit_phi);
 
    delete module;
    ralloc_free(shader);
