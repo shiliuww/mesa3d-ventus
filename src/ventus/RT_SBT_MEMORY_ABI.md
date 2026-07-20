@@ -37,6 +37,9 @@ addresses, not host `VkDeviceAddress` handles.
 | 152 | `uint64_t descriptor_table_addr` |
 | 160 | `uint32_t descriptor_count` |
 | 164 | `uint32_t descriptor_record_stride` |
+| 168 | `uint64_t continuation_arena_addr` |
+| 176 | `uint32_t continuation_frame_stride` |
+| 180 | `uint32_t continuation_context_count` |
 
 The legacy `tlas_addr`, `image_addr`, and `camera_addr` fields are retained for
 older probes. RT shader descriptor accesses use `descriptor_table_addr`.
@@ -73,40 +76,50 @@ records only after uploading the referenced resource to the selected backend.
 Descriptor arrays, dynamic offsets, sampled images, and texel buffers are not
 part of this ABI revision.
 
-## Per-Lane Scratch
+The continuation fields reserve a compiler/runtime CPS arena carrier. They do
+not carry RTCore traversal stacks. A zero `continuation_frame_stride` disables
+the arena and requires the address to remain zero.
 
-The current per-lane scratch stride is 5104 bytes. The first 4096 bytes are
-reserved for compiler-lowered private/local storage; the hardware-visible RT
-ABI region occupies the following 1008 bytes. Offsets in the second column are
-relative to the RT ABI base (`VT_RT_ABI_PDS_BASE_BYTES`):
+## Per-Lane Scratch ABI V2
+
+The current per-lane scratch stride is 4480 bytes. The first 4096 bytes are
+reserved for compiler-lowered private/local storage; the shader/RTCore-visible
+RT ABI region occupies the following 384 bytes. Offsets in the second column
+are relative to the RT ABI base (`VT_RT_ABI_PDS_BASE_BYTES`):
 
 | Per-Lane Offset | RT Region Offset | Region |
 | ---: | ---: | --- |
 | 0..4095 | n/a | compiler private/local reservation |
 | 4096..4187 | 0..91 | `ray_state`, 23 words |
 | 4188..4191 | 92..95 | alignment gap |
-| 4192..4215 | 96..119 | `control`, 6 words |
-| 4216..4223 | 120..127 | alignment gap |
-| 4224..4295 | 128..199 | candidate hit record, 18 words |
-| 4296..4303 | 200..207 | candidate hit record extension gap |
-| 4304..4375 | 208..279 | committed hit record, 18 words |
-| 4376..4383 | 280..287 | committed hit record extension gap |
-| 4384..4415 | 288..319 | hit attributes |
-| 4416..4463 | 320..367 | default payload region |
-| 4464..4479 | 368..383 | continuation header |
-| 4480..4575 | 384..479 | continuation contexts, 2 x 48 bytes |
-| 4576..5087 | 480..991 | continuation stack, 32 x 16-byte entries |
-| 5088..5103 | 992..1007 | continuation alignment/reserved |
+| 4192..4207 | 96..111 | compiler CPS header, 4 words |
+| 4208..4231 | 112..135 | `control`, 6 words |
+| 4232..4239 | 136..143 | alignment gap |
+| 4240..4311 | 144..215 | candidate hit record, 18 words |
+| 4312..4319 | 216..223 | candidate hit record extension gap |
+| 4320..4391 | 224..295 | committed hit record, 18 words |
+| 4392..4399 | 296..303 | committed hit record extension gap |
+| 4400..4431 | 304..335 | hit attributes |
+| 4432..4479 | 336..383 | default payload region |
 
 Hit record word 18 lives in each hit-record extension gap and stores
 `instance_sbt_record_offset`. Existing 18-word fields are not moved.
 
-Continuation state is fixed per lane for hardware compatibility. Header word 0
-stores active/overflow/done flags, word 1 stores stack count, word 2 stores the
-current context id, and word 3 is used by linear fallback traversal as a resume
-index. Each context stores AS base, object ray origin/direction, instance id,
-instance SBT offset, and instance address. Each stack entry stores node ref,
-AS base, and context id.
+The four CPS header words are `frame_base`, `active_level`, `fragment_id`, and
+`flags`. They reserve the per-lane link from generated shader code to a future
+compiler-managed continuation frame. The current compiler does not produce a
+nonzero `continuation_frame_size`, so the driver leaves this header and the
+dispatch CPS arena address zero in the verified compatibility path.
+
+RT traversal cursor, frontier, and stack state are deliberately absent from
+V2 scratch. The Spike functional RTCore model owns that state privately while a
+ray is paused for an any-hit or intersection callback. Shader-visible
+candidate/committed records and control words remain in this ABI.
+
+`VT_RT_ABI_VERSION` is currently a build-time constant, not a runtime version
+field. Mesa, generated kernels, and Spike therefore have to be updated as one
+compatibility profile; mixed V1/V2 binaries are not negotiated or rejected by
+a runtime version check yet.
 
 ## SBT Record Pointer Rules
 

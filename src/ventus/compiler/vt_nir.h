@@ -54,8 +54,6 @@ struct vt_nir_scratchpad_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   uint32_t continuation_base_bytes;
-   uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -72,8 +70,6 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   uint32_t continuation_base_bytes;
-   uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -300,7 +296,11 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR = 152,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_COUNT = 160,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE = 164,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 168,
+   /* Compiler/runtime CPS spill arena. Zero stride means it is inactive. */
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_ARENA_ADDR = 168,
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_FRAME_STRIDE = 176,
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_CONTEXT_COUNT = 180,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 184,
 };
 
 enum vt_nir_rt_descriptor_record {

@@ -89,22 +89,38 @@ Relevant runtime controls include:
 
 ## Build and Focused Tests
 
-Configure Mesa with the Ventus Vulkan driver enabled:
+The repository-level build script carries the exact options needed by this
+path. From the `ventus-env` root, build all runtime pieces and the pinned
+workload with:
 
 ```sh
-meson setup build-ventus -Dvulkan-drivers=ventus
-ninja -C build-ventus
+git submodule update --init
+bash build-ventus.sh --build "rt-toolchain;spike;driver-spike;mesa;rt-workload"
 ```
+
+`rt-toolchain` installs the Ventus `llc`, `ld.lld`, `llvm-nm`, and `crt0.o`
+needed for runtime ELF generation. It deliberately does not build the
+aggregate OpenCL libclc object, which is outside the Vulkan RT path. Its
+standalone riscv32 libclc build uses `llvm/build-rt-libclc/`, separate from the
+general OpenCL build directory. The superproject's
+`docs/rtcore-spike-p1.md` records the complete review and reproduction flow.
 
 Focused compiler tests are registered in the `ventus` Meson suite, including
 `vt_rt_minimal_loop`, `vt_rt_image_smoke`, and
 `vt_rt_flagged_image_smoke`. The image smokes validate compiler-side lowering;
 they must not be cited as evidence that Spike rendered a full Vulkan sample.
 
-The full-app runner and canonical workload are not yet packaged in this
-checkout. Until they are committed, reproducing the full-app result requires a
-separately built matching Ventus driver/LLVM/Spike and the
-`raytracingshadows` workload.
+Run the full application and compare its PPM byte-for-byte with the frozen P1
+baseline using:
+
+```sh
+tools/rtcore/verify_compat_p1_image.sh
+```
+
+The runner resolves Mesa, LLVM, driver, Spike, workload and scene paths below
+the current superproject root and fails if the driver links to a different
+Spike library. Workload source pins and overlay provenance live under
+`workloads/rt/`.
 
 ## Current Limits
 

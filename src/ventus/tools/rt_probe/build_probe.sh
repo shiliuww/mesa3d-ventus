@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${1:-/tmp/ventus_rt_probe_write_pixel.riscv}
 OBJ="${OUT}.o"
-LLVM_LLC=${LLVM_LLC:-/home/guanys/ventus-env/llvm/build/bin/llc}
+LLVM_LLC=${LLVM_LLC:-llc}
 
 "${LLVM_LLC}" \
    -mtriple=riscv32 \

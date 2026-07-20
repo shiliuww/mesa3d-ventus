@@ -39,6 +39,7 @@ struct vtvk_pipeline {
    uint32_t group_count;
 
    uint32_t per_lane_scratch_size;
+   uint32_t continuation_frame_size;
    struct vt_nir_pipeline_scratch_info scratch_info;
 
    llvm::Module *llvm_module;

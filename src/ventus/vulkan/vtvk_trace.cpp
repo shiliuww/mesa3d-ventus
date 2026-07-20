@@ -129,6 +129,7 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.height = height;
    trace.depth = depth;
    trace.per_lane_scratch_size = pipeline->per_lane_scratch_size;
+   trace.continuation_frame_size = pipeline->continuation_frame_size;
    trace.kernel_path = pipeline->generated_kernel_path;
    trace.kernel_entry = pipeline->generated_kernel_entry;
    trace.descriptors = descriptors.data();

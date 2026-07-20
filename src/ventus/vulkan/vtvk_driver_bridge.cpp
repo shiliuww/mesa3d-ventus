@@ -29,6 +29,18 @@ static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
 static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
               VT_NIR_RT_DESCRIPTOR_RECORD_SIZE,
               "RT descriptor ABI size mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_arena_addr) ==
+              VT_NIR_RT_DISPATCH_ARG_CONTINUATION_ARENA_ADDR,
+              "RT CPS arena argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_frame_stride) ==
+              VT_NIR_RT_DISPATCH_ARG_CONTINUATION_FRAME_STRIDE,
+              "RT CPS frame stride argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_context_count) ==
+              VT_NIR_RT_DISPATCH_ARG_CONTINUATION_CONTEXT_COUNT,
+              "RT CPS context count argument ABI mismatch");
+static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
+              VT_NIR_RT_DISPATCH_ARG_SIZE,
+              "RT dispatch argument ABI size mismatch");
 
 struct vtvk_driver_kernel_metadata {
    uint64_t kernel_id;
@@ -174,13 +186,13 @@ vtvk_bridge_backend_library(void)
       backend = "spike";
 
    if (strcmp(backend, "rtlsim") == 0)
-      return "/home/guanys/ventus-env/driver/build/driver/rtlsim_device/librtlsim_driver.so";
+      return "librtlsim_driver.so";
    if (strcmp(backend, "cyclesim") == 0)
-      return "/home/guanys/ventus-env/driver/build/driver/cyclesim_device/libcyclesim_driver.so";
+      return "libcyclesim_driver.so";
    if (strcmp(backend, "auto") == 0)
-      return "/home/guanys/ventus-env/driver/build/driver/auto_select/libauto_select_driver.so";
+      return "libauto_select_driver.so";
 
-   return "/home/guanys/ventus-env/driver/build/driver/spike_device/libspike_driver.so";
+   return "libspike_driver.so";
 }
 
 static bool
@@ -201,9 +213,6 @@ vtvk_driver_open(struct vtvk_driver_api *api)
 
    const char *path = vtvk_bridge_backend_library();
    api->lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-   if (!api->lib && !getenv("VENTUS_VK_DRIVER_LIB"))
-      api->lib = dlopen("/home/guanys/ventus-env/install/lib/libspike_driver.so",
-                        RTLD_NOW | RTLD_LOCAL);
    if (!api->lib) {
       mesa_loge("ventus-vk: driver bridge dlopen failed: %s", dlerror());
       return false;
@@ -592,6 +601,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t args_dev_addr = 0;
    uint64_t metadata_dev_addr = 0;
    uint64_t pds_dev_addr = 0;
+   uint64_t continuation_dev_addr = 0;
    uint32_t image_width = info->image_extent.width ? info->image_extent.width : info->width;
    uint32_t image_height = info->image_extent.height ? info->image_extent.height : info->height;
    uint32_t image_depth = info->image_extent.depth ? info->image_extent.depth : 1;
@@ -600,6 +610,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       (uint64_t)image_width * image_height * image_depth * image_bpp;
    struct vtvk_rt_dispatch_args args = {};
    std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
+   std::vector<uint8_t> pds_image;
    uint32_t metadata[VTVK_KNL_MAX_METADATA_SIZE / 4] = {};
    uint64_t raygen_wg_x = DIV_ROUND_UP(info->width, 32);
    uint64_t raygen_wg_y = MAX2(info->height, 1u);
@@ -611,6 +622,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                     pds_resident_lanes,
                                  (uint64_t)64 * 1024),
                             4096);
+   uint64_t continuation_size =
+      (uint64_t)info->continuation_frame_size * pds_resident_lanes;
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
@@ -692,6 +705,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
    args.scratch_stride = info->per_lane_scratch_size;
+   args.continuation_frame_stride = info->continuation_frame_size;
+   args.continuation_context_count = pds_resident_lanes;
    args.descriptor_table_addr = descriptor_table_dev_addr;
    args.descriptor_count = descriptor_table.size();
    args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
@@ -722,8 +737,39 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       goto out;
    }
 
-   if (driver.vt_buf_alloc(driver.device, pds_size, &pds_dev_addr, 0, 0, 0) != 0) {
+   if (continuation_size &&
+       !vtvk_driver_alloc_copy(&driver, NULL, continuation_size,
+                               &continuation_dev_addr)) {
+      mesa_loge("ventus-vk: driver bridge failed to allocate CPS arena");
+      goto out;
+   }
+   args.continuation_arena_addr = continuation_dev_addr;
+
+   pds_image.assign(pds_size, 0);
+   if (continuation_dev_addr) {
+      const uint64_t header_offset = VT_RT_ABI_PDS_BASE_BYTES +
+         VT_RT_ABI_CPS_HEADER_BASE_BYTES +
+         VT_RT_CPS_FRAME_BASE * VT_RT_ABI_WORD_BYTES;
+      const uint64_t aligned = header_offset & ~3ull;
+      for (uint64_t context = 0; context < pds_resident_lanes; context++) {
+         const uint64_t byte_offset = aligned * pds_resident_lanes + context * 4;
+         if (byte_offset + 4 > pds_image.size()) {
+            mesa_loge("ventus-vk: CPS frame pointer exceeds PDS allocation");
+            goto out;
+         }
+         const uint32_t frame_base = (uint32_t)(continuation_dev_addr +
+            context * info->continuation_frame_size);
+         memcpy(pds_image.data() + byte_offset, &frame_base, sizeof(frame_base));
+      }
+   }
+   if (!vtvk_driver_alloc_copy(&driver, pds_image.data(), pds_image.size(),
+                               &pds_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate PDS");
+      goto out;
+   }
+   if (driver.vt_copy_to_dev(driver.device, args_dev_addr, &args, sizeof(args),
+                             0, 0) != 0) {
+      mesa_loge("ventus-vk: driver bridge failed to update dispatch args");
       goto out;
    }
 

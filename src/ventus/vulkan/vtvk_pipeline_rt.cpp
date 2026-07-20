@@ -342,7 +342,7 @@ vtvk_llvm_tool_env_prefix(void)
 {
    const char *lib_dir = getenv("VENTUS_VK_LLVM_TOOL_LIB_DIR");
    if (!lib_dir || !lib_dir[0])
-      lib_dir = "/home/guanys/ventus-env/llvm/build/lib";
+      return "";
    return "LD_LIBRARY_PATH=" + vtvk_shell_quote(lib_dir) +
           ":${LD_LIBRARY_PATH:-} ";
 }
@@ -399,13 +399,9 @@ vtvk_find_crt0(std::string *path)
       return false;
    }
 
-   static const char *candidates[] = {
-      "/home/guanys/ventus-env/llvm/install/lib/crt0.o",
-      "/home/guanys/ventus-env/llvm/build-libclc/lib/crt0.o",
-      "/home/guanys/ventus-env/llvm/build-libclc/riscv32/lib/CMakeFiles/ctr0_obj.dir/crt0.S.o",
-   };
-
-   for (const char *candidate : candidates) {
+   const char *install_prefix = getenv("VENTUS_INSTALL_PREFIX");
+   if (install_prefix && install_prefix[0]) {
+      std::string candidate = std::string(install_prefix) + "/lib/crt0.o";
       if (llvm::sys::fs::exists(candidate)) {
          *path = candidate;
          return true;
@@ -447,7 +443,7 @@ vtvk_llvm_nm_path(void)
 {
    const char *llvm_nm = getenv("VENTUS_VK_LLVM_NM");
    if (!llvm_nm || !llvm_nm[0])
-      llvm_nm = "/home/guanys/ventus-env/llvm/build/bin/llvm-nm";
+      llvm_nm = "llvm-nm";
    return llvm_nm;
 }
 
@@ -513,9 +509,9 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
    const char *llc = getenv("VENTUS_VK_LLC");
    const char *ld_lld = getenv("VENTUS_VK_LD_LLD");
    if (!llc || !llc[0])
-      llc = "/home/guanys/ventus-env/llvm/build/bin/llc";
+      llc = "llc";
    if (!ld_lld || !ld_lld[0])
-      ld_lld = "/home/guanys/ventus-env/llvm/build/bin/ld.lld";
+      ld_lld = "ld.lld";
 
    if (!vtvk_write_rt_linker_script(ld_path))
       return;

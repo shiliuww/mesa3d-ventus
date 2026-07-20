@@ -52,7 +52,11 @@ VkDeviceAddress
 vtvk_buffer_get_device_address(VkBuffer _buffer)
 {
    struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)_buffer);
-   return buffer ? (VkDeviceAddress)(uintptr_t)buffer : 0;
+   /* Device addresses name bound backing storage, not the adjacent Vulkan
+    * wrapper objects.  Using a wrapper address with buffer->size creates
+    * overlapping fake ranges and can resolve an address to the wrong buffer.
+    */
+   return buffer && buffer->map ? (VkDeviceAddress)(uintptr_t)buffer->map : 0;
 }
 
 void *
@@ -71,7 +75,10 @@ vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
 {
    for (struct vtvk_buffer *buffer = vtvk_buffer_list; buffer;
         buffer = buffer->next) {
-      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer;
+      if (!buffer->map)
+         continue;
+
+      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
       if (address < base)
          continue;
 

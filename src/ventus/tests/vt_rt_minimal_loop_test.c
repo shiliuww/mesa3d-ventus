@@ -168,8 +168,11 @@ main(int argc, char **argv)
       build_payload_location_probe(&options);
 
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(abi.control_base_bytes >=
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES >=
                abi.ray_state_base_bytes + abi.ray_state_size_bytes);
+   VT_RT_CHECK(abi.control_base_bytes >=
+               VT_RT_ABI_CPS_HEADER_BASE_BYTES +
+               VT_RT_ABI_CPS_HEADER_SIZE_BYTES);
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes >=
                abi.control_base_bytes + abi.control_size_bytes);
    VT_RT_CHECK(abi.hit_record_base_bytes >=
@@ -180,22 +183,23 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.payload_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
    VT_RT_CHECK(abi.payload_size_bytes == 48);
-   VT_RT_CHECK(abi.continuation_base_bytes >=
-               abi.payload_base_bytes + abi.payload_size_bytes);
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES ==
+               VT_RT_CPS_HEADER_WORD_COUNT * 4);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
-   VT_RT_CHECK(abi.continuation_size_bytes == 640);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(abi.control_base_bytes == 96);
-   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 128);
-   VT_RT_CHECK(abi.hit_record_base_bytes == 208);
-   VT_RT_CHECK(abi.hit_attrib_base_bytes == 288);
-   VT_RT_CHECK(abi.payload_base_bytes == 320);
-   VT_RT_CHECK(abi.continuation_base_bytes == 368);
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
+   VT_RT_CHECK(abi.control_base_bytes == 112);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 224);
+   VT_RT_CHECK(abi.hit_attrib_base_bytes == 304);
+   VT_RT_CHECK(abi.payload_base_bytes == 336);
+   VT_RT_CHECK(abi.payload_base_bytes + abi.payload_size_bytes ==
+               VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(abi.total_size_bytes ==
                VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
