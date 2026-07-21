@@ -33,7 +33,7 @@ addresses, not host `VkDeviceAddress` handles.
 | 136 | `uint32_t image_stride` |
 | 140 | `uint32_t camera_size` |
 | 144 | `uint32_t scratch_stride` |
-| 148 | `uint32_t reserved` |
+| 148 | `uint32_t abi_tag` |
 | 152 | `uint64_t descriptor_table_addr` |
 | 160 | `uint32_t descriptor_count` |
 | 164 | `uint32_t descriptor_record_stride` |
@@ -90,8 +90,8 @@ are relative to the RT ABI base (`VT_RT_ABI_PDS_BASE_BYTES`):
 | Per-Lane Offset | RT Region Offset | Region |
 | ---: | ---: | --- |
 | 0..4095 | n/a | compiler private/local reservation |
-| 4096..4187 | 0..91 | `ray_state`, 23 words |
-| 4188..4191 | 92..95 | alignment gap |
+| 4096..4187 | 0..91 | `ray_state` legacy fields, 23 words |
+| 4188..4191 | 92..95 | V2 execution ABI tag, 1 word |
 | 4192..4207 | 96..111 | compiler CPS header, 4 words |
 | 4208..4231 | 112..135 | `control`, 6 words |
 | 4232..4239 | 136..143 | alignment gap |
@@ -116,10 +116,13 @@ V2 scratch. The Spike functional RTCore model owns that state privately while a
 ray is paused for an any-hit or intersection callback. Shader-visible
 candidate/committed records and control words remain in this ABI.
 
-`VT_RT_ABI_VERSION` is currently a build-time constant, not a runtime version
-field. Mesa, generated kernels, and Spike therefore have to be updated as one
-compatibility profile; mixed V1/V2 binaries are not negotiated or rejected by
-a runtime version check yet.
+`VT_RT_ABI_VERSION` remains the source-level layout version. V2 also derives
+the execution tag `VT_RT_ABI_TAG == 0x56540002`: the runtime publishes it in
+dispatch args, generated code copies it to ray-state word 23 before traverse,
+and Spike validates every active lane before changing any public or private RT
+state. A missing or mismatched V2 tag therefore fails closed in the current
+execution chain. The tag is not yet packaged as an ELF metadata identity, so
+it must not be interpreted as a general binary negotiation mechanism.
 
 ## SBT Record Pointer Rules
 

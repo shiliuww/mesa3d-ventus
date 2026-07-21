@@ -2,8 +2,9 @@
 
 `src/ventus/` contains the Mesa-side Ventus Vulkan UMD and RT compiler path.
 It is no longer a future directory skeleton: the matched Mesa, LLVM, driver,
-and Spike revisions can run the SaschaWillems `raytracingshadows` application,
-emit a Ventus RISC-V ELF, execute it on Ventus Spike, and read back a PPM image.
+and Spike revisions can run five maintained Vulkan RT feature slices, emit a
+Ventus RISC-V ELF, execute it on Ventus Spike, and read back exact-gated PPM
+images.
 
 ## Current Pipeline
 
@@ -51,12 +52,22 @@ vkCreateRayTracingPipelinesKHR
   -> one pipeline-owned RISC-V ELF
 ```
 
-The backend emits the current hard-operation roles:
+The common architecture names the hard-operation roles:
 
 ```text
 RT_TRAVERSE(result_out, handoff_addr)
 RT_RELEASE(handoff_addr)
 ```
+
+The current scratch-V2 compatibility encoding is still:
+
+```text
+vt.rt.traverse vd:vreg32, vs2:vreg32_slot
+vt.rt.release             vs2:vreg32_slot
+```
+
+The 32-bit slot is an implementation carrier, not a frozen Ventus V0.2
+handoff-address layout.
 
 Ray, AS, SBT, payload, hit and launch data remain in the shader-visible data
 plane. They are not extra hard-operation operands.
@@ -74,6 +85,15 @@ The verified `raytracingshadows` path currently performs all of the following:
   `vtvk_driver_bridge`;
 - launches the raygen kernel on the Ventus Spike backend;
 - copies the storage image back and optionally writes P6 PPM.
+
+Additional exact-image gates cover:
+
+| Workload | Added implementation evidence |
+| --- | --- |
+| `raytracingintersection` | procedural AABB BLAS, intersection shader and reported hit |
+| `raytracingsbtdata` | raygen/miss/hit SBT record data |
+| `raytracingreflections` | structured payload and sequential traces in a raygen loop |
+| `raytracingtextures` | push constants, BDA relocation, sampled texture and any-hit ignore |
 
 Relevant runtime controls include:
 
@@ -110,11 +130,20 @@ Focused compiler tests are registered in the `ventus` Meson suite, including
 `vt_rt_flagged_image_smoke`. The image smokes validate compiler-side lowering;
 they must not be cited as evidence that Spike rendered a full Vulkan sample.
 
-Run the full application and compare its PPM byte-for-byte with the frozen P1
-baseline using:
+Run the primary shadow application and compare its PPM byte-for-byte with the
+frozen P1 baseline using:
 
 ```sh
 tools/rtcore/verify_compat_p1_image.sh
+```
+
+Run the remaining maintained feature gates using:
+
+```sh
+tools/rtcore/verify_procedural_aabb_image.sh
+tools/rtcore/verify_sbt_record_data_image.sh
+tools/rtcore/verify_iterative_reflections_image.sh
+tools/rtcore/verify_textured_any_hit_image.sh
 ```
 
 The runner resolves Mesa, LLVM, driver, Spike, workload and scene paths below
@@ -124,12 +153,15 @@ Spike library. Workload source pins and overlay provenance live under
 
 ## Current Limits
 
-The existing image is a functional vertical slice, not a Vulkan RT conformance
-claim:
+The maintained images are bounded functional vertical slices, not a Vulkan RT
+conformance claim:
 
-- the maintained full-app evidence currently covers one triangle/instance
-  scene and raygen/miss/closest-hit shader set;
-- AABB/procedural geometry is not wired through the verified image path;
+- exact-image evidence covers triangle/TLAS/BLAS, raygen/miss/closest-hit,
+  derived shadow, procedural AABB/intersection, SBT record data, sequential
+  reflections and a restricted textured any-hit path;
+- the reflections workload uses an explicit raygen loop and the shadow path
+  remains monolithic/PDS-compatible; neither proves a general nested
+  continuation or fresh child lifecycle;
 - callable, indirect trace/build, AS copy/serialization, and deferred
   operations are unsupported or placeholder entrypoints;
 - descriptor handling is a restricted set-0 profile;
@@ -137,6 +169,8 @@ claim:
   than a complete submit-time command execution model;
 - feature/property advertisement, recursion validation, synchronization and
   standard image readback still need conformance-oriented closure;
+- scratch V2 still uses a 32-bit PDS slot, physical-address-only private
+  context identity, compatibility control words and unvalidated release;
 - Spike proves functional behavior only; it does not prove RTL scheduling,
   timing or backpressure.
 
