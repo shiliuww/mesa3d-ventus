@@ -258,13 +258,18 @@ vtvk_rt_lower_abi_with_probe(nir_shader *shader,
                              const struct vt_nir_rt_config *config)
 {
    if (config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER) {
-      /* Global workers have no PDS ABI.  Lower just the ray payload to
-       * abstract slots before CPS splitting; global lowering later binds the
-       * slots to the CPS frame rather than a private launch allocation. */
-      vtvk_rt_log_nir_stats(shader, "before global CPS payload lowering");
+      /* Global workers have no PDS ABI, but every RT interface must still be
+       * lowered to abstract slots before a hit/miss shader is inlined into a
+       * raygen root continuation.  The later global pass binds those slots to
+       * completion/CPS storage rather than a private launch allocation. */
+      vtvk_rt_log_nir_stats(shader, "before global CPS ABI lowering");
       NIR_PASS(_, shader, vt_nir_lower_rt_payload, config);
+      NIR_PASS(_, shader, vt_nir_lower_rt_hit_record, config);
+      NIR_PASS(_, shader, vt_nir_lower_rt_control, config);
+      NIR_PASS(_, shader, vt_nir_lower_shader_record_ptr, config);
+      NIR_PASS(_, shader, vt_nir_lower_shader_scratch, config);
       vtvk_rt_finalize_abi(shader, config);
-      vtvk_rt_log_nir_stats(shader, "after global CPS payload lowering");
+      vtvk_rt_log_nir_stats(shader, "after global CPS ABI lowering");
       return;
    }
 
@@ -714,112 +719,6 @@ struct vtvk_rt_callback_shaders {
 struct vtvk_rt_pipeline_callback_data {
    const vtvk_rt_callback_shaders *shaders;
 };
-
-static bool
-vtvk_lower_global_terminal_callback(nir_shader *shader,
-                                    const struct vt_nir_rt_config *config)
-{
-   if (!shader || (shader->info.stage != MESA_SHADER_MISS &&
-                   shader->info.stage != MESA_SHADER_CLOSEST_HIT))
-      return false;
-
-   /* Reuse the established payload/hit-record lowering first.  The global
-    * callback pass below replaces its PDS slot accesses with ray_ref planes. */
-   vtvk_rt_lower_abi_with_probe(shader, config);
-   if (!vt_nir_lower_rt_global_callback(shader, config))
-      return false;
-   NIR_PASS(_, shader, vt_nir_lower_descriptors);
-
-   struct vt_nir_rt_canonicalize_error error = {};
-   if (vt_nir_canonicalize_rt_for_llvm(shader, &error) !=
-       VT_NIR_RT_CANONICALIZE_SUCCESS) {
-      mesa_loge("ventus-vk: global terminal callback has non-SSA function "
-                "temporary %s", error.variable_name ? error.variable_name :
-                "<unnamed>");
-      return false;
-   }
-   nir_validate_shader(shader, "after Ventus global terminal callback lowering");
-   return true;
-}
-
-static bool
-vtvk_lower_global_terminal_callbacks(
-   const vtvk_rt_callback_shaders *callbacks,
-   const struct vt_nir_rt_config *config)
-{
-   if (!callbacks)
-      return false;
-   for (const auto &entry : callbacks->miss) {
-      if (!vtvk_lower_global_terminal_callback(entry.shader, config))
-         return false;
-   }
-   for (const auto &entry : callbacks->closest_hit) {
-      if (!vtvk_lower_global_terminal_callback(entry.shader, config))
-         return false;
-   }
-   return true;
-}
-
-static bool
-vtvk_emit_global_terminal_callbacks(
-   struct vtvk_pipeline *pipeline,
-   const vtvk_rt_callback_shaders *callbacks,
-   const struct vt_nir_to_llvm_options *base_options)
-{
-   if (!callbacks)
-      return false;
-   const uint32_t count = callbacks->miss.size() + callbacks->closest_hit.size();
-   if (!count)
-      return true;
-
-   pipeline->callback_kernel_paths =
-      (char **)calloc(count, sizeof(*pipeline->callback_kernel_paths));
-   pipeline->callback_kernel_entries =
-      (uint64_t *)calloc(count, sizeof(*pipeline->callback_kernel_entries));
-   pipeline->callback_kernel_groups =
-      (uint32_t *)calloc(count, sizeof(*pipeline->callback_kernel_groups));
-   pipeline->callback_kernel_stages =
-      (uint32_t *)calloc(count, sizeof(*pipeline->callback_kernel_stages));
-   if (!pipeline->callback_kernel_paths || !pipeline->callback_kernel_entries ||
-       !pipeline->callback_kernel_groups || !pipeline->callback_kernel_stages)
-      return false;
-   pipeline->callback_kernel_count = count;
-
-   struct vt_nir_to_llvm_options options = *base_options;
-   options.module_name = "ventus_rt_terminal_callback";
-   options.entry_point_name = "main";
-   options.entry_point_is_kernel = true;
-   uint32_t out = 0;
-   const auto emit = [&](const vtvk_rt_callback_shader_entry &entry) -> bool {
-      nir_shader *shader = entry.shader;
-      llvm::Module *module = vt_nir_to_llvm_translate(&shader, 1, &options);
-      if (!module)
-         return false;
-      char *path = NULL;
-      uint64_t kernel_entry = 0;
-      bool ok = vtvk_maybe_emit_rt_kernel_module(
-         module, pipeline->rt_uses_rv64, &path, &kernel_entry);
-      delete module;
-      if (!ok)
-         return false;
-      pipeline->callback_kernel_paths[out] = path;
-      pipeline->callback_kernel_entries[out] = kernel_entry;
-      pipeline->callback_kernel_groups[out] = entry.group_index;
-      pipeline->callback_kernel_stages[out] = shader->info.stage;
-      out++;
-      return true;
-   };
-   for (const auto &entry : callbacks->miss)
-      if (!emit(entry))
-         return false;
-   for (const auto &entry : callbacks->closest_hit)
-      if (!emit(entry))
-         return false;
-
-   mesa_logi("ventus-vk: prepared %u global terminal callback kernel%s",
-             out, out == 1 ? "" : "s");
-   return true;
-}
 
 struct vtvk_rt_payload_location_candidate {
    int location;
@@ -1306,10 +1205,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
 
       for (uint32_t s = 0; s < pipeline->shader_count; s++) {
-         /* The global producer does not execute callback stages yet.  Do not
-          * materialize their legacy slot ABI while compiling its raygen. */
-         if (global_wavefront && pipeline->shaders[s] != cb_shaders.raygen)
-            continue;
          vtvk_rt_lower_abi_with_probe(pipeline->shaders[s], &config);
          nir_validate_shader(pipeline->shaders[s], "after Ventus RT lowering");
          if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
@@ -1331,6 +1226,28 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          .shaders = &cb_shaders,
       };
       if (global_wavefront) {
+         /* Keep the terminal SBT dispatch in the root continuation.  CPS
+          * sees the original TraceRayEXT, then resumes into the dynamically
+          * selected miss/closest-hit code; a TraceRayEXT in closest-hit is
+          * therefore another root CPS call site, not a child callback path. */
+         rt_io_config.enable_monolithic_shader_callbacks = true;
+         rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
+         rt_io_config.emit_closest_hit =
+            cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
+         rt_io_config.callback_data = &cb_data;
+         if (!vt_nir_lower_rt_global_root_continuations(
+                cb_shaders.raygen, &rt_io_config)) {
+            mesa_loge("ventus-vk: global root continuation callback lowering failed");
+            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+         struct vt_nir_rt_config global_worker_config = rt_io_config;
+         global_worker_config.enable_monolithic_shader_callbacks = false;
+         global_worker_config.emit_miss = NULL;
+         global_worker_config.emit_closest_hit = NULL;
+         global_worker_config.emit_any_hit = NULL;
+         global_worker_config.emit_intersection = NULL;
+         global_worker_config.callback_data = NULL;
          vtvk_rt_log_nir_stats(cb_shaders.raygen,
                                "raygen before global wavefront producer");
          struct vt_nir_rt_cps_info cps = {};
@@ -1343,14 +1260,15 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          pipeline->resume_shaders = cps.resume_shaders;
          pipeline->resume_shader_count = cps.num_resume_shaders;
          pipeline->continuation_frame_size = cps.frame_size_bytes;
-         if (!vt_nir_lower_rt_global_raygen(cb_shaders.raygen, &rt_io_config)) {
+         if (!vt_nir_lower_rt_global_raygen(cb_shaders.raygen,
+                                             &global_worker_config)) {
             mesa_loge("ventus-vk: global wavefront CPS producer lowering failed");
             vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
             return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
          }
          for (uint32_t i = 0; i < pipeline->resume_shader_count; i++) {
             if (!vt_nir_lower_rt_global_resume(pipeline->resume_shaders[i],
-                                               &rt_io_config)) {
+                                               &global_worker_config)) {
                mesa_loge("ventus-vk: global wavefront resume %u lowering failed", i);
                vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
                return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1369,15 +1287,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
             }
             nir_validate_shader(pipeline->resume_shaders[i],
                                 "after Ventus global RT resume lowering");
-         }
-         struct vt_nir_rt_config callback_config = rt_io_config;
-         callback_config.execution_model =
-            VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK;
-         if (!vtvk_lower_global_terminal_callbacks(&cb_shaders,
-                                                   &callback_config)) {
-            mesa_loge("ventus-vk: global terminal callback lowering failed");
-            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
          }
          vtvk_rt_log_nir_stats(cb_shaders.raygen,
                                "raygen after global wavefront producer");
@@ -1446,12 +1355,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    }
    vtvk_maybe_emit_rt_kernel(pipeline);
    if (!vtvk_emit_rt_resume_kernels(pipeline, &llvm_options)) {
-      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-      return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
-   }
-   if (global_wavefront &&
-       !vtvk_emit_global_terminal_callbacks(pipeline, &cb_shaders,
-                                            &llvm_options)) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }

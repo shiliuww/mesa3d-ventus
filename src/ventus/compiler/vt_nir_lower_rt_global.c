@@ -32,6 +32,9 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
 static nir_def *callback_ray_ref(nir_builder *b);
 static nir_def *load_completion_field(
    nir_builder *b, nir_def *ray_ref, enum vt_rt_global_completion_field field);
+static nir_def *global_callback_slot_addr(
+   nir_builder *b, const struct vt_nir_rt_config *config, uint32_t slot,
+   nir_def *ray_ref);
 static bool constant_def_u32(nir_def *def, uint32_t *value);
 
 /* Completion owns the logical frame identity.  All callback and resume
@@ -132,9 +135,15 @@ lower_global_worker_slot(nir_builder *b, nir_intrinsic_instr *intrin,
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *addr = nir_iadd_imm(
-      b, global_worker_cps_frame_addr(
-            b, (const struct global_lower_state *)data), slot);
+   const struct global_lower_state *state = data;
+   nir_def *addr = NULL;
+   if (state && state->resume_shader)
+      addr = global_callback_slot_addr(b, state->config, slot,
+                                      callback_ray_ref(b));
+   else
+      addr = nir_iadd_imm(b, global_worker_cps_frame_addr(b, state), slot);
+   if (!addr)
+      return false;
    if (load) {
       nir_def_rewrite_uses(&intrin->def,
          nir_load_global(b, intrin->def.num_components,

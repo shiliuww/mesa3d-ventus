@@ -1248,10 +1248,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                 driver.vt_ready_wait(driver.device, 60 * 60 * 1000) == 0;
       };
 
-      /* This is deliberately a bridge-side probe: callback kernels have
-       * completed here, while resume kernels have not yet touched the CPS
-       * frame.  It makes a payload handoff failure distinguishable from a
-       * later image-store failure without adding an RT ABI debug field. */
+      /* Root continuations execute terminal SBT code in the resume ELF.  Read
+       * this optional probe only after that resume has finished. */
       const bool debug_payload_rgb =
          vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_PAYLOAD_RGB");
       uint32_t debug_payload_ray_ref = 0;
@@ -1451,15 +1449,17 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                          request.continuation_id);
                goto out;
             }
-            uint32_t callback_index = UINT32_MAX;
-            const char *callback_path = NULL;
-            uint64_t callback_entry = 0;
-            if (!vtvk_global_callback_kernel(info, callback_stage,
-                                             request.callback_group,
-                                             &callback_index, &callback_path,
-                                             &callback_entry))
-               goto out;
-            callback_refs[callback_index].push_back(request.ray_ref);
+            if (info->callback_kernel_count) {
+               uint32_t callback_index = UINT32_MAX;
+               const char *callback_path = NULL;
+               uint64_t callback_entry = 0;
+               if (!vtvk_global_callback_kernel(info, callback_stage,
+                                                request.callback_group,
+                                                &callback_index, &callback_path,
+                                                &callback_entry))
+                  goto out;
+               callback_refs[callback_index].push_back(request.ray_ref);
+            }
          }
 
          if (!hit_refs.empty() && debug_payload_rgb) {
@@ -1498,7 +1498,6 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                goto out;
             }
          }
-         log_payload_rgb(requests, phase + 1);
          /* Completion stage is uniform within each terminal callback.  Keep
           * it uniform for its resume batch as well: mixing miss and hit
           * records here immediately re-diverges the raygen post-trace path,
@@ -1527,6 +1526,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                goto out;
             }
          }
+         log_payload_rgb(requests, phase + 1);
       }
       if (!complete) {
          mesa_loge("ventus-vk: global RT exceeded recursion-phase dispatch bound");

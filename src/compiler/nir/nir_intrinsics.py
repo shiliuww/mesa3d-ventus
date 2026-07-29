@@ -783,11 +783,13 @@ intrinsic("ventus_rt_release", src_comp=[1])
 # mailbox address; it is valid only after the producer has published VALID.
 intrinsic("ventus_rt_enqueue", src_comp=[1])
 
-# Ventus RT per-lane slot memory.  This is private/PDS scratch, not shared/LDS
-# memory.  Loads may be eliminated when unused, but neither loads nor stores are
-# marked CAN_REORDER because vt.rt.traverse/release observe the same slot.
+# Ventus RT slot memory is observed and written by a TraceRay continuation.
+# In particular, a closest-hit payload store before a nested TraceRayEXT must
+# not let a later payload load reuse that pre-call SSA value: miss/closest-hit
+# code in the resumed continuation may have changed the slot.  Keep loads
+# non-eliminable as well as non-reorderable so CPS preserves that dependency.
 intrinsic("ventus_rt_load_slot", src_comp=[1], dest_comp=0,
-          bit_sizes=[8, 16, 32, 64], flags=[CAN_ELIMINATE])
+          bit_sizes=[8, 16, 32, 64])
 intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
 
 

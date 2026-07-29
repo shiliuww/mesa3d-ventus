@@ -294,6 +294,13 @@ vt_nir_build_traversal(nir_builder *b,
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
 
+/* Insert terminal miss/closest-hit dispatch after each traceRayEXT without
+ * consuming the trace instruction.  CPS splitting subsequently moves that
+ * dispatch into the root continuation, where the global completion plane is
+ * the source of the terminal result. */
+bool vt_nir_lower_rt_global_root_continuations(
+   nir_shader *shader, const struct vt_nir_rt_config *config);
+
 /* PDS-free root raygen producer.  Call vt_nir_lower_rt_cps() first, then pass
  * its resulting initial/resume shaders through these lowerings.  The MVP owns
  * exactly one root CPS frame per launch invocation; callback/child traces are
