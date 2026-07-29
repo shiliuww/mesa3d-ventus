@@ -10,6 +10,7 @@
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 
+#include "ventus/compiler/vt_rt_descriptor_abi.h"
 #include "ventus/llvm/ventus_nir_to_llvm.h"
 
 #include "llvm/IR/Constants.h"
@@ -217,6 +218,35 @@ main()
    ralloc_free(shader);
 
    shader = build_storage_image_shader(&nir_options, 1, 13);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
+
+   bool found_set_1_binding_13 = false;
+   for (llvm::Function &function : *module) {
+      for (llvm::BasicBlock &block : function) {
+         for (llvm::Instruction &instruction : block) {
+            auto *mul = llvm::dyn_cast<llvm::BinaryOperator>(&instruction);
+            if (!mul || mul->getOpcode() != llvm::Instruction::Mul)
+               continue;
+            for (unsigned operand = 0; operand < 2; operand++) {
+               auto *constant =
+                  llvm::dyn_cast<llvm::ConstantInt>(mul->getOperand(operand));
+               found_set_1_binding_13 |=
+                  constant && constant->getZExtValue() ==
+                     VT_RT_DESCRIPTOR_BINDINGS_PER_SET + 13;
+            }
+         }
+      }
+   }
+   VT_RT_CHECK(found_set_1_binding_13);
+
+   delete module;
+   ralloc_free(shader);
+
+   shader = build_storage_image_shader(
+      &nir_options, VT_RT_DESCRIPTOR_SET_COUNT, 13);
    shaders[0] = shader;
    module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
    VT_RT_CHECK(module == nullptr);

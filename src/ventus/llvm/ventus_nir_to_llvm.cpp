@@ -1147,14 +1147,19 @@ private:
       if (nir_src_is_deref(intrin->src[0])) {
          nir_variable *var =
             nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[0]));
-         if (var && var->data.descriptor_set == 0)
-            return ConstantInt::get(i32, var->data.binding);
+         if (var &&
+             vt_rt_descriptor_location_valid(var->data.descriptor_set,
+                                             var->data.binding)) {
+            return ConstantInt::get(
+               i32, vt_rt_descriptor_table_slot(var->data.descriptor_set,
+                                                var->data.binding));
+         }
       }
 
       if (debugLowering)
          fprintf(stderr,
                  "ventus-nir-to-llvm: storage image binding is not a "
-                 "static set-0 binding\n");
+                 "static in-range descriptor location\n");
       translationFailed = true;
       return nullptr;
    }
@@ -1301,8 +1306,12 @@ private:
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
          coord && texture_var && sampler_var &&
-         texture_var->data.descriptor_set == 0 &&
-         sampler_var->data.descriptor_set == 0 &&
+         vt_rt_descriptor_location_valid(
+            texture_var->data.descriptor_set, texture_var->data.binding) &&
+         vt_rt_descriptor_location_valid(
+            sampler_var->data.descriptor_set, sampler_var->data.binding) &&
+         texture_var->data.descriptor_set ==
+            sampler_var->data.descriptor_set &&
          texture_var->data.binding == sampler_var->data.binding;
       if (!supported) {
          if (debugLowering)
@@ -1318,7 +1327,9 @@ private:
        * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
        * sampler derefs resolve through one software descriptor record, just
        * as RADV first resolves them to its hardware descriptor pair. */
-      Value *binding = ConstantInt::get(i32, texture_var->data.binding);
+      Value *binding = ConstantInt::get(
+         i32, vt_rt_descriptor_table_slot(texture_var->data.descriptor_set,
+                                          texture_var->data.binding));
       Value *base = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
       Value *format = descriptorRecordI32(
@@ -1812,7 +1823,21 @@ private:
          return rayLaunchSize();
       }
       case nir_intrinsic_vulkan_resource_index: {
-         return ConstantInt::get(i32, nir_intrinsic_binding(intrin));
+         const uint32_t set = nir_intrinsic_desc_set(intrin);
+         const uint32_t binding = nir_intrinsic_binding(intrin);
+         if (!vt_rt_descriptor_location_valid(set, binding)) {
+            if (debugLowering) {
+               fprintf(stderr,
+                       "ventus-nir-to-llvm: descriptor set=%u binding=%u "
+                       "exceeds the software descriptor table\n",
+                       set, binding);
+            }
+            translationFailed = true;
+            unsupportedDefs.insert(&intrin->def);
+            return undefFor(&intrin->def);
+         }
+         return ConstantInt::get(
+            i32, vt_rt_descriptor_table_slot(set, binding));
       }
       case nir_intrinsic_vulkan_resource_reindex: {
          return builder.CreateAdd(asInt32(value(intrin->src[0])),

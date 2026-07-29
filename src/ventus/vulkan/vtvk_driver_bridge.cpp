@@ -883,8 +883,13 @@ static uint32_t
 vtvk_driver_descriptor_table_slots(const struct vtvk_driver_trace_rays_info *info)
 {
    uint32_t slots = 5;
-   for (uint32_t i = 0; i < info->descriptor_count; i++)
-      slots = std::max(slots, info->descriptors[i].binding + 1);
+   for (uint32_t i = 0; i < info->descriptor_count; i++) {
+      const struct vtvk_rt_descriptor_source *src = &info->descriptors[i];
+      if (!vt_rt_descriptor_location_valid(src->set, src->binding))
+         continue;
+      slots = std::max(
+         slots, vt_rt_descriptor_table_slot(src->set, src->binding) + 1);
+   }
    return slots;
 }
 
@@ -1158,25 +1163,29 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if (info->descriptor_count) {
       uint32_t slots = vtvk_driver_descriptor_table_slots(info);
       descriptor_table.resize(slots);
-      for (uint32_t binding = 0; binding < slots; binding++) {
-         descriptor_table[binding].set = 0;
-         descriptor_table[binding].binding = binding;
+      for (uint32_t slot = 0; slot < slots; slot++) {
+         descriptor_table[slot].set =
+            slot / VT_RT_DESCRIPTOR_BINDINGS_PER_SET;
+         descriptor_table[slot].binding =
+            slot % VT_RT_DESCRIPTOR_BINDINGS_PER_SET;
       }
 
       for (uint32_t i = 0; i < info->descriptor_count; i++) {
          const struct vtvk_rt_descriptor_source *src = &info->descriptors[i];
-         if (src->set != 0 || src->binding >= slots) {
+         if (!vt_rt_descriptor_location_valid(src->set, src->binding)) {
             mesa_loge("ventus-vk: unsupported RT descriptor set=%u binding=%u",
                       src->set, src->binding);
             goto out;
          }
+         uint32_t slot =
+            vt_rt_descriptor_table_slot(src->set, src->binding);
          if (!vtvk_driver_upload_descriptor(&driver, src,
-                                            &descriptor_table[src->binding],
+                                            &descriptor_table[slot],
                                             &uploads))
             goto out;
 
          const struct vtvk_rt_descriptor_record *record =
-            &descriptor_table[src->binding];
+            &descriptor_table[slot];
          if (src->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
              !tlas_dev_addr) {
             tlas_dev_addr = record->device_addr;

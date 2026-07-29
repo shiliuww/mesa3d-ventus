@@ -16,11 +16,16 @@ validate_descriptor_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_vulkan_resource_index:
-      if (nir_intrinsic_desc_set(intrin) != 0) {
+      if (!vt_rt_descriptor_location_valid(
+             nir_intrinsic_desc_set(intrin),
+             nir_intrinsic_binding(intrin))) {
          fprintf(stderr,
-                 "ventus-nir: unsupported RT descriptor set %u for binding %u\n",
+                 "ventus-nir: RT descriptor set=%u binding=%u exceeds the "
+                 "%u-set x %u-binding table\n",
                  nir_intrinsic_desc_set(intrin),
-                 nir_intrinsic_binding(intrin));
+                 nir_intrinsic_binding(intrin),
+                 VT_RT_DESCRIPTOR_SET_COUNT,
+                 VT_RT_DESCRIPTOR_BINDINGS_PER_SET);
          *unsupported = true;
       }
       break;

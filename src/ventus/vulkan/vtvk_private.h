@@ -12,13 +12,14 @@
 #include "vk_physical_device.h"
 #include "vk_query_pool.h"
 #include "vk_queue.h"
+#include "ventus/compiler/vt_rt_descriptor_abi.h"
 #include "vtvk_rt_profile.h"
 
 #define VTVK_VENDOR_ID 0x5654
 #define VTVK_DEVICE_ID 0x5254
 #define VTVK_QUEUE_FAMILY 0
-#define VTVK_MAX_DESCRIPTOR_BINDINGS 32
-#define VTVK_MAX_BOUND_DESCRIPTOR_SETS 4
+#define VTVK_MAX_DESCRIPTOR_BINDINGS VT_RT_DESCRIPTOR_BINDINGS_PER_SET
+#define VTVK_MAX_BOUND_DESCRIPTOR_SETS VT_RT_DESCRIPTOR_SET_COUNT
 #define VTVK_MAX_PUSH_CONSTANT_SIZE 256
 
 #ifdef __cplusplus

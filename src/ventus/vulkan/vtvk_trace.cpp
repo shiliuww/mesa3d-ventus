@@ -15,12 +15,13 @@ vtvk_handle_to_ptr(uint64_t handle)
 
 static bool
 vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
+                           uint32_t set,
                            uint32_t binding,
                            std::vector<vtvk_rt_descriptor_source> *out)
 {
    struct vtvk_rt_descriptor_source desc = {};
    desc.type = info->type;
-   desc.set = 0;
+   desc.set = set;
    desc.binding = binding;
 
    switch (info->type) {
@@ -39,8 +40,8 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
       desc.range = info->buffer.range;
       break;
    default:
-      mesa_loge("ventus-vk: unsupported RT descriptor set=0 binding=%u type=%u",
-                binding, (unsigned)info->type);
+      mesa_loge("ventus-vk: unsupported RT descriptor set=%u binding=%u type=%u",
+                set, binding, (unsigned)info->type);
       return false;
    }
 
@@ -64,8 +65,6 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
       vtvk_cmd_buffer_bound_rt_pipeline(commandBuffer);
    struct vtvk_pipeline *pipeline =
       vtvk_pipeline_from_handle(pipeline_handle);
-   VkDescriptorSet descriptor_set =
-      vtvk_cmd_buffer_bound_descriptor_set(commandBuffer, 0);
    VkAccelerationStructureKHR tlas_handle = VK_NULL_HANDLE;
    VkImage storage_image = VK_NULL_HANDLE;
    VkExtent3D image_extent = {};
@@ -74,26 +73,30 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    void *camera_data = nullptr;
 
    std::vector<vtvk_rt_descriptor_source> descriptors;
-   descriptors.reserve(VTVK_MAX_DESCRIPTOR_BINDINGS);
-   for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
-        binding++) {
-      struct vtvk_descriptor_binding_info info = {};
-      if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info) ||
-          !vtvk_collect_rt_descriptor(&info, binding, &descriptors))
-         continue;
+   descriptors.reserve(VT_RT_DESCRIPTOR_TABLE_SLOT_COUNT);
+   for (uint32_t set = 0; set < VTVK_MAX_BOUND_DESCRIPTOR_SETS; set++) {
+      VkDescriptorSet descriptor_set =
+         vtvk_cmd_buffer_bound_descriptor_set(commandBuffer, set);
+      for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
+           binding++) {
+         struct vtvk_descriptor_binding_info info = {};
+         if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info) ||
+             !vtvk_collect_rt_descriptor(&info, set, binding, &descriptors))
+            continue;
 
-      if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
-          tlas_handle == VK_NULL_HANDLE) {
-         tlas_handle = info.acceleration_structure;
-      } else if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-                 storage_image == VK_NULL_HANDLE) {
-         storage_image = info.image;
-      } else if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-                 !camera_data) {
-         camera_range = info.buffer.range;
-         camera_data =
-            vtvk_buffer_host_ptr(info.buffer.buffer, info.buffer.offset,
-                                 camera_range);
+         if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+             tlas_handle == VK_NULL_HANDLE) {
+            tlas_handle = info.acceleration_structure;
+         } else if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                    storage_image == VK_NULL_HANDLE) {
+            storage_image = info.image;
+         } else if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                    !camera_data) {
+            camera_range = info.buffer.range;
+            camera_data =
+               vtvk_buffer_host_ptr(info.buffer.buffer, info.buffer.offset,
+                                    camera_range);
+         }
       }
    }
 

@@ -11,6 +11,7 @@
 
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
+#include "ventus/compiler/vt_rt_descriptor_abi.h"
 #include "ventus/compiler/vt_rt_global_abi.h"
 #include "ventus/compiler/vt_rt_abi.h"
 
