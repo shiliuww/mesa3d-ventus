@@ -104,6 +104,7 @@ Relevant runtime controls include:
 | `VENTUS_VK_DRIVER_BRIDGE=1` | Enable resource upload and backend launch |
 | `VENTUS_VK_EMIT_ELF=1` | Compile/link a generated RT ELF |
 | `VENTUS_VK_SHADER_ARTIFACT_DIR` | Directory for generated LLVM/ELF artifacts |
+| `VENTUS_VK_RETAIN_SHADER_ARTIFACTS=1` | Keep pipeline ELF and compiler intermediates after pipeline destruction for debugging |
 | `VENTUS_VK_DUMP_IMAGE` | PPM path for storage-image readback |
 | `VENTUS_VK_DRIVER_LIB` | Optional explicit driver shared library |
 

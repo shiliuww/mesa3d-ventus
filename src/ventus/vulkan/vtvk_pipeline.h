@@ -59,6 +59,7 @@ struct vtvk_pipeline {
    uint32_t max_ray_recursion_depth;
    enum vtvk_rt_execution_profile rt_execution_profile;
    bool rt_uses_rv64;
+   bool retain_generated_artifacts;
    struct vt_nir_pipeline_scratch_info scratch_info;
 
    llvm::Module *llvm_module;

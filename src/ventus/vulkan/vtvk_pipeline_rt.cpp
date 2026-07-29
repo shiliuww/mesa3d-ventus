@@ -341,6 +341,53 @@ vtvk_rt_artifact_base(void)
    return base + name;
 }
 
+static void
+vtvk_remove_rt_artifact(const std::string &path)
+{
+   if (path.empty() || unlink(path.c_str()) == 0 || errno == ENOENT)
+      return;
+
+   mesa_logw("ventus-vk: failed to remove RT compiler artifact %s: %s",
+             path.c_str(), strerror(errno));
+}
+
+struct vtvk_rt_emit_artifacts {
+   explicit vtvk_rt_emit_artifacts(const std::string &base,
+                                   bool retain_all,
+                                   bool retain_llvm_dump)
+      : ll_path(base + ".ll"),
+        emit_ll_path(base + ".emit.ll"),
+        obj_path(base + ".o"),
+        elf_path(base + ".riscv"),
+        ld_path(base + ".ld"),
+        retain_all(retain_all),
+        retain_ll(retain_all || retain_llvm_dump)
+   {}
+
+   ~vtvk_rt_emit_artifacts()
+   {
+      if (retain_all)
+         return;
+
+      if (!retain_ll)
+         vtvk_remove_rt_artifact(ll_path);
+      vtvk_remove_rt_artifact(emit_ll_path);
+      vtvk_remove_rt_artifact(obj_path);
+      vtvk_remove_rt_artifact(ld_path);
+      if (!retain_elf)
+         vtvk_remove_rt_artifact(elf_path);
+   }
+
+   std::string ll_path;
+   std::string emit_ll_path;
+   std::string obj_path;
+   std::string elf_path;
+   std::string ld_path;
+   bool retain_all;
+   bool retain_ll;
+   bool retain_elf = false;
+};
+
 static bool
 vtvk_write_rt_linker_script(const std::string &path)
 {
@@ -444,14 +491,6 @@ vtvk_dump_rt_llvm_module_to(llvm::Module *module,
 }
 
 static bool
-vtvk_dump_rt_llvm_module(llvm::Module *module, std::string *ll_path)
-{
-   std::string base = vtvk_rt_artifact_base();
-   *ll_path = base + ".ll";
-   return vtvk_dump_rt_llvm_module_to(module, *ll_path, "pre-lowering");
-}
-
-static bool
 vtvk_find_crt0(bool rv64, std::string *path)
 {
    const char *env_path = getenv("VENTUS_VK_CRT0");
@@ -481,11 +520,9 @@ vtvk_find_crt0(bool rv64, std::string *path)
 
 static bool
 vtvk_dump_rt_emit_llvm_module(llvm::Module *module,
-                              const std::string &ll_path,
-                              std::string *emit_ll_path)
+                              const std::string &emit_ll_path)
 {
-   *emit_ll_path = ll_path.substr(0, ll_path.size() - 3) + ".emit.ll";
-   return vtvk_dump_rt_llvm_module_to(module, *emit_ll_path, "ELF-input");
+   return vtvk_dump_rt_llvm_module_to(module, emit_ll_path, "ELF-input");
 }
 
 static bool
@@ -557,23 +594,24 @@ vtvk_read_elf_symbol(const std::string &elf_path, const char *symbol,
 
 static bool
 vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
+                                 bool retain_artifacts,
                                  char **out_path, uint64_t *out_entry)
 {
    *out_path = NULL;
    *out_entry = 0;
-   if (!vtvk_env_enabled("VENTUS_VK_DUMP_LLVM") &&
-       !vtvk_env_enabled("VENTUS_VK_EMIT_ELF"))
+   const bool dump_llvm = vtvk_env_enabled("VENTUS_VK_DUMP_LLVM");
+   const bool emit_elf = vtvk_env_enabled("VENTUS_VK_EMIT_ELF");
+   if (!dump_llvm && !emit_elf)
       return true;
 
-   std::string ll_path;
-   if (!vtvk_dump_rt_llvm_module(module, &ll_path) ||
-       !vtvk_env_enabled("VENTUS_VK_EMIT_ELF"))
+   vtvk_rt_emit_artifacts artifacts(vtvk_rt_artifact_base(),
+                                    retain_artifacts, dump_llvm);
+   if (!vtvk_dump_rt_llvm_module_to(module, artifacts.ll_path,
+                                    "pre-lowering"))
+      return false;
+   if (!emit_elf)
       return true;
 
-   std::string obj_path = ll_path.substr(0, ll_path.size() - 3) + ".o";
-   std::string elf_path = ll_path.substr(0, ll_path.size() - 3) + ".riscv";
-   std::string ld_path = ll_path.substr(0, ll_path.size() - 3) + ".ld";
-   std::string emit_ll_path;
    std::string crt0_path;
    const char *llc = getenv("VENTUS_VK_LLC");
    const char *ld_lld = getenv("VENTUS_VK_LD_LLD");
@@ -582,12 +620,12 @@ vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
    if (!ld_lld || !ld_lld[0])
       ld_lld = "ld.lld";
 
-   if (!vtvk_write_rt_linker_script(ld_path))
+   if (!vtvk_write_rt_linker_script(artifacts.ld_path))
       return false;
    if (!vtvk_find_crt0(rv64, &crt0_path))
       return false;
 
-   if (!vtvk_dump_rt_emit_llvm_module(module, ll_path, &emit_ll_path))
+   if (!vtvk_dump_rt_emit_llvm_module(module, artifacts.emit_ll_path))
       return false;
 
    std::string tool_env = vtvk_llvm_tool_env_prefix();
@@ -599,43 +637,51 @@ vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
                          + (rv64 ? " -target-abi=lp64" : " -target-abi=ilp32") +
                          " -mattr=+m,+a,+f,+d,+v,+zfh"
                          " -filetype=obj " +
-                         vtvk_shell_quote(emit_ll_path.c_str()) + " -o " +
-                         vtvk_shell_quote(obj_path.c_str());
+                         vtvk_shell_quote(artifacts.emit_ll_path.c_str()) +
+                         " -o " +
+                         vtvk_shell_quote(artifacts.obj_path.c_str());
    if (!vtvk_run_tool(llc_cmd, "llc"))
       return false;
 
    std::string link_cmd;
-   if (!vtvk_rt_elf_link_command(tool_env, ld_lld, ld_path, elf_path, crt0_path,
-                                 obj_path, &link_cmd))
+   if (!vtvk_rt_elf_link_command(tool_env, ld_lld, artifacts.ld_path,
+                                 artifacts.elf_path, crt0_path,
+                                 artifacts.obj_path, &link_cmd))
       return false;
    if (!vtvk_run_tool(link_cmd, "link"))
       return false;
 
    uint64_t kernel_entry = 0;
-   if (!vtvk_read_elf_symbol(elf_path, "main", &kernel_entry))
+   if (!vtvk_read_elf_symbol(artifacts.elf_path, "main", &kernel_entry))
       return false;
 
-   *out_path = strdup(elf_path.c_str());
+   *out_path = strdup(artifacts.elf_path.c_str());
    if (!*out_path)
       return false;
+   artifacts.retain_elf = true;
    *out_entry = kernel_entry;
    mesa_logi("ventus-vk: emitted RT RISC-V kernel to %s entry=0x%" PRIx64,
-             elf_path.c_str(), kernel_entry);
+             artifacts.elf_path.c_str(), kernel_entry);
    return true;
 }
 
-static void
+static bool
 vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
 {
    char *path = NULL;
    uint64_t entry = 0;
    if (!vtvk_maybe_emit_rt_kernel_module(pipeline->llvm_module,
                                          pipeline->rt_uses_rv64,
+                                         pipeline->retain_generated_artifacts,
                                          &path, &entry))
-      return;
+      return false;
+   if (pipeline->generated_kernel_path &&
+       !pipeline->retain_generated_artifacts)
+      vtvk_remove_rt_artifact(pipeline->generated_kernel_path);
    free(pipeline->generated_kernel_path);
    pipeline->generated_kernel_path = path;
    pipeline->generated_kernel_entry = entry;
+   return true;
 }
 
 /* CPS lowerings produce raygen-stage resume NIR.  Keep every resume in its
@@ -672,7 +718,8 @@ vtvk_emit_rt_resume_kernels(struct vtvk_pipeline *pipeline,
       char *path = NULL;
       uint64_t entry = 0;
       const bool emitted = vtvk_maybe_emit_rt_kernel_module(
-         module, pipeline->rt_uses_rv64, &path, &entry);
+         module, pipeline->rt_uses_rv64,
+         pipeline->retain_generated_artifacts, &path, &entry);
       delete module;
       if (!emitted)
          return false;
@@ -1367,7 +1414,8 @@ vtvk_emit_rt_global_candidate_kernels(
       char *path = NULL;
       uint64_t entry = 0;
       const bool emitted = vtvk_maybe_emit_rt_kernel_module(
-         module, pipeline->rt_uses_rv64, &path, &entry);
+         module, pipeline->rt_uses_rv64,
+         pipeline->retain_generated_artifacts, &path, &entry);
       delete module;
       if (!emitted)
          return false;
@@ -1403,6 +1451,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->max_ray_recursion_depth = info->maxPipelineRayRecursionDepth;
    pipeline->rt_execution_profile = device->rt_execution_profile;
    pipeline->rt_uses_rv64 = device->rt_uses_rv64;
+   pipeline->retain_generated_artifacts =
+      vtvk_env_enabled("VENTUS_VK_RETAIN_SHADER_ARTIFACTS");
 
    pipeline->shaders =
       (nir_shader **)vk_zalloc2(&device->vk.alloc, pAllocator,
@@ -1608,7 +1658,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }
-   vtvk_maybe_emit_rt_kernel(pipeline);
+   if (!vtvk_maybe_emit_rt_kernel(pipeline)) {
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+   }
    if (!vtvk_emit_rt_resume_kernels(pipeline, &llvm_options)) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
