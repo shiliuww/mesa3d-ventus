@@ -772,15 +772,29 @@ vtvk_build_tlas(struct vtvk_device *device,
 
    const VkAccelerationStructureGeometryInstancesDataKHR *instances =
       &geom->geometry.instances;
-   if (instances->arrayOfPointers)
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-
-   VkAccelerationStructureInstanceKHR *instance_base =
-      (VkAccelerationStructureInstanceKHR *)vtvk_buffer_host_ptr_from_addr(
-         instances->data.deviceAddress,
-         sizeof(VkAccelerationStructureInstanceKHR) * instance_count);
-   if (!instance_base)
+   if (range->primitiveOffset >
+       UINT64_MAX - instances->data.deviceAddress)
       return vk_error(device, VK_ERROR_UNKNOWN);
+   const VkDeviceAddress instance_data_address =
+      instances->data.deviceAddress + range->primitiveOffset;
+   const VkAccelerationStructureInstanceKHR *instance_base = nullptr;
+   const uint8_t *instance_address_array = nullptr;
+   if (instances->arrayOfPointers) {
+      instance_address_array =
+         (const uint8_t *)vtvk_buffer_host_ptr_from_addr(
+            instance_data_address,
+            sizeof(VkDeviceAddress) * instance_count);
+      if (!instance_address_array)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+   } else {
+      instance_base =
+         (const VkAccelerationStructureInstanceKHR *)
+            vtvk_buffer_host_ptr_from_addr(
+               instance_data_address,
+               sizeof(VkAccelerationStructureInstanceKHR) * instance_count);
+      if (!instance_base)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+   }
 
    uint8_t *dst = (uint8_t *)as->data;
    if (!dst)
@@ -792,9 +806,28 @@ vtvk_build_tlas(struct vtvk_device *device,
    std::vector<struct vtvk_build_node> leaves;
 
    for (uint32_t i = 0; i < instance_count; i++) {
-      const VkAccelerationStructureInstanceKHR *inst = &instance_base[i];
-      const uint8_t *blas = (const uint8_t *)(uintptr_t)inst->accelerationStructureReference;
-      if (!blas || vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
+      const VkAccelerationStructureInstanceKHR *inst;
+      if (instances->arrayOfPointers) {
+         VkDeviceAddress instance_address;
+         memcpy(&instance_address,
+                instance_address_array + i * sizeof(instance_address),
+                sizeof(instance_address));
+         inst = (const VkAccelerationStructureInstanceKHR *)
+            vtvk_buffer_host_ptr_from_addr(
+               instance_address, sizeof(VkAccelerationStructureInstanceKHR));
+      } else {
+         inst = &instance_base[i];
+      }
+      if (!inst)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+
+      const VkDeviceAddress blas_address =
+         inst->accelerationStructureReference;
+      struct vtvk_acceleration_structure *blas_as =
+         vtvk_find_as_by_address(blas_address);
+      const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_address;
+      if (!blas_as || !blas ||
+          vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
          return vk_error(device, VK_ERROR_UNKNOWN);
 
       struct vtvk_aabb blas_bounds = vtvk_header_aabb(blas);
