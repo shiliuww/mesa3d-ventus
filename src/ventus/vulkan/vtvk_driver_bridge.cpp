@@ -1056,6 +1056,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t global_completion_dev_addr = 0;
    uint64_t global_hit_attribute_dev_addr = 0;
    uint64_t global_candidate_hit_attribute_dev_addr = 0;
+   uint64_t global_ray_ref_list_dev_addr = 0;
+   uint64_t global_ray_ref_list_size = 0;
    uint32_t global_hit_attribute_stride = 0;
    struct vtvk_driver_rt_global_consume_info global_consume = {};
    bool global_session_teardown_armed = false;
@@ -1506,6 +1508,25 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       args.global_completion_field_stride =
          (uint32_t)global_completion_layout.field_stride_bytes;
 
+      if (wavefront_global) {
+         if (__builtin_mul_overflow((uint64_t)global_queue_capacity,
+                                    sizeof(uint32_t),
+                                    &global_ray_ref_list_size) ||
+             !vtvk_driver_alloc_copy(&driver, NULL, global_ray_ref_list_size,
+                                     &global_ray_ref_list_dev_addr)) {
+            mesa_loge("ventus-vk: driver bridge failed to allocate global "
+                      "ray-ref scratch");
+            goto out;
+         }
+         if (!rv64 &&
+             !vtvk_bridge_require_rv32_range(
+                "global ray-ref scratch", global_ray_ref_list_dev_addr,
+                global_ray_ref_list_size))
+            goto out;
+         args.global_ray_ref_list_base = global_ray_ref_list_dev_addr;
+         args.global_ray_ref_generation = generation;
+      }
+
       if (wavefront_global &&
           !vt_nir_rt_submission_mailbox_capacity(
              vtvk_rt_resident_warps, vtvk_rt_lanes_per_warp,
@@ -1701,15 +1722,22 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          if (ray_refs.empty())
             return true;
 
-         uint64_t list_dev_addr = 0;
+         if (!global_ray_ref_list_dev_addr ||
+             ray_refs.size() > global_queue_capacity) {
+            mesa_loge("ventus-vk: global RT ray-ref batch exceeds scratch "
+                      "capacity rays=%zu capacity=%u",
+                      ray_refs.size(), global_queue_capacity);
+            return false;
+         }
          const uint64_t list_size = ray_refs.size() * sizeof(ray_refs[0]);
-         if (!vtvk_driver_alloc_copy(&driver, ray_refs.data(), list_size,
-                                     &list_dev_addr) ||
-             (!rv64 && !vtvk_bridge_require_rv32_range(
-                         "global RT ray-ref list", list_dev_addr, list_size)))
+         if (list_size > global_ray_ref_list_size)
+            return false;
+         if (driver.vt_copy_to_dev(driver.device,
+                                   global_ray_ref_list_dev_addr,
+                                   ray_refs.data(), list_size, 0, 0) != 0)
             return false;
 
-         args.global_ray_ref_list_base = list_dev_addr;
+         args.global_ray_ref_list_base = global_ray_ref_list_dev_addr;
          args.global_ray_ref_count = ray_refs.size();
          args.global_ray_ref_generation = dispatch_generation;
          if (driver.vt_copy_to_dev(driver.device, args_dev_addr, &args,
@@ -1755,8 +1783,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          if (dispatched &&
              vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_GLOBAL")) {
             mesa_logi("ventus-vk: global RT dispatched %s entry=0x%" PRIx64
-                      " rays=%zu generation=%u",
-                      name, entry, ray_refs.size(), dispatch_generation);
+                      " rays=%zu generation=%u ray_ref_list=0x%" PRIx64,
+                      name, entry, ray_refs.size(), dispatch_generation,
+                      global_ray_ref_list_dev_addr);
          }
          return dispatched;
       };
