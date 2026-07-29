@@ -23,6 +23,7 @@ libvtvk_files = files(
   'vtvk_pipeline.cpp',
   'vtvk_pipeline_graphics.cpp',
   'vtvk_pipeline_rt.cpp',
+  'vtvk_query.c',
   'vtvk_render_compat.c',
   'vtvk_rt_profile.c',
   'vtvk_rt_unsupported.cpp',

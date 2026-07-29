@@ -1130,11 +1130,59 @@ vtvk_CmdBuildAccelerationStructuresKHR(
 }
 
 static VkResult
-vtvk_clone_acceleration_structure(
+vtvk_acceleration_structure_used_size(
+   struct vtvk_device *device,
+   const struct vtvk_acceleration_structure *as,
+   VkDeviceSize *size_out)
+{
+   if (!as || !as->built || !as->snapshot ||
+       as->snapshot_size < VENTUS_AS_HEADER_SIZE ||
+       vtvk_load_u32(as->snapshot, VENTUS_AS_HEADER_MAGIC) !=
+          VENTUS_AS_MAGIC)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   const uint32_t node_region_size =
+      vtvk_load_u32(as->snapshot, VENTUS_AS_HEADER_NODE_REGION_SIZE);
+   if (node_region_size > as->snapshot_size - VENTUS_AS_HEADER_SIZE)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   *size_out = VENTUS_AS_HEADER_SIZE + VkDeviceSize(node_region_size);
+   return VK_SUCCESS;
+}
+
+static VkResult
+vtvk_acceleration_structure_property(
+   struct vtvk_device *device,
+   const struct vtvk_acceleration_structure *as,
+   VkQueryType query_type,
+   uint64_t *value_out)
+{
+   if (!as || !as->built)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   if (query_type !=
+       VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (!(as->build_flags &
+         VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   VkDeviceSize used_size;
+   VkResult result =
+      vtvk_acceleration_structure_used_size(device, as, &used_size);
+   if (result == VK_SUCCESS)
+      *value_out = used_size;
+   return result;
+}
+
+static VkResult
+vtvk_copy_acceleration_structure(
    struct vtvk_device *device,
    const VkCopyAccelerationStructureInfoKHR *info)
 {
-   if (!info || info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR)
+   if (!info ||
+       (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
+        info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    struct vtvk_acceleration_structure *src =
@@ -1146,18 +1194,29 @@ vtvk_clone_acceleration_structure(
    if (!src || !dst || src == dst || src->type != dst->type ||
        !src->built || !src->snapshot || !src->snapshot_size)
       return vk_error(device, VK_ERROR_UNKNOWN);
-   if (dst->size < src->snapshot_size)
+
+   VkDeviceSize copy_size = src->snapshot_size;
+   if (info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR) {
+      if (!(src->build_flags &
+            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR))
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      VkResult result =
+         vtvk_acceleration_structure_used_size(device, src, &copy_size);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   if (dst->size < copy_size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    void *dst_data = vtvk_buffer_host_ptr(dst->buffer, dst->offset, dst->size);
    if (!dst_data || !dst->snapshot ||
-       dst->snapshot_size < src->snapshot_size)
+       dst->snapshot_size < copy_size)
       return vk_error(device, VK_ERROR_UNKNOWN);
 
    memset(dst_data, 0, dst->size);
-   memcpy(dst_data, src->snapshot, src->snapshot_size);
+   memcpy(dst_data, src->snapshot, copy_size);
    memset(dst->snapshot, 0, dst->snapshot_size);
-   memcpy(dst->snapshot, src->snapshot, src->snapshot_size);
+   memcpy(dst->snapshot, src->snapshot, copy_size);
    dst->data = dst_data;
    dst->build_flags = src->build_flags;
    dst->built_type = src->built_type;
@@ -1174,10 +1233,54 @@ vtvk_CmdCopyAccelerationStructureKHR(
    struct vtvk_device *device =
       container_of(vk_cmd->base.device, struct vtvk_device, vk);
 
-   VkResult result = vtvk_clone_acceleration_structure(device, pInfo);
+   VkResult result = vtvk_copy_acceleration_structure(device, pInfo);
    if (result != VK_SUCCESS) {
-      mesa_loge("ventus-vk: AS clone failed (%d)", result);
+      mesa_loge("ventus-vk: AS copy failed (%d)", result);
       vk_command_buffer_set_error(vk_cmd, result);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdWriteAccelerationStructuresPropertiesKHR(
+   VkCommandBuffer commandBuffer,
+   uint32_t accelerationStructureCount,
+   const VkAccelerationStructureKHR *pAccelerationStructures,
+   VkQueryType queryType,
+   VkQueryPool queryPool,
+   uint32_t firstQuery)
+{
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   VK_FROM_HANDLE(vtvk_query_pool, pool, queryPool);
+   struct vtvk_device *device =
+      container_of(vk_cmd->base.device, struct vtvk_device, vk);
+
+   if (!pool || pool->vk.query_type != queryType ||
+       firstQuery > pool->vk.query_count ||
+       accelerationStructureCount > pool->vk.query_count - firstQuery) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_UNKNOWN);
+      return;
+   }
+
+   std::vector<uint64_t> values(accelerationStructureCount);
+   for (uint32_t i = 0; i < accelerationStructureCount; i++) {
+      if (pool->queries[firstQuery + i].available) {
+         vk_command_buffer_set_error(vk_cmd, VK_ERROR_UNKNOWN);
+         return;
+      }
+      const struct vtvk_acceleration_structure *as =
+         (const struct vtvk_acceleration_structure *)
+            vtvk_handle_to_ptr((uint64_t)pAccelerationStructures[i]);
+      VkResult result = vtvk_acceleration_structure_property(
+         device, as, queryType, &values[i]);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(vk_cmd, result);
+         return;
+      }
+   }
+
+   for (uint32_t i = 0; i < accelerationStructureCount; i++) {
+      pool->queries[firstQuery + i].value = values[i];
+      pool->queries[firstQuery + i].available = true;
    }
 }
 

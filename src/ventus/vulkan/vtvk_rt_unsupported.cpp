@@ -78,23 +78,6 @@ vtvk_CmdCopyMemoryToAccelerationStructureKHR(
 }
 
 VKAPI_ATTR void VKAPI_CALL
-vtvk_CmdWriteAccelerationStructuresPropertiesKHR(
-   VkCommandBuffer commandBuffer,
-   uint32_t accelerationStructureCount,
-   const VkAccelerationStructureKHR *pAccelerationStructures,
-   VkQueryType queryType,
-   VkQueryPool queryPool,
-   uint32_t firstQuery)
-{
-   (void)commandBuffer;
-   (void)accelerationStructureCount;
-   (void)pAccelerationStructures;
-   (void)queryType;
-   (void)queryPool;
-   (void)firstQuery;
-}
-
-VKAPI_ATTR void VKAPI_CALL
 vtvk_GetDeviceAccelerationStructureCompatibilityKHR(
    VkDevice device,
    const VkAccelerationStructureVersionInfoKHR *pVersionInfo,

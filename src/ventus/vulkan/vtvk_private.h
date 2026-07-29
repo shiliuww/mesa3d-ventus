@@ -10,6 +10,7 @@
 #include "vk_instance.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
+#include "vk_query_pool.h"
 #include "vk_queue.h"
 #include "vtvk_rt_profile.h"
 
@@ -84,6 +85,16 @@ struct vtvk_acceleration_structure {
    bool built;
 };
 
+struct vtvk_query {
+   uint64_t value;
+   bool available;
+};
+
+struct vtvk_query_pool {
+   struct vk_query_pool vk;
+   struct vtvk_query queries[0];
+};
+
 struct vtvk_descriptor_binding_info {
    bool valid;
    VkDescriptorType type;
@@ -98,6 +109,8 @@ VK_DEFINE_HANDLE_CASTS(vtvk_instance, vk.base, VkInstance,
 VK_DEFINE_HANDLE_CASTS(vtvk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 VK_DEFINE_HANDLE_CASTS(vtvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(vtvk_query_pool, vk.base, VkQueryPool,
+                               VK_OBJECT_TYPE_QUERY_POOL)
 
 VkResult vtvk_enumerate_physical_devices(struct vk_instance *vk_instance);
 void vtvk_destroy_physical_device(struct vk_physical_device *vk_pdev);
