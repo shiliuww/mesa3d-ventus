@@ -516,7 +516,6 @@ vtvk_append_triangle_geometry(
    const VkAccelerationStructureGeometryTrianglesDataKHR *triangles =
       &geom->geometry.triangles;
    if (triangles->vertexFormat != VK_FORMAT_R32G32B32_SFLOAT ||
-       triangles->indexType != VK_INDEX_TYPE_UINT32 ||
        triangles->vertexStride < sizeof(float) * 3)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
@@ -524,40 +523,81 @@ vtvk_append_triangle_geometry(
    if (!primitive_count)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
+   uint32_t index_size;
+   switch (triangles->indexType) {
+   case VK_INDEX_TYPE_UINT16:
+      index_size = sizeof(uint16_t);
+      break;
+   case VK_INDEX_TYPE_UINT32:
+      index_size = sizeof(uint32_t);
+      break;
+   case VK_INDEX_TYPE_NONE_KHR:
+      index_size = 0;
+      break;
+   default:
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
+   const bool indexed = index_size != 0;
    VkDeviceAddress index_addr = triangles->indexData.deviceAddress;
-   if (range) {
+   const uint8_t *index_base = nullptr;
+   if (indexed) {
       if (UINT64_MAX - index_addr < range->primitiveOffset)
          return vk_error(device, VK_ERROR_UNKNOWN);
       index_addr += range->primitiveOffset;
+      const uint64_t index_count = uint64_t(primitive_count) * 3;
+      if (index_count > SIZE_MAX / index_size)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      index_base = (const uint8_t *)vtvk_buffer_host_ptr_from_addr(
+         index_addr, size_t(index_count) * index_size);
+      if (!index_base)
+         return vk_error(device, VK_ERROR_UNKNOWN);
    }
-   const uint64_t index_count = uint64_t(primitive_count) * 3;
-   if (index_count > SIZE_MAX / sizeof(uint32_t))
-      return vk_error(device, VK_ERROR_UNKNOWN);
-   uint32_t *index_base = (uint32_t *)vtvk_buffer_host_ptr_from_addr(
-      index_addr, size_t(index_count) * sizeof(uint32_t));
-   if (!index_base)
-      return vk_error(device, VK_ERROR_UNKNOWN);
 
-   uint32_t first_vertex = range ? range->firstVertex : 0;
-   uint32_t max_index = 0;
-   for (uint32_t p = 0; p < primitive_count; p++) {
-      max_index = std::max(max_index, index_base[p * 3 + 0]);
-      max_index = std::max(max_index, index_base[p * 3 + 1]);
-      max_index = std::max(max_index, index_base[p * 3 + 2]);
+   const auto load_index = [&](uint64_t index) {
+      uint32_t value = 0;
+      if (index_size == sizeof(uint16_t)) {
+         uint16_t value16;
+         memcpy(&value16, index_base + index * index_size, sizeof(value16));
+         value = value16;
+      } else {
+         memcpy(&value, index_base + index * index_size, sizeof(value));
+      }
+      return value;
+   };
+
+   const uint32_t first_vertex = range->firstVertex;
+   uint32_t max_referenced_vertex;
+   if (indexed) {
+      uint32_t max_index = 0;
+      for (uint64_t i = 0; i < uint64_t(primitive_count) * 3; i++)
+         max_index = std::max(max_index, load_index(i));
+      if (first_vertex > UINT32_MAX - max_index)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      max_referenced_vertex = max_index + first_vertex;
+   } else {
+      const uint64_t last_vertex =
+         uint64_t(first_vertex) + uint64_t(primitive_count) * 3 - 1;
+      if (last_vertex > UINT32_MAX)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      max_referenced_vertex = uint32_t(last_vertex);
    }
-   if (first_vertex > UINT32_MAX - max_index)
-      return vk_error(device, VK_ERROR_UNKNOWN);
-   uint32_t max_referenced_vertex = max_index + first_vertex;
    if (max_referenced_vertex > triangles->maxVertex)
       return vk_error(device, VK_ERROR_UNKNOWN);
 
+   VkDeviceAddress vertex_addr = triangles->vertexData.deviceAddress;
+   if (!indexed) {
+      if (UINT64_MAX - vertex_addr < range->primitiveOffset)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      vertex_addr += range->primitiveOffset;
+   }
    const uint64_t vertex_bytes =
       uint64_t(triangles->vertexStride) *
       (uint64_t(max_referenced_vertex) + 1);
    if (vertex_bytes > SIZE_MAX)
       return vk_error(device, VK_ERROR_UNKNOWN);
    uint8_t *vertex_base = (uint8_t *)vtvk_buffer_host_ptr_from_addr(
-      triangles->vertexData.deviceAddress, size_t(vertex_bytes));
+      vertex_addr, size_t(vertex_bytes));
    if (!vertex_base)
       return vk_error(device, VK_ERROR_UNKNOWN);
 
@@ -578,9 +618,17 @@ vtvk_append_triangle_geometry(
    }
 
    for (uint32_t p = 0; p < primitive_count; p++) {
-      uint32_t i0 = index_base[p * 3 + 0] + first_vertex;
-      uint32_t i1 = index_base[p * 3 + 1] + first_vertex;
-      uint32_t i2 = index_base[p * 3 + 2] + first_vertex;
+      const uint64_t primitive_index = uint64_t(p) * 3;
+      uint32_t i0, i1, i2;
+      if (indexed) {
+         i0 = load_index(primitive_index + 0) + first_vertex;
+         i1 = load_index(primitive_index + 1) + first_vertex;
+         i2 = load_index(primitive_index + 2) + first_vertex;
+      } else {
+         i0 = uint32_t(first_vertex + primitive_index + 0);
+         i1 = uint32_t(first_vertex + primitive_index + 1);
+         i2 = uint32_t(first_vertex + primitive_index + 2);
+      }
       float v0[3], v1[3], v2[3];
       vtvk_read_vec3(vertex_base, triangles->vertexStride, i0, v0);
       vtvk_read_vec3(vertex_base, triangles->vertexStride, i1, v1);
@@ -606,10 +654,13 @@ vtvk_append_triangle_geometry(
          return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       uint32_t offset =
          vtvk_next_node_offset(cursor, VENTUS_AS_TRIANGLE_NODE_SIZE);
+      const VkDeviceAddress primitive_addr =
+         indexed ?
+         index_addr + primitive_index * index_size :
+         vertex_addr + uint64_t(i0) * triangles->vertexStride;
       vtvk_write_triangle_leaf(dst, offset, v0, v1, v2, p, geometry_id, 0,
                                geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
-                               index_addr + (VkDeviceAddress)p * 3 *
-                                  sizeof(uint32_t));
+                               primitive_addr);
       (*node_count)++;
       leaves->push_back({
          ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_TRIANGLE),
