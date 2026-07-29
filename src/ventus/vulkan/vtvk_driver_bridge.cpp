@@ -46,6 +46,18 @@ static_assert(offsetof(struct vtvk_rt_dispatch_args, global_queue_base) ==
 static_assert(offsetof(struct vtvk_rt_dispatch_args, global_cps_arena_addr) ==
               VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_ARENA_ADDR,
               "RT global CPS arena argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_completion_base) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_BASE,
+              "RT global completion base argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_completion_capacity) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_CAPACITY,
+              "RT global completion capacity argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_ray_ref_list_base) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_LIST_BASE,
+              "RT global ray-ref list argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_completion_field_stride) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE,
+              "RT global completion stride argument ABI mismatch");
 static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
               VT_NIR_RT_DISPATCH_ARG_SIZE,
               "RT dispatch argument ABI size mismatch");
@@ -68,6 +80,29 @@ struct vtvk_driver_kernel_metadata {
    uint64_t pdsResidentWgCount;
 };
 
+/* Keep this private mirror byte-for-byte compatible with the optional Spike
+ * driver C ABI.  It is resolved only for the global-wavefront profile. */
+struct vtvk_driver_rt_global_consume_info {
+   uint64_t queue_base;
+   uint64_t completion_base;
+   uint64_t hit_attribute_base;
+   uint32_t capacity_rays;
+   uint32_t hit_attribute_stride_bytes;
+   uint32_t max_batch_rays;
+};
+
+struct vtvk_driver_rt_resume_request {
+   uint64_t payload_address;
+   uint32_t ray_ref;
+   uint32_t completed_stage;
+   uint32_t cps_frame;
+   uint32_t cps_stack_size;
+   uint32_t continuation_id;
+   uint32_t launch_id_x;
+   uint32_t launch_id_y;
+   uint32_t launch_id_z;
+};
+
 struct vtvk_driver_api {
    void *lib;
    void *device;
@@ -88,6 +123,12 @@ struct vtvk_driver_api {
                    struct vtvk_driver_kernel_metadata *metadata,
                    uint64_t task_id);
    int (*vt_ready_wait)(void *device, uint64_t timeout_ms);
+   int (*vt_rt_consume_global)(
+      void *device, const struct vtvk_driver_rt_global_consume_info *info,
+      uint32_t *out_request_count);
+   int (*vt_rt_get_resume_requests)(
+      void *device, struct vtvk_driver_rt_resume_request *requests,
+      uint32_t capacity, uint32_t *out_request_count);
 };
 
 struct vtvk_driver_upload {
@@ -106,6 +147,21 @@ vtvk_bridge_env_enabled(const char *name)
           strcmp(value, "FALSE") != 0 &&
           strcmp(value, "off") != 0 &&
           strcmp(value, "OFF") != 0;
+}
+
+static bool
+vtvk_bridge_env_u32(const char *name, uint32_t *out_value)
+{
+   const char *value = getenv(name);
+   if (!value || !value[0] || !out_value)
+      return false;
+
+   char *end = NULL;
+   const unsigned long parsed = strtoul(value, &end, 0);
+   if (*end || parsed > UINT32_MAX)
+      return false;
+   *out_value = (uint32_t)parsed;
+   return true;
 }
 
 static uint32_t
@@ -276,6 +332,35 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
       return false;
    return !src ||
           api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
+}
+
+static bool
+vtvk_global_callback_kernel(const struct vtvk_driver_trace_rays_info *info,
+                            uint32_t stage, const char **out_path,
+                            uint64_t *out_entry)
+{
+   uint32_t found = UINT32_MAX;
+   for (uint32_t i = 0; i < info->callback_kernel_count; i++) {
+      if (info->callback_kernel_stages[i] != stage)
+         continue;
+      if (found != UINT32_MAX) {
+         mesa_loge("ventus-vk: global RT requires one callback kernel per "
+                   "terminal stage; multiple SBT groups are not scheduled yet");
+         return false;
+      }
+      found = i;
+   }
+   if (found == UINT32_MAX || !info->callback_kernel_paths[found]) {
+      mesa_loge("ventus-vk: global RT has no emitted terminal callback kernel "
+                "for stage %u", stage);
+      return false;
+   }
+   *out_path = info->callback_kernel_paths[found];
+   *out_entry = info->callback_kernel_entries[found];
+   if (vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_CALLBACK_DISPATCH"))
+      mesa_logi("ventus-vk: global RT callback stage=%u index=%u entry=0x%" PRIx64
+                " path=%s", stage, found, *out_entry, *out_path);
+   return true;
 }
 
 static bool
@@ -621,6 +706,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t mailbox_dev_addr = 0;
    uint64_t global_queue_dev_addr = 0;
    uint64_t global_cps_dev_addr = 0;
+   uint64_t global_completion_dev_addr = 0;
+   uint64_t global_hit_attribute_dev_addr = 0;
    uint32_t image_width = info->image_extent.width ? info->image_extent.width : info->width;
    uint32_t image_height = info->image_extent.height ? info->image_extent.height : info->height;
    uint32_t image_depth = info->image_extent.depth ? info->image_extent.depth : 1;
@@ -651,12 +738,27 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                        (size_t)VENTUS_KNL32_MAX_SIZE, 0);
    uint64_t kernel_entry = 0;
    uint32_t work_dim = 0;
-   const uint64_t mailbox_stride = 128;
+   static_assert(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES <= UINT32_MAX,
+                 "RT mailbox stride must fit the dispatch ABI");
+   static_assert(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES % sizeof(uint32_t) == 0,
+                 "RT mailbox fields require a u32-aligned stride");
+   /* This is an array of wire records, not a field-major queue plane.  Every
+    * field is a u32, so use the exact ABI size (140 B); the old 128-B stride
+    * aliased the next record's header. */
+   const uint64_t mailbox_stride = VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES;
    uint64_t mailbox_count = 0;
    uint32_t global_queue_capacity = 0;
    struct vt_rt_global_queue_layout global_queue_layout = {};
+   struct vt_rt_global_completion_layout global_completion_layout = {};
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
+
+   if (wavefront_global &&
+       (!vtvk_driver_resolve(driver.lib, "vt_rt_consume_global",
+                             (void **)&driver.vt_rt_consume_global) ||
+        !vtvk_driver_resolve(driver.lib, "vt_rt_get_resume_requests",
+                             (void **)&driver.vt_rt_get_resume_requests)))
+      goto out;
 
    if (info->descriptor_count) {
       uint32_t slots = vtvk_driver_descriptor_table_slots(info);
@@ -855,7 +957,10 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          goto out;
       }
       global_queue_layout = vt_nir_rt_global_queue_layout(global_queue_capacity);
-      if (!global_queue_layout.total_size_bytes) {
+      global_completion_layout =
+         vt_nir_rt_global_completion_layout(global_queue_capacity);
+      if (!global_queue_layout.total_size_bytes ||
+          !global_completion_layout.total_size_bytes) {
          mesa_loge("ventus-vk: wavefront queue layout exceeds the ABI limit");
          goto out;
       }
@@ -879,6 +984,33 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           global_queue.size()))
          goto out;
 
+      std::vector<uint8_t> global_completion(
+         global_completion_layout.total_size_bytes, 0);
+      if (!vtvk_driver_alloc_copy(&driver, global_completion.data(),
+                                  global_completion.size(),
+                                  &global_completion_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global completion plane");
+         goto out;
+      }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range("global completion plane",
+                                          global_completion_dev_addr,
+                                          global_completion.size()))
+         goto out;
+
+      const uint64_t global_hit_attribute_size =
+         (uint64_t)global_queue_capacity * 2 * sizeof(uint32_t);
+      if (!vtvk_driver_alloc_copy(&driver, NULL, global_hit_attribute_size,
+                                  &global_hit_attribute_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global hit attributes");
+         goto out;
+      }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range("global hit attributes",
+                                          global_hit_attribute_dev_addr,
+                                          global_hit_attribute_size))
+         goto out;
+
       const uint64_t global_cps_size =
          (uint64_t)info->continuation_frame_size * global_queue_capacity;
       if (global_cps_size &&
@@ -897,6 +1029,15 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       args.global_cps_arena_addr = global_cps_dev_addr;
       args.global_cps_frame_stride = info->continuation_frame_size;
       args.max_ray_recursion_depth = info->max_ray_recursion_depth;
+      args.global_completion_base = global_completion_dev_addr;
+      args.global_completion_capacity = global_queue_capacity;
+      args.global_completion_generation = generation;
+      if (global_completion_layout.field_stride_bytes > UINT32_MAX) {
+         mesa_loge("ventus-vk: global completion field stride exceeds u32 ABI");
+         goto out;
+      }
+      args.global_completion_field_stride =
+         (uint32_t)global_completion_layout.field_stride_bytes;
 
       if (wavefront_global &&
           !vt_nir_rt_submission_mailbox_capacity(
@@ -1009,6 +1150,367 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
        driver.vt_ready_wait(driver.device, 60 * 60 * 1000) != 0) {
       mesa_loge("ventus-vk: driver bridge execution failed");
       goto out;
+   }
+
+   if (wavefront_global) {
+      if (vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_GLOBAL")) {
+         uint32_t queue_header[VT_RT_GLOBAL_QUEUE_HEADER_WORD_COUNT] = {};
+         if (driver.vt_copy_from_dev(driver.device, global_queue_dev_addr,
+                                     queue_header, sizeof(queue_header),
+                                     0, 0) != 0) {
+            mesa_loge("ventus-vk: failed to inspect global RT queue header");
+            goto out;
+         }
+         mesa_logi("ventus-vk: global RT queue capacity=%u tail=%u head=%u "
+                   "overflow=%u generation=%u",
+                   queue_header[VT_RT_GLOBAL_QUEUE_CAPACITY_RAYS],
+                   queue_header[VT_RT_GLOBAL_QUEUE_RESERVE_TAIL],
+                   queue_header[VT_RT_GLOBAL_QUEUE_CONSUME_HEAD],
+                   queue_header[VT_RT_GLOBAL_QUEUE_OVERFLOW_FLAG],
+                   queue_header[VT_RT_GLOBAL_QUEUE_GENERATION]);
+      }
+      const struct vtvk_driver_rt_global_consume_info consume = {
+         .queue_base = global_queue_dev_addr,
+         .completion_base = global_completion_dev_addr,
+         .hit_attribute_base = global_hit_attribute_dev_addr,
+         .capacity_rays = global_queue_capacity,
+         .hit_attribute_stride_bytes = 2 * sizeof(uint32_t),
+         .max_batch_rays = vtvk_rt_lanes_per_warp,
+      };
+      auto dispatch_compact = [&](const char *path, uint64_t entry,
+                                  const std::vector<uint32_t> &ray_refs,
+                                  const char *name,
+                                  uint32_t dispatch_generation) -> bool {
+         if (ray_refs.empty())
+            return true;
+
+         uint64_t list_dev_addr = 0;
+         const uint64_t list_size = ray_refs.size() * sizeof(ray_refs[0]);
+         if (!vtvk_driver_alloc_copy(&driver, ray_refs.data(), list_size,
+                                     &list_dev_addr) ||
+             (!rv64 && !vtvk_bridge_require_rv32_range(
+                         "global RT ray-ref list", list_dev_addr, list_size)))
+            return false;
+
+         args.global_ray_ref_list_base = list_dev_addr;
+         args.global_ray_ref_count = ray_refs.size();
+         args.global_ray_ref_generation = dispatch_generation;
+         if (driver.vt_copy_to_dev(driver.device, args_dev_addr, &args,
+                                   sizeof(args), 0, 0) != 0)
+            return false;
+
+         if (rv64) {
+            memcpy(metadata.data() + VENTUS_KNL64_ENTRY, &entry, sizeof(entry));
+            memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_X,
+                   &args.global_ray_ref_count, sizeof(args.global_ray_ref_count));
+            const uint32_t one = 1;
+            memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Y, &one, sizeof(one));
+            memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Z, &one, sizeof(one));
+         } else {
+            uint32_t entry32 = 0;
+            if (!vtvk_bridge_checked_u32("global RT kernel entry", entry,
+                                         &entry32))
+               return false;
+            memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
+            memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_X,
+                   &args.global_ray_ref_count, sizeof(args.global_ray_ref_count));
+            const uint32_t one = 1;
+            memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Y, &one, sizeof(one));
+            memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Z, &one, sizeof(one));
+         }
+         if (driver.vt_copy_to_dev(driver.device, metadata_dev_addr, metadata.data(),
+                                   metadata.size(), 0, 0) != 0 ||
+             driver.vt_upload_kernel_file(driver.device, path, 0) != 0)
+            return false;
+
+         kernel.kernel_size[0] =
+            DIV_ROUND_UP((uint64_t)args.global_ray_ref_count,
+                         vtvk_rt_lanes_per_warp);
+         kernel.kernel_size[1] = 1;
+         kernel.kernel_size[2] = 1;
+         kernel.num_thread_global[0] = args.global_ray_ref_count;
+         kernel.num_thread_global[1] = 1;
+         kernel.num_thread_global[2] = 1;
+         kernel.kernel_name = name;
+         return driver.vt_start(driver.device, &kernel, 0) == 0 &&
+                driver.vt_ready_wait(driver.device, 60 * 60 * 1000) == 0;
+      };
+
+      /* This is deliberately a bridge-side probe: callback kernels have
+       * completed here, while resume kernels have not yet touched the CPS
+       * frame.  It makes a payload handoff failure distinguishable from a
+       * later image-store failure without adding an RT ABI debug field. */
+      const bool debug_payload_rgb =
+         vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_PAYLOAD_RGB");
+      uint32_t debug_payload_ray_ref = 0;
+      const bool debug_payload_ray_ref_enabled =
+         vtvk_bridge_env_u32("VENTUS_VK_RT_DEBUG_PAYLOAD_RAY_REF",
+                             &debug_payload_ray_ref);
+      uint32_t debug_payload_launch_x = 0;
+      uint32_t debug_payload_launch_y = 0;
+      const bool debug_payload_launch_enabled =
+         vtvk_bridge_env_u32("VENTUS_VK_RT_DEBUG_PAYLOAD_LAUNCH_X",
+                             &debug_payload_launch_x) &&
+         vtvk_bridge_env_u32("VENTUS_VK_RT_DEBUG_PAYLOAD_LAUNCH_Y",
+                             &debug_payload_launch_y);
+      const bool debug_trace_inputs =
+         vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_TRACE_INPUTS");
+      const auto log_trace_input = [&](uint32_t ray_ref) {
+         uint32_t words[7] = {};
+         const uint32_t fields[] = {
+            VT_RT_GLOBAL_TRACE_ORIGIN_X, VT_RT_GLOBAL_TRACE_ORIGIN_Y,
+            VT_RT_GLOBAL_TRACE_ORIGIN_Z, VT_RT_GLOBAL_TRACE_DIRECTION_X,
+            VT_RT_GLOBAL_TRACE_DIRECTION_Y, VT_RT_GLOBAL_TRACE_DIRECTION_Z,
+            VT_RT_GLOBAL_TRACE_TMAX,
+         };
+         for (uint32_t i = 0; i < ARRAY_SIZE(fields); ++i) {
+            const uint64_t address = global_queue_dev_addr +
+               VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
+               (uint64_t)fields[i] * global_queue_layout.field_stride_bytes +
+               (uint64_t)ray_ref * sizeof(uint32_t);
+            if (driver.vt_copy_from_dev(driver.device, address, &words[i],
+                                        sizeof(words[i]), 0, 0) != 0) {
+               mesa_loge("ventus-vk: global RT trace-input probe read failed "
+                         "ray_ref=%u field=%u", ray_ref, fields[i]);
+               return;
+            }
+         }
+         float values[7];
+         memcpy(values, words, sizeof(values));
+         mesa_logi("ventus-vk: global RT trace-input ray_ref=%u "
+                   "origin=(%.6f,%.6f,%.6f) direction=(%.6f,%.6f,%.6f) "
+                   "tmax=%.6f",
+                   ray_ref, values[0], values[1], values[2], values[3],
+                   values[4], values[5], values[6]);
+      };
+      const auto log_payload_rgb =
+         [&](const std::vector<struct vtvk_driver_rt_resume_request> &requests,
+             uint32_t phase) {
+            if (!debug_payload_rgb)
+               return;
+            uint32_t stage_samples[2] = {};
+            for (uint32_t i = 0; i < requests.size(); ++i) {
+               const auto &request = requests[i];
+               if (debug_payload_ray_ref_enabled &&
+                   request.ray_ref != debug_payload_ray_ref)
+                  continue;
+               if (debug_payload_launch_enabled &&
+                   (request.launch_id_x != debug_payload_launch_x ||
+                    request.launch_id_y != debug_payload_launch_y))
+                  continue;
+               if (request.completed_stage > 1 ||
+                   stage_samples[request.completed_stage]++ >= 8)
+                  continue;
+               /* The reflections payload is eight words (color, distance,
+                * normal, reflector).  Keep the complete small payload in
+                * this opt-in probe: RGB alone cannot distinguish a callback
+                * that wrote a black material from one that did not publish
+                * its hit distance/normal at all. */
+               uint32_t bits[8] = {};
+               if (driver.vt_copy_from_dev(driver.device, request.payload_address,
+                                           bits, sizeof(bits), 0, 0) != 0) {
+                  mesa_loge("ventus-vk: global RT payload probe read failed "
+                            "phase=%u ray_ref=%u", phase, request.ray_ref);
+                  continue;
+               }
+               float values[8];
+               memcpy(values, bits, sizeof(values));
+               uint32_t primitive_id = 0;
+               float hit_t = -1.0f;
+               uint64_t hit_attribute_address = 0;
+               float hit_attributes[2] = {};
+               if (request.completed_stage == 1) {
+                  const uint32_t fields[] = {
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_HIT_T,
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_PRIMITIVE_ID,
+                     VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO,
+                     VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_HI,
+                  };
+                  uint32_t hit_words[4] = {};
+                  for (uint32_t field = 0; field < ARRAY_SIZE(fields); ++field) {
+                     const uint64_t address = global_completion_dev_addr +
+                        VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
+                        (uint64_t)fields[field] *
+                           global_completion_layout.field_stride_bytes +
+                        (uint64_t)request.ray_ref * sizeof(uint32_t);
+                     if (driver.vt_copy_from_dev(driver.device, address,
+                                                 &hit_words[field],
+                                                 sizeof(hit_words[field]), 0, 0) != 0)
+                        continue;
+                  }
+                  memcpy(&hit_t, &hit_words[0], sizeof(hit_t));
+                  primitive_id = hit_words[1];
+                  hit_attribute_address = (uint64_t)hit_words[2] |
+                                          ((uint64_t)hit_words[3] << 32);
+                  if (hit_attribute_address &&
+                      driver.vt_copy_from_dev(driver.device,
+                                              hit_attribute_address,
+                                              hit_attributes,
+                                              sizeof(hit_attributes), 0, 0) != 0) {
+                     mesa_loge("ventus-vk: global RT hit-attribute probe read failed "
+                               "ray_ref=%u", request.ray_ref);
+                  }
+               }
+               mesa_logi("ventus-vk: global RT payload post-callback "
+                         "phase=%u ray_ref=%u stage=%u addr=%" PRIx64
+                         " payload=(%.6f,%.6f,%.6f; d=%.6f; n=%.6f,%.6f,%.6f; r=%.6f) "
+                         "bits=(%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x) "
+                         "frame=%u stack=%u continuation=%u launch=(%u,%u,%u)",
+                         phase, request.ray_ref, request.completed_stage,
+                         request.payload_address, values[0], values[1], values[2],
+                         values[3], values[4], values[5], values[6], values[7],
+                         bits[0], bits[1], bits[2], bits[3], bits[4], bits[5],
+                         bits[6], bits[7], request.cps_frame,
+                         request.cps_stack_size, request.continuation_id,
+                         request.launch_id_x, request.launch_id_y,
+                         request.launch_id_z);
+               if (request.completed_stage == 1)
+                  mesa_logi("ventus-vk: global RT committed hit ray_ref=%u "
+                            "primitive=%u t=%.6f attr_addr=%" PRIx64
+                            " attr=(%.6f,%.6f)", request.ray_ref,
+                            primitive_id, hit_t, hit_attribute_address,
+                            hit_attributes[0], hit_attributes[1]);
+            }
+         };
+
+      bool complete = false;
+      const uint32_t max_phases = MAX2(info->max_ray_recursion_depth, 1u);
+      for (uint32_t phase = 0; phase <= max_phases; phase++) {
+         uint32_t request_count = 0;
+         if (driver.vt_rt_consume_global(driver.device, &consume,
+                                         &request_count) != 0) {
+            mesa_loge("ventus-vk: global RT queue consumer failed");
+            goto out;
+         }
+         if (!request_count) {
+            if (phase == 0) {
+               mesa_loge("ventus-vk: global RT producer published no traversal "
+                         "requests; refusing to copy an unwritten image");
+               goto out;
+            }
+            complete = true;
+            break;
+         }
+
+         std::vector<struct vtvk_driver_rt_resume_request> requests(request_count);
+         uint32_t copied_count = 0;
+         if (driver.vt_rt_get_resume_requests(
+                driver.device, requests.data(), request_count, &copied_count) != 0 ||
+             copied_count != request_count) {
+            mesa_loge("ventus-vk: global RT queue consumer request export failed");
+            goto out;
+         }
+         if (debug_trace_inputs && phase == 0) {
+            for (const auto &request : requests)
+               if (request.ray_ref < 16)
+                  log_trace_input(request.ray_ref);
+         }
+         std::vector<uint32_t> miss_refs;
+         std::vector<uint32_t> hit_refs;
+         std::vector<std::vector<uint32_t>> miss_resume_refs(
+            info->resume_kernel_count);
+         std::vector<std::vector<uint32_t>> hit_resume_refs(
+            info->resume_kernel_count);
+         for (const auto &request : requests) {
+            if (request.completed_stage == 0) {
+               miss_refs.push_back(request.ray_ref);
+               if (request.continuation_id < miss_resume_refs.size())
+                  miss_resume_refs[request.continuation_id].push_back(
+                     request.ray_ref);
+            } else if (request.completed_stage == 1) {
+               hit_refs.push_back(request.ray_ref);
+               if (request.continuation_id < hit_resume_refs.size())
+                  hit_resume_refs[request.continuation_id].push_back(
+                     request.ray_ref);
+            } else {
+               mesa_loge("ventus-vk: global RT produced unsupported candidate stage %u",
+                         request.completed_stage);
+               goto out;
+            }
+            if (request.continuation_id >= miss_resume_refs.size()) {
+               mesa_loge("ventus-vk: global RT continuation %u has no resume ELF",
+                         request.continuation_id);
+               goto out;
+            }
+         }
+
+         const char *callback_path = NULL;
+         uint64_t callback_entry = 0;
+         if (!miss_refs.empty()) {
+            if (!vtvk_global_callback_kernel(info, MESA_SHADER_MISS,
+                                             &callback_path, &callback_entry) ||
+                !dispatch_compact(callback_path, callback_entry, miss_refs,
+                                  "ventus_vk_miss", phase + 1)) {
+               mesa_loge("ventus-vk: global RT miss callback dispatch failed");
+               goto out;
+            }
+         }
+         if (!hit_refs.empty()) {
+            /* Poison the complete hit payload before the callback.  This
+             * opt-in diagnostic separates "callback wrote zero" from
+             * "callback never reached its global stores" without changing
+             * normal global-wavefront execution. */
+            if (debug_payload_rgb) {
+               const uint32_t poison[8] = {
+                  0x7fc01234u, 0x7fc01235u, 0x7fc01236u, 0x7fc01237u,
+                  0x7fc01238u, 0x7fc01239u, 0x7fc0123au, 0x7fc0123bu,
+               };
+               for (const auto &request : requests) {
+                  if (request.completed_stage != 1)
+                     continue;
+                  if (driver.vt_copy_to_dev(driver.device,
+                                            request.payload_address, poison,
+                                            sizeof(poison), 0, 0) != 0) {
+                     mesa_loge("ventus-vk: global RT hit payload poison failed "
+                               "ray_ref=%u", request.ray_ref);
+                     goto out;
+                  }
+               }
+            }
+            if (!vtvk_global_callback_kernel(info, MESA_SHADER_CLOSEST_HIT,
+                                             &callback_path, &callback_entry) ||
+                !dispatch_compact(callback_path, callback_entry, hit_refs,
+                                  "ventus_vk_closest_hit", phase + 1)) {
+               mesa_loge("ventus-vk: global RT closest-hit callback dispatch failed");
+               goto out;
+            }
+         }
+         log_payload_rgb(requests, phase + 1);
+         /* Completion stage is uniform within each terminal callback.  Keep
+          * it uniform for its resume batch as well: mixing miss and hit
+          * records here immediately re-diverges the raygen post-trace path,
+          * even though those records have no data dependency on one another.
+          */
+         for (uint32_t continuation = 0;
+              continuation < miss_resume_refs.size(); continuation++) {
+            if (!dispatch_compact(info->resume_kernel_paths[continuation],
+                                  info->resume_kernel_entries[continuation],
+                                  miss_resume_refs[continuation],
+                                  "ventus_vk_resume_miss", phase + 1)) {
+               mesa_loge("ventus-vk: global RT miss resume %u dispatch failed",
+                         continuation);
+               goto out;
+            }
+         }
+         for (uint32_t continuation = 0;
+              continuation < hit_resume_refs.size(); continuation++) {
+            if (!dispatch_compact(info->resume_kernel_paths[continuation],
+                                  info->resume_kernel_entries[continuation],
+                                  hit_resume_refs[continuation],
+                                  "ventus_vk_resume_hit",
+                                  phase + 1)) {
+               mesa_loge("ventus-vk: global RT hit resume %u dispatch failed",
+                         continuation);
+               goto out;
+            }
+         }
+      }
+      if (!complete) {
+         mesa_loge("ventus-vk: global RT exceeded recursion-phase dispatch bound");
+         goto out;
+      }
    }
 
    if (driver.vt_copy_from_dev(driver.device, image_dev_addr,

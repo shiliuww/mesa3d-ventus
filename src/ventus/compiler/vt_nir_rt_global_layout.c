@@ -67,3 +67,26 @@ vt_nir_rt_global_queue_layout(uint32_t capacity_rays)
    layout.total_size_bytes = total_size;
    return layout;
 }
+
+struct vt_rt_global_completion_layout
+vt_nir_rt_global_completion_layout(uint32_t capacity_rays)
+{
+   const uint64_t unaligned_stride = (uint64_t)capacity_rays * 4u;
+   const uint64_t field_stride =
+      (unaligned_stride + VT_RT_GLOBAL_ALIGNMENT_BYTES - 1u) &
+      ~(uint64_t)(VT_RT_GLOBAL_ALIGNMENT_BYTES - 1u);
+   if (field_stride > UINT64_MAX / VT_RT_GLOBAL_COMPLETION_FIELD_COUNT)
+      return (struct vt_rt_global_completion_layout){};
+   const uint64_t fields_size =
+      (uint64_t)VT_RT_GLOBAL_COMPLETION_FIELD_COUNT * field_stride;
+   if (VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES > UINT64_MAX - fields_size)
+      return (struct vt_rt_global_completion_layout){};
+
+   return (struct vt_rt_global_completion_layout){
+      .capacity_rays = capacity_rays,
+      .header_size_bytes = VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES,
+      .field_stride_bytes = field_stride,
+      .fields_base_bytes = VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES,
+      .total_size_bytes = VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES + fields_size,
+   };
+}

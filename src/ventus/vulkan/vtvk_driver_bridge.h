@@ -49,6 +49,14 @@ struct vtvk_rt_dispatch_args {
    uint64_t global_cps_arena_addr;
    uint32_t global_cps_frame_stride;
    uint32_t max_ray_recursion_depth;
+   uint64_t global_completion_base;
+   uint32_t global_completion_capacity;
+   uint32_t global_completion_generation;
+   uint64_t global_ray_ref_list_base;
+   uint32_t global_ray_ref_count;
+   uint32_t global_ray_ref_generation;
+   uint32_t global_completion_field_stride;
+   uint32_t reserved_global;
 };
 
 struct vtvk_rt_descriptor_record {
@@ -92,6 +100,14 @@ struct vtvk_driver_trace_rays_info {
    uint32_t max_ray_recursion_depth;
    const char *kernel_path;
    uint64_t kernel_entry;
+   const char *const *resume_kernel_paths;
+   const uint64_t *resume_kernel_entries;
+   uint32_t resume_kernel_count;
+   const char *const *callback_kernel_paths;
+   const uint64_t *callback_kernel_entries;
+   const uint32_t *callback_kernel_groups;
+   const uint32_t *callback_kernel_stages;
+   uint32_t callback_kernel_count;
    const struct vtvk_rt_descriptor_source *descriptors;
    uint32_t descriptor_count;
 };

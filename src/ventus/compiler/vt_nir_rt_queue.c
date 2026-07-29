@@ -69,7 +69,8 @@ void
 vt_nir_rt_store_submission_mailbox(
    nir_builder *b, const struct vt_nir_rt_submission_mailbox_args *mailbox,
    const struct vt_nir_rt_trace_params *params, nir_def *parent_frame,
-   nir_def *phase_generation, nir_def *depth)
+   nir_def *cps_frame, nir_def *continuation_id, nir_def *cps_stack_size,
+   nir_def *launch_id, nir_def *phase_generation, nir_def *depth)
 {
    /* Prepare all record data before publishing the mailbox valid word. */
    nir_def *tlas = params->accel_struct ? nir_u2u64(b, params->accel_struct) :
@@ -108,10 +109,16 @@ vt_nir_rt_store_submission_mailbox(
       store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_PAYLOAD_HI,
                                  nir_imm_int(b, 0));
    }
-   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_CHILD_CPS_FRAME,
-                      NULL);
+   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_CPS_FRAME,
+                      cps_frame);
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_PARENT_FRAME,
                       parent_frame);
+   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_CONTINUATION_ID,
+                      continuation_id);
+   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_CPS_STACK_SIZE,
+                      cps_stack_size);
+   store_vec3_mailbox_fields(b, mailbox, VT_RT_GLOBAL_TRACE_LAUNCH_ID_X,
+                             launch_id);
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_PHASE_GENERATION,
                       phase_generation);
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_DEPTH, depth);

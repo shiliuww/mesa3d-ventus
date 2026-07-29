@@ -23,6 +23,18 @@ if prog_glslang.found()
     depfile : 'vt_rt_flagged_raygen.spv.d',
   )
 
+  vt_rt_cps_loop_raygen_spv = custom_target(
+    'vt_rt_cps_loop_raygen.spv',
+    input : 'vt_rt_cps_loop_raygen.rgen',
+    output : 'vt_rt_cps_loop_raygen.spv',
+    command : [
+      prog_glslang, '-V', '--target-env', 'vulkan1.2',
+      '-o', '@OUTPUT@', '@INPUT@',
+      glslang_quiet, glslang_depfile,
+    ],
+    depfile : 'vt_rt_cps_loop_raygen.spv.d',
+  )
+
   vt_rt_minimal_loop_test = executable(
     'vt_rt_minimal_loop_test',
     [
@@ -92,7 +104,7 @@ if prog_glslang.found()
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
-    args : [vt_rt_minimal_raygen_spv],
+    args : [vt_rt_minimal_raygen_spv, vt_rt_cps_loop_raygen_spv],
     suite : ['ventus'],
   )
 

@@ -24,6 +24,8 @@ vt_nir_lower_rt_cps(nir_shader *shader,
       .localized_loads = true,
    };
 
+   NIR_PASS(_, shader, nir_lower_vars_to_ssa);
+
    if (!nir_lower_shader_calls(shader, &options, &info->resume_shaders,
                                &info->num_resume_shaders, mem_ctx))
       return false;

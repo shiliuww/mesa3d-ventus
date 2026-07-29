@@ -7,3 +7,9 @@
 /build
 .venv/
 *.mda.tar
+
+# Locally generated GitNexus dependency-graph exports.
+/docs/ventus-src-gitnexus-dependency-graph.dot
+/docs/ventus-src-gitnexus-dependency-graph.html
+/docs/ventus-src-gitnexus-dependency-graph.md
+/docs/ventus-src-gitnexus-dependency-graph.svg

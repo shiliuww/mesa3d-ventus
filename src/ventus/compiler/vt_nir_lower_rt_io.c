@@ -191,6 +191,9 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       };
       vt_nir_rt_store_submission_mailbox(b, &mailbox, &params,
                                          nir_imm_int(b, 0),
+                                         nir_imm_int(b, 0),
+                                         nir_imm_int(b, 0),
+                                         nir_imm_int(b, 0), id,
                                          mailbox.generation, nir_imm_int(b, 0));
    }
 

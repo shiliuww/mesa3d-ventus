@@ -23,6 +23,16 @@ vtvk_pipeline_destroy(struct vk_device *device,
 
    delete pipeline->llvm_module;
    free(pipeline->generated_kernel_path);
+   for (uint32_t i = 0; i < pipeline->resume_kernel_count; i++)
+      free(pipeline->resume_kernel_paths[i]);
+   free(pipeline->resume_kernel_paths);
+   free(pipeline->resume_kernel_entries);
+   for (uint32_t i = 0; i < pipeline->callback_kernel_count; i++)
+      free(pipeline->callback_kernel_paths[i]);
+   free(pipeline->callback_kernel_paths);
+   free(pipeline->callback_kernel_entries);
+   free(pipeline->callback_kernel_groups);
+   free(pipeline->callback_kernel_stages);
    ralloc_free(pipeline->nir_mem_ctx);
    vk_free2(&device->alloc, pAllocator, pipeline->shaders);
    vk_free2(&device->alloc, pAllocator, pipeline->group_handles);

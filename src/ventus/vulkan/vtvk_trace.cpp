@@ -133,6 +133,14 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.max_ray_recursion_depth = pipeline->max_ray_recursion_depth;
    trace.kernel_path = pipeline->generated_kernel_path;
    trace.kernel_entry = pipeline->generated_kernel_entry;
+   trace.resume_kernel_paths = pipeline->resume_kernel_paths;
+   trace.resume_kernel_entries = pipeline->resume_kernel_entries;
+   trace.resume_kernel_count = pipeline->resume_kernel_count;
+   trace.callback_kernel_paths = pipeline->callback_kernel_paths;
+   trace.callback_kernel_entries = pipeline->callback_kernel_entries;
+   trace.callback_kernel_groups = pipeline->callback_kernel_groups;
+   trace.callback_kernel_stages = pipeline->callback_kernel_stages;
+   trace.callback_kernel_count = pipeline->callback_kernel_count;
    trace.descriptors = descriptors.data();
    trace.descriptor_count = descriptors.size();
 

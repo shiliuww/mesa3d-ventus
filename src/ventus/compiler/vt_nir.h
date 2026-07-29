@@ -26,6 +26,8 @@ enum vt_rt_execution_model {
    /* PDS-free profile.  Raygen publishes level-zero requests in global
     * mailboxes; RTcore compacts them into, then consumes, the queue. */
    VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER = 2,
+   /* Terminal miss/closest-hit execution over a compact global ray_ref list. */
+   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK = 3,
 };
 
 enum vt_rt_shader_layout {
@@ -77,6 +79,8 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
+   /* PDS-free static RT state: ray, hit records, attributes, and payload. */
+   uint32_t region_size_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -161,8 +165,16 @@ struct vt_nir_rt_config vt_nir_rt_default_config(void);
 
 struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
 
+/* Rebind the common RT regions into a PDS-free global CPS frame. */
+void vt_nir_rt_config_apply_global_cps_layout(
+   struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_abi_layout *layout);
+
 struct vt_rt_global_queue_layout
 vt_nir_rt_global_queue_layout(uint32_t capacity_rays);
+
+struct vt_rt_global_completion_layout
+vt_nir_rt_global_completion_layout(uint32_t capacity_rays);
 
 bool vt_nir_rt_global_queue_capacity(uint32_t width, uint32_t height,
                                      uint32_t max_ray_recursion_depth,
@@ -182,7 +194,8 @@ nir_def *vt_nir_rt_global_queue_field_addr(
 void vt_nir_rt_store_submission_mailbox(
    nir_builder *b, const struct vt_nir_rt_submission_mailbox_args *mailbox,
    const struct vt_nir_rt_trace_params *params, nir_def *parent_frame,
-   nir_def *phase_generation, nir_def *depth);
+   nir_def *cps_frame, nir_def *continuation_id, nir_def *cps_stack_size,
+   nir_def *launch_id, nir_def *phase_generation, nir_def *depth);
 
 /* Computes the global staging address owned by this physical worker lane.
  * worker_id is globally unique across resident SM/warp slots. */
@@ -281,11 +294,20 @@ vt_nir_build_traversal(nir_builder *b,
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
 
-/* PDS-free level-zero producer.  It intentionally supports only terminal
- * primary traceRayEXT calls; worker callback dispatch and CPS resume require
- * the RTcore worker ABI and are lowered separately. */
+/* PDS-free root raygen producer.  Call vt_nir_lower_rt_cps() first, then pass
+ * its resulting initial/resume shaders through these lowerings.  The MVP owns
+ * exactly one root CPS frame per launch invocation; callback/child traces are
+ * deliberately outside this profile. */
 bool vt_nir_lower_rt_global_raygen(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
+
+bool vt_nir_lower_rt_global_resume(nir_shader *shader,
+                                   const struct vt_nir_rt_config *config);
+
+/* Rewrites a terminal miss/closest-hit shader's legacy RT slot accesses to
+ * the global queue/completion planes selected by the compact dispatch list. */
+bool vt_nir_lower_rt_global_callback(nir_shader *shader,
+                                     const struct vt_nir_rt_config *config);
 
 bool vt_nir_lower_rt_abi(nir_shader *shader,
                          const struct vt_nir_rt_config *config);
@@ -388,7 +410,16 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_ARENA_ADDR = 216,
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_FRAME_STRIDE = 224,
    VT_NIR_RT_DISPATCH_ARG_MAX_RAY_RECURSION_DEPTH = 228,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 232,
+   /* Separate ray_ref-indexed completion/result plane. */
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_BASE = 232,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_CAPACITY = 240,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_GENERATION = 244,
+   /* Compact worker/callback/resume dispatch: ray_ref_list[index]. */
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_LIST_BASE = 248,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT = 256,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_GENERATION = 260,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE = 264,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 272,
 };
 
 enum vt_nir_rt_descriptor_record {

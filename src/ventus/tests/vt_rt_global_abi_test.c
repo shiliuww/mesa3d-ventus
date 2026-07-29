@@ -21,9 +21,27 @@ main(void)
 {
    const struct vt_rt_global_queue_layout layout =
       vt_nir_rt_global_queue_layout(65);
+   struct vt_nir_rt_config legacy_config = vt_nir_rt_default_config();
+   struct vt_nir_rt_config global_config = vt_nir_rt_default_config();
+   const struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    uint32_t capacity = 0;
 
-   CHECK(VT_RT_GLOBAL_ABI_VERSION == 6);
+   vt_nir_rt_config_apply_global_cps_layout(&global_config, &abi);
+   CHECK(legacy_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes ==
+         VT_RT_ABI_PDS_BASE_BYTES);
+   CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes == 0);
+   CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes ==
+         VT_RT_ABI_PAYLOAD_BASE_BYTES);
+   CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes ==
+         VT_RT_ABI_REGION_SIZE_BYTES);
+   CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].stride_bytes ==
+         VT_RT_ABI_REGION_SIZE_BYTES);
+
+   CHECK(VT_RT_GLOBAL_ABI_VERSION == 8);
+   CHECK(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES ==
+         VT_RT_SUBMISSION_MAILBOX_HEADER_SIZE_BYTES +
+            VT_RT_GLOBAL_TRACE_FIELD_COUNT * 4u);
+   CHECK(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES == 140);
    CHECK(vt_nir_rt_global_queue_capacity(160, 96, 2, 3, &capacity));
    CHECK(capacity == 160 * 96 * 2 * 3);
    uint64_t mailbox_records = 0;
@@ -57,6 +75,24 @@ main(void)
                                          VT_RT_GLOBAL_TRACE_TMAX, 64) ==
          VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES + VT_RT_GLOBAL_TRACE_TMAX * 384 + 256);
    CHECK(vt_nir_rt_global_queue_layout(UINT32_MAX).total_size_bytes > UINT32_MAX);
+   const struct vt_rt_global_completion_layout completion =
+      vt_nir_rt_global_completion_layout(65);
+   CHECK(completion.header_size_bytes == VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES);
+   CHECK(completion.field_stride_bytes == 384);
+   CHECK(completion.total_size_bytes == VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
+         VT_RT_GLOBAL_COMPLETION_FIELD_COUNT * 384);
+   CHECK(vt_rt_global_completion_field_offset_bytes(
+            &completion, VT_RT_GLOBAL_COMPLETION_CPS_FRAME, 31) ==
+         VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
+         VT_RT_GLOBAL_COMPLETION_CPS_FRAME * 384 + 124);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_BASE == 232);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_CAPACITY == 240);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_GENERATION == 244);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_LIST_BASE == 248);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT == 256);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_GENERATION == 260);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE == 264);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 272);
    CHECK(ventus_rt_device_range_fits_u32(0, 1));
    CHECK(ventus_rt_device_range_fits_u32(0xfffffff0ull, 16));
    CHECK(!ventus_rt_device_range_fits_u32(0xfffffff0ull, 17));

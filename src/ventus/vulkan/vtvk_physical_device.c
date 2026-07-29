@@ -135,7 +135,11 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxDescriptorSetAccelerationStructures = 64;
    p->minAccelerationStructureScratchOffsetAlignment = 128;
    p->shaderGroupHandleSize = 32;
-   p->maxRayRecursionDepth = 1;
+   /* The global wavefront profile carries recursion in CPS frames and drains
+    * one traversal generation at a time.  Advertise the depth the bridge can
+    * actually retain, rather than forcing reflection shaders to a stale
+    * one-trace limit. */
+   p->maxRayRecursionDepth = 4;
    p->maxShaderGroupStride = 4096;
    p->shaderGroupBaseAlignment = 64;
    p->shaderGroupHandleCaptureReplaySize = 32;

@@ -43,6 +43,12 @@ main(void)
    vt_nir_rt_store_submission_mailbox(&b, &mailbox, &params,
                                        nir_imm_int(&b, 8),
                                        nir_imm_int(&b, 9),
+                                       nir_imm_int(&b, 10),
+                                       nir_imm_int(&b, 11),
+                                       nir_vec3(&b, nir_imm_int(&b, 12),
+                                                nir_imm_int(&b, 13),
+                                                nir_imm_int(&b, 14)),
+                                       nir_imm_int(&b, 9),
                                        nir_imm_int(&b, 10));
    nir_validate_shader(b.shader, "vt_rt_global_queue_nir");
 

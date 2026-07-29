@@ -369,8 +369,15 @@ vt_nir_lower_rt_payload(nir_shader *shader,
       build_payload_location_map(shader, payload_modes);
 
    bool progress = false;
+   /* Global CPS frames preserve ray payload state without allocating any PDS.
+    * Raygen payload interfaces may be shader_temp variables without an
+    * explicit Vulkan location, so use their lowered driver location here.
+    * Keep ordinary function temporaries as CPS SSA spills. */
+   const bool global_cps_payload =
+      config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
    progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
-                             payload_base, true, &payload_locations);
+                             payload_base, !global_cps_payload,
+                             &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_function_temp, config,
                              payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,

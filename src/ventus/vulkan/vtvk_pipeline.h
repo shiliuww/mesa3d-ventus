@@ -34,6 +34,22 @@ struct vtvk_pipeline {
    void *nir_mem_ctx;
    nir_shader **shaders;
    uint32_t shader_count;
+   /* NIR CPS split products for the PDS-free root wavefront profile. */
+   nir_shader **resume_shaders;
+   uint32_t resume_shader_count;
+   /* Independently linked executable images for the CPS split products.
+    * They are metadata only until the RTcore completion dispatcher schedules
+    * them; raygen remains generated_kernel_path. */
+   char **resume_kernel_paths;
+   uint64_t *resume_kernel_entries;
+   uint32_t resume_kernel_count;
+   /* Terminal global callback kernels; index is selected by SBT group metadata
+    * after RTcore has published a completion record. */
+   char **callback_kernel_paths;
+   uint64_t *callback_kernel_entries;
+   uint32_t *callback_kernel_groups;
+   uint32_t *callback_kernel_stages;
+   uint32_t callback_kernel_count;
 
    uint8_t *group_handles;
    uint32_t group_count;

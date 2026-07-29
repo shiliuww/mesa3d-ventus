@@ -105,13 +105,19 @@ residual_function_temp(const nir_shader *shader)
 
 class VentusNirToLlvm {
 public:
-   VentusNirToLlvm(LLVMContext &context, Module &module)
+   VentusNirToLlvm(LLVMContext &context, Module &module,
+                   const struct vt_nir_to_llvm_options *options)
       : context(context), module(module), builder(context),
         i1(Type::getInt1Ty(context)), i32(Type::getInt32Ty(context)),
         i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
-        debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
+        debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")),
+        globalRtWavefront(options && options->global_rt_wavefront),
+        globalRtCompactResume(options && options->global_rt_compact_resume),
+        entryPointName(options && options->entry_point_name ?
+                       options->entry_point_name : ""),
+        entryPointIsKernel(options && options->entry_point_is_kernel) {}
 
    bool translate(nir_shader *shader, bool requireSsaFunctionTemps)
    {
@@ -149,9 +155,11 @@ public:
 
       BasicBlock *first = firstBlock(&impl->body);
       if (first) {
-         if (needsRaygenLaunchGuard(shader)) {
+         if (needsRaygenLaunchGuard(shader) || needsCompactResumeGuard(shader)) {
             returnTarget = BasicBlock::Create(context, "raygen.exit", fn);
-            builder.CreateCondBr(raygenLaunchIdInBounds(), first, returnTarget);
+            Value *inBounds = globalRtCompactResume ?
+               compactResumeDispatchInBounds() : raygenLaunchIdInBounds();
+            builder.CreateCondBr(inBounds, first, returnTarget);
          } else {
             builder.CreateBr(first);
          }
@@ -188,6 +196,10 @@ private:
    bool noopRtIntrinsics;
    bool earlyExit;
    bool debugLowering;
+   bool globalRtWavefront;
+   bool globalRtCompactResume;
+   std::string entryPointName;
+   bool entryPointIsKernel;
    bool translationFailed = false;
 
    std::unordered_map<const nir_def *, Value *> defs;
@@ -451,7 +463,21 @@ private:
 
    bool needsRaygenLaunchGuard(nir_shader *shader)
    {
-      return !noopRtIntrinsics && shader->info.stage == MESA_SHADER_RAYGEN;
+      return !noopRtIntrinsics && !globalRtCompactResume &&
+             shader->info.stage == MESA_SHADER_RAYGEN;
+   }
+
+   bool needsCompactResumeGuard(nir_shader *shader)
+   {
+      return !noopRtIntrinsics && globalRtCompactResume &&
+             shader->info.stage == MESA_SHADER_RAYGEN;
+   }
+
+   Value *compactResumeDispatchInBounds()
+   {
+      Value *index = primaryDispatchPixelComponent(0);
+      Value *count = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT);
+      return builder.CreateICmpULT(index, count);
    }
 
    Value *raygenLaunchIdInBounds()
@@ -477,15 +503,21 @@ private:
          raygenLaunchId[i] = primaryDispatchPixelComponent(i);
       }
 
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
+      if (!globalRtWavefront) {
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
+      }
    }
 
    Value *rayLaunchId()
    {
       if (noopRtIntrinsics)
          return ConstantAggregateZero::get(StructType::get(context, {i32, i32, i32}));
+      if (globalRtWavefront)
+         return buildVector(3, i32, [&](unsigned i) {
+            return raygenLaunchIdComponent(i);
+         });
       return buildVector(3, i32, [&](unsigned i) {
          switch (i) {
          case 0:
@@ -619,7 +651,7 @@ private:
       if (!bb)
          return false;
       Function *fn = bb->getParent();
-      return fn && fn->getName() == "main";
+      return fn && (entryPointIsKernel || fn->getName() == "main");
    }
 
    void emitKernelReturn()
@@ -653,12 +685,14 @@ private:
    Function *createEntry(nir_shader *shader)
    {
       std::string name = "vt_" + stage_name(shader->info.stage);
-      if (shader->info.stage == MESA_SHADER_RAYGEN)
+      if (!entryPointName.empty())
+         name = entryPointName;
+      else if (shader->info.stage == MESA_SHADER_RAYGEN)
          name = "main";
       Function *fn =
          Function::Create(FunctionType::get(Type::getVoidTy(context), false),
                           GlobalValue::ExternalLinkage, name, module);
-      if (name == "main")
+      if (entryPointIsKernel || name == "main")
          fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
       return fn;
    }
@@ -1535,6 +1569,11 @@ private:
       case nir_intrinsic_ventus_rt_worker_id: {
          return rtWorkerId();
       }
+      case nir_intrinsic_ventus_rt_dispatch_index: {
+         /* Compact global callback/resume dispatches are one-dimensional;
+          * their physical X invocation selects ray_ref_list[index]. */
+         return primaryDispatchPixelComponent(0);
+      }
       case nir_intrinsic_load_ray_launch_size: {
          return rayLaunchSize();
       }
@@ -1894,22 +1933,53 @@ private:
       return it == blocks.end() ? nullptr : it->second;
    }
 
+   /* A structured NIR loop may have several break blocks, while LLVM uses
+    * one synthetic loop-end block before the following NIR block.  A phi in
+    * that following block therefore receives one LLVM edge, not one edge per
+    * NIR break block. */
+   BasicBlock *phiEdgeBlock(BasicBlock *pred, BasicBlock *phiBlock)
+   {
+      auto *branch = dyn_cast_or_null<BranchInst>(pred->getTerminator());
+      if (!branch || !branch->isUnconditional())
+         return pred;
+
+      BasicBlock *bridge = branch->getSuccessor(0);
+      if (bridge == phiBlock)
+         return pred;
+
+      auto *bridgeBranch =
+         dyn_cast_or_null<BranchInst>(bridge->getTerminator());
+      if (bridgeBranch && bridgeBranch->isUnconditional() &&
+          bridgeBranch->getSuccessor(0) == phiBlock)
+         return bridge;
+
+      return pred;
+   }
+
    void finishPhis()
    {
       for (auto &entry : phis) {
          nir_phi_instr *nirPhi = entry.first;
          PHINode *llvmPhi = entry.second;
 
+         struct Incoming {
+            BasicBlock *pred;
+            BasicBlock *edge;
+            Value *value;
+         };
+         std::vector<Incoming> incomings;
+
          nir_foreach_phi_src(src, nirPhi) {
             BasicBlock *pred = endBlockFor(src->pred);
             if (!pred)
                continue;
+            Instruction *terminator = pred->getTerminator();
             Value *incoming = value(src->src);
 
             /* The conversion belongs to the incoming CFG edge, not to the
              * block where finishPhis() happens to leave the IRBuilder. */
             IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
-            if (Instruction *terminator = pred->getTerminator())
+            if (terminator)
                builder.SetInsertPoint(terminator);
             else
                builder.SetInsertPoint(pred);
@@ -1917,7 +1987,40 @@ private:
             builder.restoreIP(savedInsertPoint);
             if (incoming->getType() != llvmPhi->getType())
                incoming = UndefValue::get(llvmPhi->getType());
-            llvmPhi->addIncoming(incoming, pred);
+            incomings.push_back(
+               {pred, phiEdgeBlock(pred, llvmPhi->getParent()), incoming});
+         }
+
+         for (const Incoming &incoming : incomings) {
+            bool firstOnEdge = true;
+            for (const Incoming &previous : incomings) {
+               if (&previous == &incoming)
+                  break;
+               if (previous.edge == incoming.edge) {
+                  firstOnEdge = false;
+                  break;
+               }
+            }
+            if (!firstOnEdge)
+               continue;
+
+            unsigned edgeCount = 0;
+            for (const Incoming &candidate : incomings)
+               edgeCount += candidate.edge == incoming.edge;
+
+            if (edgeCount == 1) {
+               llvmPhi->addIncoming(incoming.value, incoming.edge);
+               continue;
+            }
+
+            PHINode *edgePhi = PHINode::Create(llvmPhi->getType(), edgeCount,
+                                                "nir.phi.edge",
+                                                incoming.edge->getFirstNonPHIIt());
+            for (const Incoming &candidate : incomings) {
+               if (candidate.edge == incoming.edge)
+                  edgePhi->addIncoming(candidate.value, candidate.pred);
+            }
+            llvmPhi->addIncoming(edgePhi, incoming.edge);
          }
       }
    }
@@ -1936,7 +2039,7 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
    module->setTargetTriple(options && options->target_triple ? options->target_triple : "riscv32-unknown-elf");
    module->setDataLayout(options && options->data_layout ? options->data_layout : "e-m:e-p:32:32-i64:64-n32-S128");
 
-   VentusNirToLlvm translator(context, *module);
+   VentusNirToLlvm translator(context, *module, options);
    for (unsigned i = 0; i < shader_count; ++i) {
       if (shaders[i] && !translator.translate(
                             shaders[i],
