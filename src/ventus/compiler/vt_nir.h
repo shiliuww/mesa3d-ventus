@@ -182,6 +182,7 @@ struct vt_rt_global_completion_layout
 vt_nir_rt_global_completion_layout(uint32_t capacity_rays);
 
 bool vt_nir_rt_global_queue_capacity(uint32_t width, uint32_t height,
+                                     uint32_t depth,
                                      uint32_t max_ray_recursion_depth,
                                      uint32_t children_per_ray,
                                      uint32_t *capacity_rays);

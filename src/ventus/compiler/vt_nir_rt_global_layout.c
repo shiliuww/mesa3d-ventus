@@ -7,17 +7,23 @@
 
 bool
 vt_nir_rt_global_queue_capacity(uint32_t width, uint32_t height,
+                                uint32_t depth,
                                 uint32_t max_ray_recursion_depth,
                                 uint32_t children_per_ray,
                                 uint32_t *capacity_rays)
 {
-   if (!width || !height || !max_ray_recursion_depth || !children_per_ray)
+   if (!width || !height || !depth || !max_ray_recursion_depth ||
+       !children_per_ray || !capacity_rays)
       return false;
 
-   uint64_t capacity = (uint64_t)width * height;
-   capacity *= max_ray_recursion_depth;
-   capacity *= children_per_ray;
-   if (capacity > UINT32_MAX)
+   uint64_t capacity = width;
+   if (__builtin_mul_overflow(capacity, (uint64_t)height, &capacity) ||
+       __builtin_mul_overflow(capacity, (uint64_t)depth, &capacity) ||
+       __builtin_mul_overflow(capacity, (uint64_t)max_ray_recursion_depth,
+                              &capacity) ||
+       __builtin_mul_overflow(capacity, (uint64_t)children_per_ray,
+                              &capacity) ||
+       capacity > UINT32_MAX)
       return false;
 
    *capacity_rays = (uint32_t)capacity;

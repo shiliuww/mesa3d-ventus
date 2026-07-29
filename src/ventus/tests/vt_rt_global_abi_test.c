@@ -42,8 +42,10 @@ main(void)
          VT_RT_SUBMISSION_MAILBOX_HEADER_SIZE_BYTES +
             VT_RT_GLOBAL_TRACE_FIELD_COUNT * 4u);
    CHECK(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES == 140);
-   CHECK(vt_nir_rt_global_queue_capacity(160, 96, 2, 3, &capacity));
+   CHECK(vt_nir_rt_global_queue_capacity(160, 96, 1, 2, 3, &capacity));
    CHECK(capacity == 160 * 96 * 2 * 3);
+   CHECK(vt_nir_rt_global_queue_capacity(4, 3, 2, 2, 3, &capacity));
+   CHECK(capacity == 4 * 3 * 2 * 2 * 3);
    uint64_t mailbox_records = 0;
    CHECK(vt_nir_rt_submission_mailbox_capacity(2, 32, &mailbox_records));
    CHECK(mailbox_records == 2ull * 32 * 4);
@@ -56,7 +58,11 @@ main(void)
             1, 31, VT_RT_SUBMISSION_MAILBOX_CHILD_REFRACTION) ==
          mailbox_records - 1);
    CHECK(!vt_nir_rt_submission_mailbox_capacity(0, 32, &mailbox_records));
-   CHECK(!vt_nir_rt_global_queue_capacity(UINT32_MAX, 2, 2, 3, &capacity));
+   CHECK(!vt_nir_rt_global_queue_capacity(1, 1, 0, 2, 3, &capacity));
+   CHECK(!vt_nir_rt_global_queue_capacity(1, 1, 1, 2, 3, NULL));
+   CHECK(!vt_nir_rt_global_queue_capacity(UINT32_MAX, UINT32_MAX,
+                                          UINT32_MAX, UINT32_MAX,
+                                          UINT32_MAX, &capacity));
    CHECK(layout.header_size_bytes == VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES);
    CHECK(layout.field_stride_bytes == 384);
    CHECK(vt_nir_rt_global_queue_layout(768).field_stride_bytes == 3072);

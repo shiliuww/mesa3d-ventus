@@ -1404,11 +1404,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    /* Both the mirror and PDS-free producer use the same global queue ABI.
     * Only the latter must not allocate a legacy slot/CPS backing store. */
    if (wavefront_profile) {
-      if (info->depth != 1 ||
-          !vt_nir_rt_global_queue_capacity(info->width, info->height,
+      if (!vt_nir_rt_global_queue_capacity(info->width, info->height,
+                                            info->depth,
                                             info->max_ray_recursion_depth,
                                             3, &global_queue_capacity)) {
-         mesa_loge("ventus-vk: unsupported wavefront queue dimensions "
+         mesa_loge("ventus-vk: invalid or overflowing wavefront queue "
+                   "dimensions "
                    "%ux%ux%u max_depth=%u",
                    info->width, info->height, info->depth,
                    info->max_ray_recursion_depth);
