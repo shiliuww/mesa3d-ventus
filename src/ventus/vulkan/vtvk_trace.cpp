@@ -218,3 +218,60 @@ vtvk_CmdTraceRaysIndirectKHR(
       pHitShaderBindingTable, pCallableShaderBindingTable,
       command->width, command->height, command->depth);
 }
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
+                              VkDeviceAddress indirectDeviceAddress)
+{
+   if (indirectDeviceAddress & 3) {
+      mesa_loge("ventus-vk: indirect2 RT dispatch address is not 4-byte "
+                "aligned: 0x%" PRIx64,
+                (uint64_t)indirectDeviceAddress);
+      return;
+   }
+
+   const VkTraceRaysIndirectCommand2KHR *command =
+      (const VkTraceRaysIndirectCommand2KHR *)
+         vtvk_buffer_host_ptr_from_addr_with_usage(
+            indirectDeviceAddress, sizeof(*command),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+   if (!command) {
+      mesa_loge("ventus-vk: indirect2 RT dispatch address is not a complete "
+                "INDIRECT_BUFFER range: 0x%" PRIx64,
+                (uint64_t)indirectDeviceAddress);
+      return;
+   }
+
+   const VkStridedDeviceAddressRegionKHR raygen = {
+      .deviceAddress = command->raygenShaderRecordAddress,
+      .stride = command->raygenShaderRecordSize,
+      .size = command->raygenShaderRecordSize,
+   };
+   const VkStridedDeviceAddressRegionKHR miss = {
+      .deviceAddress = command->missShaderBindingTableAddress,
+      .stride = command->missShaderBindingTableStride,
+      .size = command->missShaderBindingTableSize,
+   };
+   const VkStridedDeviceAddressRegionKHR hit = {
+      .deviceAddress = command->hitShaderBindingTableAddress,
+      .stride = command->hitShaderBindingTableStride,
+      .size = command->hitShaderBindingTableSize,
+   };
+   const VkStridedDeviceAddressRegionKHR callable = {
+      .deviceAddress = command->callableShaderBindingTableAddress,
+      .stride = command->callableShaderBindingTableStride,
+      .size = command->callableShaderBindingTableSize,
+   };
+
+   static bool logged;
+   if (!logged) {
+      logged = true;
+      mesa_logi("ventus-vk: vkCmdTraceRaysIndirect2KHR resolved "
+                "%ux%ux%u and SBT regions from 0x%" PRIx64,
+                command->width, command->height, command->depth,
+                (uint64_t)indirectDeviceAddress);
+   }
+
+   vtvk_CmdTraceRaysKHR(commandBuffer, &raygen, &miss, &hit, &callable,
+                        command->width, command->height, command->depth);
+}
