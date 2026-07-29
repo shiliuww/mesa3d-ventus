@@ -203,6 +203,7 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->accelerationStructureHostCommands = false;
    f->rayTracingPipeline = true;
    f->rayTracingPipelineTraceRaysIndirect = true;
+   f->rayTraversalPrimitiveCulling = true;
    f->rayTracingMaintenance1 = false;
    f->rayTracingPipelineTraceRaysIndirect2 = true;
    f->descriptorBindingAccelerationStructureUpdateAfterBind = false;
