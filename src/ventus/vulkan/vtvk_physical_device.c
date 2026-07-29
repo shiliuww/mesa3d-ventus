@@ -199,7 +199,7 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->runtimeDescriptorArray = false;
    f->accelerationStructure = true;
    f->accelerationStructureCaptureReplay = false;
-   f->accelerationStructureIndirectBuild = false;
+   f->accelerationStructureIndirectBuild = true;
    f->accelerationStructureHostCommands = false;
    f->rayTracingPipeline = true;
    f->rayTracingPipelineTraceRaysIndirect = true;

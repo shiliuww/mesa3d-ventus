@@ -1293,12 +1293,89 @@ vtvk_CmdBuildAccelerationStructuresIndirectKHR(
    const uint32_t *pIndirectStrides,
    const uint32_t *const *ppMaxPrimitiveCounts)
 {
-   (void)commandBuffer;
-   (void)infoCount;
-   (void)pInfos;
-   (void)pIndirectDeviceAddresses;
-   (void)pIndirectStrides;
-   (void)ppMaxPrimitiveCounts;
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   struct vtvk_device *device =
+      container_of(vk_cmd->base.device, struct vtvk_device, vk);
+
+   if (!infoCount || !pInfos || !pIndirectDeviceAddresses ||
+       !pIndirectStrides || !ppMaxPrimitiveCounts) {
+      mesa_loge("ventus-vk: indirect AS build is missing command arrays");
+      return;
+   }
+
+   std::vector<std::vector<VkAccelerationStructureBuildRangeInfoKHR>>
+      build_ranges(infoCount);
+   uint64_t total_geometry_count = 0;
+
+   for (uint32_t i = 0; i < infoCount; i++) {
+      const uint32_t geometry_count = pInfos[i].geometryCount;
+      const VkDeviceAddress address = pIndirectDeviceAddresses[i];
+      const uint32_t stride = pIndirectStrides[i];
+      total_geometry_count += geometry_count;
+
+      if ((address & 3) || (stride & 3)) {
+         mesa_loge("ventus-vk: indirect AS build address/stride is not "
+                   "4-byte aligned: address=0x%" PRIx64 " stride=%u",
+                   (uint64_t)address, stride);
+         return;
+      }
+      if (!geometry_count)
+         continue;
+      if (!ppMaxPrimitiveCounts[i]) {
+         mesa_loge("ventus-vk: indirect AS build %u has no maximum "
+                   "primitive counts",
+                   i);
+         return;
+      }
+
+      const VkDeviceSize specified_span =
+         VkDeviceSize(geometry_count) * stride;
+      const VkDeviceSize loaded_span =
+         VkDeviceSize(geometry_count - 1) * stride +
+         sizeof(VkAccelerationStructureBuildRangeInfoKHR);
+      const VkDeviceSize span = std::max(specified_span, loaded_span);
+      const uint8_t *range_bytes =
+         (const uint8_t *)vtvk_buffer_host_ptr_from_addr_with_usage(
+            address, span, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+      if (!range_bytes) {
+         mesa_loge("ventus-vk: indirect AS build %u does not name a complete "
+                   "INDIRECT_BUFFER range: address=0x%" PRIx64
+                   " span=%" PRIu64,
+                   i, (uint64_t)address, (uint64_t)span);
+         return;
+      }
+
+      build_ranges[i].resize(geometry_count);
+      for (uint32_t j = 0; j < geometry_count; j++) {
+         memcpy(&build_ranges[i][j], range_bytes + VkDeviceSize(j) * stride,
+                sizeof(build_ranges[i][j]));
+         if (build_ranges[i][j].primitiveCount >
+             ppMaxPrimitiveCounts[i][j]) {
+            mesa_loge("ventus-vk: indirect AS build %u geometry %u "
+                      "primitiveCount=%u exceeds maximum=%u",
+                      i, j, build_ranges[i][j].primitiveCount,
+                      ppMaxPrimitiveCounts[i][j]);
+            return;
+         }
+      }
+   }
+
+   for (uint32_t i = 0; i < infoCount; i++) {
+      const VkAccelerationStructureBuildRangeInfoKHR *ranges =
+         build_ranges[i].empty() ? nullptr : build_ranges[i].data();
+      VkResult result = vtvk_build_as(
+         device, &pInfos[i], ranges ? &ranges : nullptr);
+      if (result != VK_SUCCESS) {
+         mesa_loge("ventus-vk: indirect AS build failed for Ventus BVH "
+                   "ABI v1 object=%u (%d)",
+                   i, result);
+         return;
+      }
+   }
+
+   mesa_logi("ventus-vk: indirect AS build wrote Ventus BVH ABI v1 "
+             "objects=%u geometries=%" PRIu64,
+             infoCount, total_geometry_count);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
