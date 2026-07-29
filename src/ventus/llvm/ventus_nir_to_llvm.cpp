@@ -1139,9 +1139,28 @@ private:
                           builder.CreateShl(a, ConstantInt::get(i32, 24))));
    }
 
-   void storeStorageImage(Value *coord, Value *rgba)
+   Value *storageImageBinding(nir_intrinsic_instr *intrin)
    {
-      Value *imageBinding = ConstantInt::get(i32, 1);
+      if (intrin->intrinsic == nir_intrinsic_image_store)
+         return asInt32(value(intrin->src[0]));
+
+      if (nir_src_is_deref(intrin->src[0])) {
+         nir_variable *var =
+            nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[0]));
+         if (var && var->data.descriptor_set == 0)
+            return ConstantInt::get(i32, var->data.binding);
+      }
+
+      if (debugLowering)
+         fprintf(stderr,
+                 "ventus-nir-to-llvm: storage image binding is not a "
+                 "static set-0 binding\n");
+      translationFailed = true;
+      return nullptr;
+   }
+
+   void storeStorageImage(Value *imageBinding, Value *coord, Value *rgba)
+   {
       Value *imageBase =
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
       Value *stride =
@@ -1859,7 +1878,10 @@ private:
       }
       case nir_intrinsic_image_deref_store:
       case nir_intrinsic_image_store: {
-         storeStorageImage(value(intrin->src[1]), value(intrin->src[3]));
+         Value *imageBinding = storageImageBinding(intrin);
+         if (imageBinding)
+            storeStorageImage(imageBinding, value(intrin->src[1]),
+                              value(intrin->src[3]));
          return nullptr;
       }
       case nir_intrinsic_image_deref_size:

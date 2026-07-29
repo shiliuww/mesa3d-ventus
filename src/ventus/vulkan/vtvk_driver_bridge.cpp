@@ -1174,14 +1174,20 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                             &descriptor_table[src->binding],
                                             &uploads))
             goto out;
-      }
 
-      if (slots > 0)
-         tlas_dev_addr = descriptor_table[0].device_addr;
-      if (slots > 1)
-         image_dev_addr = descriptor_table[1].device_addr;
-      if (slots > 2)
-         camera_dev_addr = descriptor_table[2].device_addr;
+         const struct vtvk_rt_descriptor_record *record =
+            &descriptor_table[src->binding];
+         if (src->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+             !tlas_dev_addr) {
+            tlas_dev_addr = record->device_addr;
+         } else if (src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                    !image_dev_addr) {
+            image_dev_addr = record->device_addr;
+         } else if (src->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                    !camera_dev_addr) {
+            camera_dev_addr = record->device_addr;
+         }
+      }
 
       if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
                                   descriptor_table.size() *

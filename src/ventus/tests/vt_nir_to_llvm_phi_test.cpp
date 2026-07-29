@@ -80,6 +80,32 @@ build_loop_exit_phi_shader(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static nir_shader *
+build_storage_image_shader(const nir_shader_compiler_options *options,
+                           uint32_t descriptor_set, uint32_t binding)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_RAYGEN, options, "vt_sparse_storage_image");
+   const glsl_type *image_type =
+      glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT);
+   nir_variable *output =
+      nir_variable_create(b.shader, nir_var_image, image_type, "output");
+   output->data.descriptor_set = descriptor_set;
+   output->data.binding = binding;
+
+   nir_def *coord =
+      nir_vec4(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+               nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   nir_def *rgba =
+      nir_vec4(&b, nir_imm_float(&b, 1.0f), nir_imm_float(&b, 0.5f),
+               nir_imm_float(&b, 0.25f), nir_imm_float(&b, 1.0f));
+   nir_image_deref_store(
+      &b, &nir_build_deref_var(&b, output)->def, coord,
+      nir_undef(&b, 1, 32), rgba, nir_imm_int(&b, 0),
+      .image_dim = GLSL_SAMPLER_DIM_2D);
+   return b.shader;
+}
+
 int
 main()
 {
@@ -150,6 +176,52 @@ main()
 
    delete module;
    ralloc_free(shader);
+
+   shader = build_storage_image_shader(&nir_options, 0, 13);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
+
+   bool found_binding_13 = false;
+   bool found_image_store = false;
+   for (llvm::Function &function : *module) {
+      for (llvm::BasicBlock &block : function) {
+         for (llvm::Instruction &instruction : block) {
+            auto *mul =
+               llvm::dyn_cast<llvm::BinaryOperator>(&instruction);
+            if (mul) {
+               if (mul->getOpcode() == llvm::Instruction::Mul) {
+                  for (unsigned operand = 0; operand < 2; operand++) {
+                     auto *constant =
+                        llvm::dyn_cast<llvm::ConstantInt>(
+                           mul->getOperand(operand));
+                     found_binding_13 |=
+                        constant && constant->getZExtValue() == 13;
+                  }
+               }
+            }
+
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+            llvm::Function *callee = call ? call->getCalledFunction() : nullptr;
+            found_image_store |=
+               callee &&
+               callee->getName() == "llvm.riscv.ventus.image.store.rgba8";
+         }
+      }
+   }
+   VT_RT_CHECK(found_binding_13);
+   VT_RT_CHECK(found_image_store);
+
+   delete module;
+   ralloc_free(shader);
+
+   shader = build_storage_image_shader(&nir_options, 1, 13);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module == nullptr);
+   ralloc_free(shader);
+
    glsl_type_singleton_decref();
    return 0;
 }

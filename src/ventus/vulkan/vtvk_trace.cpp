@@ -14,36 +14,33 @@ vtvk_handle_to_ptr(uint64_t handle)
 }
 
 static bool
-vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
+vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
+                           uint32_t binding,
                            std::vector<vtvk_rt_descriptor_source> *out)
 {
-   struct vtvk_descriptor_binding_info info = {};
-   if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info))
-      return false;
-
    struct vtvk_rt_descriptor_source desc = {};
-   desc.type = info.type;
+   desc.type = info->type;
    desc.set = 0;
    desc.binding = binding;
 
-   switch (info.type) {
+   switch (info->type) {
    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
-      desc.acceleration_structure = info.acceleration_structure;
+      desc.acceleration_structure = info->acceleration_structure;
       break;
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-      desc.image = info.image;
-      desc.sampler = info.image_info.sampler;
+      desc.image = info->image;
+      desc.sampler = info->image_info.sampler;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-      desc.buffer = info.buffer.buffer;
-      desc.offset = info.buffer.offset;
-      desc.range = info.buffer.range;
+      desc.buffer = info->buffer.buffer;
+      desc.offset = info->buffer.offset;
+      desc.range = info->buffer.range;
       break;
    default:
       mesa_loge("ventus-vk: unsupported RT descriptor set=0 binding=%u type=%u",
-                binding, (unsigned)info.type);
+                binding, (unsigned)info->type);
       return false;
    }
 
@@ -69,34 +66,50 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
       vtvk_pipeline_from_handle(pipeline_handle);
    VkDescriptorSet descriptor_set =
       vtvk_cmd_buffer_bound_descriptor_set(commandBuffer, 0);
-   VkAccelerationStructureKHR tlas_handle =
-      vtvk_descriptor_set_acceleration_structure(descriptor_set, 0);
+   VkAccelerationStructureKHR tlas_handle = VK_NULL_HANDLE;
+   VkImage storage_image = VK_NULL_HANDLE;
+   VkExtent3D image_extent = {};
+   VkFormat image_format = VK_FORMAT_UNDEFINED;
+   VkDeviceSize camera_range = 0;
+   void *camera_data = nullptr;
+
+   std::vector<vtvk_rt_descriptor_source> descriptors;
+   descriptors.reserve(VTVK_MAX_DESCRIPTOR_BINDINGS);
+   for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
+        binding++) {
+      struct vtvk_descriptor_binding_info info = {};
+      if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info) ||
+          !vtvk_collect_rt_descriptor(&info, binding, &descriptors))
+         continue;
+
+      if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+          tlas_handle == VK_NULL_HANDLE) {
+         tlas_handle = info.acceleration_structure;
+      } else if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                 storage_image == VK_NULL_HANDLE) {
+         storage_image = info.image;
+      } else if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                 !camera_data) {
+         camera_range = info.buffer.range;
+         camera_data =
+            vtvk_buffer_host_ptr(info.buffer.buffer, info.buffer.offset,
+                                 camera_range);
+      }
+   }
+
    struct vtvk_acceleration_structure *tlas =
       (struct vtvk_acceleration_structure *)
          vtvk_handle_to_ptr((uint64_t)tlas_handle);
-
-   VkExtent3D image_extent = {};
-   VkFormat image_format = VK_FORMAT_UNDEFINED;
-   VkImage storage_image = vtvk_descriptor_set_image(descriptor_set, 1);
    void *storage_image_data =
       vtvk_image_host_ptr(storage_image, &image_extent, &image_format);
 
-   VkDeviceSize camera_range = 0;
-   void *camera_data =
-      vtvk_descriptor_set_buffer_ptr(descriptor_set, 2, &camera_range);
    uint32_t push_constant_size = 0;
    VkShaderStageFlags push_constant_stages = 0;
    const void *push_constant_data =
       vtvk_cmd_buffer_push_constants(commandBuffer, &push_constant_size,
                                      &push_constant_stages);
 
-   std::vector<vtvk_rt_descriptor_source> descriptors;
-   descriptors.reserve(5);
-   for (uint32_t binding = 0; binding <= 4; binding++)
-      vtvk_collect_rt_descriptor(descriptor_set, binding, &descriptors);
-
-   if (!pipeline || !tlas || !tlas->address || !storage_image_data ||
-       !camera_data) {
+   if (!pipeline || !tlas || !tlas->address || !storage_image_data) {
       mesa_loge("ventus-vk: vkCmdTraceRaysKHR missing Spike dispatch state "
                 "pipeline=%p tlas=0x%" PRIx64 " image=%p camera=%p",
                 (void *)pipeline, tlas ? (uint64_t)tlas->address : 0,

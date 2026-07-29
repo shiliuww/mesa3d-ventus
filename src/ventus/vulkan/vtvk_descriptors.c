@@ -38,52 +38,6 @@ vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
 }
-VkAccelerationStructureKHR
-vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
-                                           uint32_t binding)
-{
-   struct vtvk_descriptor_set *set =
-      vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
-      return VK_NULL_HANDLE;
-
-   return set->bindings[binding].acceleration_structure;
-}
-
-VkImage
-vtvk_descriptor_set_image(VkDescriptorSet descriptorSet, uint32_t binding)
-{
-   struct vtvk_descriptor_set *set =
-      vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
-      return VK_NULL_HANDLE;
-
-   struct vtvk_image_view *view =
-      vtvk_handle_to_ptr((uint64_t)set->bindings[binding].image.imageView);
-   return view ? view->image : VK_NULL_HANDLE;
-}
-
-void *
-vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
-                               VkDeviceSize *range_out)
-{
-   struct vtvk_descriptor_set *set =
-      vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
-      return NULL;
-
-   VkDescriptorBufferInfo *info = &set->bindings[binding].buffer;
-   VkDeviceSize range = info->range;
-   if (range == VK_WHOLE_SIZE) {
-      struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)info->buffer);
-      range = buffer && info->offset <= buffer->size ?
-                 buffer->size - info->offset : 0;
-   }
-   if (range_out)
-      *range_out = range;
-   return vtvk_buffer_host_ptr(info->buffer, info->offset, range);
-}
-
 bool
 vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
                                 uint32_t binding,

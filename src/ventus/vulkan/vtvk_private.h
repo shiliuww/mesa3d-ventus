@@ -121,14 +121,6 @@ VkDescriptorSet vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuff
 const void *vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
                                            uint32_t *size_out,
                                            VkShaderStageFlags *stages_out);
-VkAccelerationStructureKHR
-vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
-                                           uint32_t binding);
-VkImage vtvk_descriptor_set_image(VkDescriptorSet descriptorSet,
-                                  uint32_t binding);
-void *vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet,
-                                     uint32_t binding,
-                                     VkDeviceSize *range_out);
 bool vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
                                      uint32_t binding,
                                      struct vtvk_descriptor_binding_info *out);
