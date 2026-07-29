@@ -7,10 +7,6 @@
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 
-struct vtvk_sampler {
-   uint32_t unused;
-};
-
 struct vtvk_render_pass {
    uint32_t attachment_count;
    uint32_t subpass_count;
@@ -38,6 +34,22 @@ vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
 }
+
+static uint32_t
+vtvk_image_bytes_per_pixel(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_B8G8R8A8_SNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return 4;
+   default:
+      return 4;
+   }
+}
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_CreateSampler(VkDevice _device,
                    const VkSamplerCreateInfo *pCreateInfo,
@@ -46,12 +58,15 @@ vtvk_CreateSampler(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
-   (void)pCreateInfo;
-
    struct vtvk_sampler *sampler =
       vk_zalloc(alloc, sizeof(*sampler), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!sampler)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   sampler->mag_filter = pCreateInfo->magFilter;
+   sampler->min_filter = pCreateInfo->minFilter;
+   sampler->address_mode_u = pCreateInfo->addressModeU;
+   sampler->address_mode_v = pCreateInfo->addressModeV;
 
    *pSampler = (VkSampler)vtvk_ptr_to_handle(sampler);
    return VK_SUCCESS;
@@ -562,9 +577,49 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                           const VkBufferImageCopy *pRegions)
 {
    (void)commandBuffer;
-   (void)srcBuffer;
-   (void)dstImage;
    (void)dstImageLayout;
-   (void)regionCount;
-   (void)pRegions;
+   struct vtvk_image *dst = vtvk_handle_to_ptr((uint64_t)dstImage);
+   if (!dst || !dst->map || !pRegions)
+      return;
+
+   const uint32_t bpp = vtvk_image_bytes_per_pixel(dst->format);
+   for (uint32_t r = 0; r < regionCount; ++r) {
+      const VkBufferImageCopy *region = &pRegions[r];
+      /* vtvk_image currently stores only mip 0 / layer 0.  Preserve the
+       * source texture's base level, which is exactly what the RT txl(0)
+       * lowering consumes. */
+      if (region->imageSubresource.mipLevel != 0 ||
+          region->imageSubresource.baseArrayLayer != 0 ||
+          region->imageOffset.x < 0 || region->imageOffset.y < 0 ||
+          region->imageOffset.z < 0)
+         continue;
+
+      const uint32_t width = region->imageExtent.width;
+      const uint32_t height = region->imageExtent.height;
+      const uint32_t depth = region->imageExtent.depth ? region->imageExtent.depth : 1;
+      const uint32_t row_length = region->bufferRowLength ?
+         region->bufferRowLength : width;
+      const uint32_t image_height = region->bufferImageHeight ?
+         region->bufferImageHeight : height;
+      if (!width || !height || !row_length || !image_height ||
+          region->imageOffset.x + width > dst->extent.width ||
+          region->imageOffset.y + height > dst->extent.height ||
+          region->imageOffset.z + depth > dst->extent.depth)
+         continue;
+
+      for (uint32_t z = 0; z < depth; ++z) {
+         for (uint32_t y = 0; y < height; ++y) {
+            const VkDeviceSize src_offset = region->bufferOffset +
+               ((VkDeviceSize)z * image_height + y) * row_length * bpp;
+            const VkDeviceSize dst_offset =
+               (((VkDeviceSize)(region->imageOffset.z + z) * dst->extent.height +
+                 (region->imageOffset.y + y)) * dst->extent.width +
+                region->imageOffset.x) * bpp;
+            const VkDeviceSize bytes = (VkDeviceSize)width * bpp;
+            void *src = vtvk_buffer_host_ptr(srcBuffer, src_offset, bytes);
+            if (src && dst_offset + bytes <= dst->size)
+               memcpy((uint8_t *)dst->map + dst_offset, src, bytes);
+         }
+      }
+   }
 }

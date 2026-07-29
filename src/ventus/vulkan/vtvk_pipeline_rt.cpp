@@ -705,6 +705,7 @@ vtvk_emit_rt_resume_kernels(struct vtvk_pipeline *pipeline,
 
 struct vtvk_rt_callback_shader_entry {
    uint32_t group_index;
+   mesa_shader_stage stage;
    nir_shader *shader;
 };
 
@@ -730,8 +731,7 @@ struct vtvk_rt_payload_location_candidate {
 static bool
 vtvk_rt_is_payload_variable(const nir_variable *var)
 {
-   return var && var->data.explicit_location &&
-          (var->data.mode == nir_var_shader_temp ||
+   return var && (var->data.mode == nir_var_shader_temp ||
            var->data.mode == nir_var_shader_call_data);
 }
 
@@ -796,6 +796,19 @@ static void
 vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
                                         uint32_t shader_count)
 {
+   /* SPIR-V payload decorations arrive with data.location populated, but not
+    * always with NIR's explicit_location bit.  The ABI lowering needs the
+    * latter to preserve the Vulkan location across raygen and callbacks. */
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader)
+         continue;
+      nir_foreach_variable_in_shader(var, shader) {
+         if (vtvk_rt_is_payload_variable(var) && var->data.location >= 0)
+            var->data.explicit_location = true;
+      }
+   }
+
    std::vector<vtvk_rt_payload_location_candidate> candidates;
    for (uint32_t i = 0; i < shader_count; i++)
       vtvk_rt_collect_payload_location_candidates(shaders[i], &candidates);
@@ -871,6 +884,7 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
             continue;
 
          var->data.location = location;
+         var->data.explicit_location = true;
          if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
             mesa_logi("ventus-vk: inferred RT payload location %d for %s",
                       location, var->name ? var->name : "<unnamed>");
@@ -925,6 +939,17 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
    if (!b || !index || entries.empty())
       return;
 
+   /* Diagnostic only: textures has exactly one closest-hit group.  Bypass
+    * the dynamic SBT predicate to distinguish a callback-body/CPS-address
+    * bug from a SIMT lowering bug in that predicate.  This must never become
+    * a normal fallback: a pipeline may legally have hit groups with no
+    * closest-hit shader. */
+   if (entries.size() == 1 &&
+       vtvk_env_enabled("VENTUS_VK_RT_DEBUG_DIRECT_SINGLE_CALLBACK")) {
+      vtvk_inline_rt_callback_shader(b, entries[0].shader);
+      return;
+   }
+
    for (size_t i = 0; i < entries.size(); i++) {
       nir_push_if(b, nir_ieq_imm(b, index, entries[i].group_index));
       vtvk_inline_rt_callback_shader(b, entries[i].shader);
@@ -933,6 +958,134 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
    }
    for (size_t i = 0; i < entries.size(); i++)
       nir_pop_if(b, NULL);
+}
+
+/* A procedural report stays inside one compact intersection callback.  The
+ * matching any-hit code is inlined at the report site, so locals and control
+ * flow naturally continue to a later reportIntersectionEXT in the same
+ * shader.  DONE records that at least one report was accepted; the committed
+ * record retains the nearest accepted report even if a later one is ignored. */
+struct vtvk_rt_intersection_report_lower_data {
+   const struct vt_nir_rt_config *config;
+   nir_shader *any_hit;
+};
+
+static bool
+vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
+                                  void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_report_ray_intersection)
+      return false;
+
+   const vtvk_rt_intersection_report_lower_data *state =
+      static_cast<const vtvk_rt_intersection_report_lower_data *>(data);
+   const struct vt_nir_rt_config *config = state->config;
+   const enum vt_rt_shader_layout layout =
+      vt_nir_layout_for_stage(b->shader->info.stage);
+   b->cursor = nir_before_instr(&intrin->instr);
+
+   nir_def *hit_t = intrin->src[0].ssa;
+   nir_def *hit_kind = intrin->src[1].ssa;
+   nir_def *current_tmax = vt_nir_load_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
+   nir_def *tmin = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_TMIN);
+   nir_def *terminated = nir_ine_imm(
+      b, vt_nir_load_control_word(
+            b, config, layout, VT_RT_CONTROL_TERMINATE_RAY, 32), 0);
+   nir_def *ray_ref = vt_nir_rt_global_callback_ray_ref(b);
+   nir_def *candidate_attributes = vt_nir_rt_global_load_completion_addr(
+      b, ray_ref, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
+   nir_def *committed_attributes = vt_nir_rt_global_load_completion_addr(
+      b, ray_ref, VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO);
+   nir_def *in_range = nir_iand(
+      b, nir_flt(b, hit_t, current_tmax), nir_fge(b, hit_t, tmin));
+   nir_def *eligible = nir_iand(b, in_range, nir_inot(b, terminated));
+
+   /* Preserve the AABB metadata populated by RTcore, changing only the
+    * report-specific fields.  Its geometry is non-opaque unless the ray or
+    * the record says otherwise. */
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_STATUS,
+      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_STATUS_HIT),
+                nir_imm_int(b, VT_RT_STATUS_IDLE)));
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_T, hit_t);
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_FRONT_FACE,
+      nir_ieq_imm(b, hit_kind, 0xfe));
+   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
+                               eligible);
+   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
+                               nir_inot(b, eligible));
+   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
+                               terminated);
+
+   nir_def *flags = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_FLAGS);
+   nir_def *force_opaque = nir_ine_imm(b, nir_iand_imm(b, flags, 1), 0);
+   nir_def *force_non_opaque =
+      nir_ine_imm(b, nir_iand_imm(b, flags, 1u << 1), 0);
+   nir_def *geometry_opaque = nir_ine_imm(
+      b, vt_nir_load_candidate_hit_record_word(
+            b, config, layout, VT_RT_HIT_RECORD_OPAQUE, 32), 0);
+   nir_def *opaque = nir_ior(
+      b, force_opaque, nir_iand(b, geometry_opaque, nir_inot(b, force_non_opaque)));
+
+   if (state->any_hit) {
+      nir_push_if(b, nir_iand(b, eligible, nir_inot(b, opaque)));
+      vtvk_inline_rt_callback_shader(b, state->any_hit);
+      nir_pop_if(b, NULL);
+   }
+
+   nir_def *accepted = nir_iand(
+      b, nir_ine_imm(
+            b, vt_nir_load_control_word(
+                  b, config, layout, VT_RT_CONTROL_ACCEPT_HIT, 32), 0),
+      nir_inot(b, nir_ine_imm(
+                       b, vt_nir_load_control_word(
+                             b, config, layout, VT_RT_CONTROL_IGNORE_HIT, 32), 0)));
+   nir_def *was_accepted = nir_ine_imm(
+      b, vt_nir_load_control_word(b, config, layout, VT_RT_CONTROL_DONE, 32), 0);
+   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_DONE,
+                               nir_ior(b, was_accepted, accepted));
+
+   nir_push_if(b, accepted);
+   for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
+      const enum vt_rt_hit_record_word hit_word =
+         static_cast<enum vt_rt_hit_record_word>(word);
+      vt_nir_store_hit_record_word(
+         b, config, layout, hit_word,
+         vt_nir_load_candidate_hit_record_word(b, config, layout, hit_word, 32));
+   }
+   for (uint32_t word = 0; word < 2; word++) {
+      nir_def *offset = nir_imm_intN_t(b, word * sizeof(uint32_t), 64);
+      nir_store_global(b, nir_load_global(
+                              b, 1, 32, nir_iadd(b, candidate_attributes, offset)),
+                       nir_iadd(b, committed_attributes, offset), 0x1);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_def_rewrite_uses(&intrin->def, accepted);
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
+vtvk_lower_rt_intersection_reports(
+   nir_shader *shader, const struct vt_nir_rt_config *config,
+   nir_shader *any_hit)
+{
+   if (!shader || shader->info.stage != MESA_SHADER_INTERSECTION)
+      return false;
+   const vtvk_rt_intersection_report_lower_data data = {
+      .config = config,
+      .any_hit = any_hit,
+   };
+   return nir_shader_intrinsics_pass(shader, vtvk_lower_rt_intersection_report,
+                                     nir_metadata_control_flow, (void *)&data);
 }
 
 static nir_def *
@@ -974,7 +1127,7 @@ vtvk_emit_rt_closest_hit(nir_builder *b,
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->closest_hit.empty() ||
-       !result || !result->sbt_index)
+       !result || !result->hit_shader_record_ptr)
       return;
 
    nir_def *index =
@@ -992,7 +1145,7 @@ vtvk_emit_rt_any_hit(nir_builder *b, const struct vt_nir_rt_trace_params *params
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->any_hit.empty() ||
-       !result || !result->sbt_index)
+       !result || !result->hit_shader_record_ptr)
       return;
 
    nir_def *index =
@@ -1009,7 +1162,7 @@ vtvk_emit_rt_intersection(nir_builder *b, const struct vt_nir_rt_trace_params *p
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->intersection.empty() ||
-       !result || !result->sbt_index)
+       !result || !result->hit_shader_record_ptr)
       return;
 
    nir_def *index =
@@ -1051,6 +1204,15 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    vtvk_rt_log_nir_stats(*nir_out, "after nir_lower_system_values");
    NIR_PASS(_, *nir_out, vt_nir_lower_descriptors);
    vtvk_rt_log_nir_stats(*nir_out, "after vt_nir_lower_descriptors");
+   /* Convert the API push-constant variable while it is still common to the
+    * root shader and every shader-call clone.  The global CPS lowering below
+    * then replaces the resulting load_push_constant intrinsics with loads
+    * from the immutable dispatch snapshot.  Leaving this logical variable in
+    * place reaches the LLVM canonicalizer as an uninitialized function
+    * temporary in a root-resume shader. */
+   NIR_PASS(_, *nir_out, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
+   vtvk_rt_log_nir_stats(*nir_out, "after Ventus RT push-constant IO lowering");
    nir_validate_shader(*nir_out, "after Ventus RT pre-lowering");
 
    return VK_SUCCESS;
@@ -1100,7 +1262,7 @@ vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
       mesa_shader_stage shader_stage =
          vk_to_mesa_shader_stage(info->pStages[shader_index].stage);
       if (shader_stage == required_stage) {
-         dst->push_back({group_index, shaders[shader_index]});
+         dst->push_back({group_index, required_stage, shaders[shader_index]});
       }
    };
 
@@ -1135,6 +1297,94 @@ vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
       if (stage == MESA_SHADER_RAYGEN && !out->raygen)
          out->raygen = shaders[i];
    }
+}
+
+/* Candidate callbacks are separate compact kernels: their control stores must
+ * become visible to RTcore before the same ray_ref resumes its private
+ * traversal state.  Terminal miss/closest-hit remain in the root CPS resume
+ * ELFs, where post-trace raygen code can continue immediately. */
+static bool
+vtvk_emit_rt_global_candidate_kernels(
+   struct vtvk_pipeline *pipeline,
+   const std::vector<vtvk_rt_callback_shader_entry> &any_hit,
+   const std::vector<vtvk_rt_callback_shader_entry> &intersection,
+   const struct vt_nir_to_llvm_options *options)
+{
+   std::vector<vtvk_rt_callback_shader_entry> callbacks = any_hit;
+   callbacks.insert(callbacks.end(), intersection.begin(), intersection.end());
+   if (callbacks.empty())
+      return true;
+
+   pipeline->callback_kernel_paths = (char **)calloc(
+      callbacks.size(), sizeof(*pipeline->callback_kernel_paths));
+   pipeline->callback_kernel_entries = (uint64_t *)calloc(
+      callbacks.size(), sizeof(*pipeline->callback_kernel_entries));
+   pipeline->callback_kernel_groups = (uint32_t *)calloc(
+      callbacks.size(), sizeof(*pipeline->callback_kernel_groups));
+   pipeline->callback_kernel_stages = (uint32_t *)calloc(
+      callbacks.size(), sizeof(*pipeline->callback_kernel_stages));
+   if (!pipeline->callback_kernel_paths || !pipeline->callback_kernel_entries ||
+       !pipeline->callback_kernel_groups || !pipeline->callback_kernel_stages)
+      return false;
+   pipeline->callback_kernel_count = callbacks.size();
+
+   struct vt_nir_rt_config config = vt_nir_rt_default_config();
+   struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
+   vt_nir_rt_config_apply_abi_layout(&config, &abi);
+   vt_nir_rt_config_apply_global_cps_layout(&config, &abi);
+   config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK;
+
+   struct vt_nir_to_llvm_options callback_options = *options;
+   callback_options.global_rt_compact_resume = true;
+   callback_options.entry_point_name = "main";
+   callback_options.entry_point_is_kernel = true;
+   for (uint32_t i = 0; i < callbacks.size(); i++) {
+      nir_shader *shader = callbacks[i].shader;
+      if (callbacks[i].stage == MESA_SHADER_INTERSECTION) {
+         nir_shader *matching_any_hit = NULL;
+         for (const vtvk_rt_callback_shader_entry &entry : any_hit) {
+            if (entry.group_index == callbacks[i].group_index) {
+               matching_any_hit = entry.shader;
+               break;
+            }
+         }
+         vtvk_lower_rt_intersection_reports(shader, &config, matching_any_hit);
+      }
+      if (!vt_nir_lower_rt_global_callback(shader, &config)) {
+         mesa_loge("ventus-vk: global candidate callback lowering failed stage=%u group=%u",
+                   callbacks[i].stage, callbacks[i].group_index);
+         return false;
+      }
+      NIR_PASS(_, shader, vt_nir_lower_descriptors);
+      struct vt_nir_rt_canonicalize_error error = {};
+      if (vt_nir_canonicalize_rt_for_llvm(shader, &error) !=
+          VT_NIR_RT_CANONICALIZE_SUCCESS) {
+         mesa_loge("ventus-vk: global candidate callback has non-SSA temporary %s",
+                   error.variable_name ? error.variable_name : "<unnamed>");
+         return false;
+      }
+      nir_validate_shader(shader, "after Ventus global candidate callback lowering");
+
+      llvm::Module *module = vt_nir_to_llvm_translate(&shader, 1,
+                                                       &callback_options);
+      if (!module)
+         return false;
+      char *path = NULL;
+      uint64_t entry = 0;
+      const bool emitted = vtvk_maybe_emit_rt_kernel_module(
+         module, pipeline->rt_uses_rv64, &path, &entry);
+      delete module;
+      if (!emitted)
+         return false;
+      pipeline->callback_kernel_paths[i] = path;
+      pipeline->callback_kernel_entries[i] = entry;
+      pipeline->callback_kernel_groups[i] = callbacks[i].group_index;
+      pipeline->callback_kernel_stages[i] = callbacks[i].stage;
+   }
+   mesa_logi("ventus-vk: prepared %u global RT candidate callback kernel%s",
+             pipeline->callback_kernel_count,
+             pipeline->callback_kernel_count == 1 ? "" : "s");
+   return true;
 }
 
 static VkResult
@@ -1202,6 +1452,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&config, &abi);
          config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+         config.defer_intersection_reports = true;
       }
 
       for (uint32_t s = 0; s < pipeline->shader_count; s++) {
@@ -1355,6 +1606,13 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    }
    vtvk_maybe_emit_rt_kernel(pipeline);
    if (!vtvk_emit_rt_resume_kernels(pipeline, &llvm_options)) {
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+   }
+   if (global_wavefront &&
+       !vtvk_emit_rt_global_candidate_kernels(pipeline, cb_shaders.any_hit,
+                                               cb_shaders.intersection,
+                                               &llvm_options)) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }

@@ -31,7 +31,9 @@ vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
       desc.acceleration_structure = info.acceleration_structure;
       break;
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       desc.image = info.image;
+      desc.sampler = info.image_info.sampler;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -82,6 +84,9 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    VkDeviceSize camera_range = 0;
    void *camera_data =
       vtvk_descriptor_set_buffer_ptr(descriptor_set, 2, &camera_range);
+   uint32_t push_constants_size = 0;
+   const void *push_constants =
+      vtvk_cmd_buffer_push_constants(commandBuffer, &push_constants_size);
 
    std::vector<vtvk_rt_descriptor_source> descriptors;
    descriptors.reserve(5);
@@ -121,6 +126,8 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.image_format = image_format;
    trace.camera_data = camera_data;
    trace.camera_range = camera_range;
+   trace.push_constants = push_constants;
+   trace.push_constants_size = push_constants_size;
    trace.raygen_sbt = pRaygenShaderBindingTable;
    trace.miss_sbt = pMissShaderBindingTable;
    trace.hit_sbt = pHitShaderBindingTable;

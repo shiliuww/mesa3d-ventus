@@ -14,7 +14,7 @@
  * Shader-visible wavefront RT ABI.  A ray reference is an ordinal in a
  * field-major global queue, never a PDS address or a physical lane number.
  */
-#define VT_RT_GLOBAL_ABI_VERSION 9
+#define VT_RT_GLOBAL_ABI_VERSION 10
 #define VT_RT_GLOBAL_WARP_SIZE 32u
 #define VT_RT_GLOBAL_ALIGNMENT_BYTES 128u
 #define VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES VT_RT_GLOBAL_ALIGNMENT_BYTES
@@ -105,6 +105,25 @@ enum vt_rt_global_completion_field {
    VT_RT_GLOBAL_COMPLETION_CALLBACK_GROUP,
    /* Written last by RTcore after the result and payload are visible. */
    VT_RT_GLOBAL_COMPLETION_READY,
+   /*
+    * Candidate state is deliberately appended after the stable terminal
+    * layout.  It is indexed by the same ray_ref as the committed record, but
+    * its own field-major planes ensure a paused any-hit/intersection shader
+    * can never overwrite the traversal's committed tmax record.
+    */
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_KIND,
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE,
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_LAST =
+      VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE +
+      VT_RT_HIT_RECORD_WORD_COUNT - 1,
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO,
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_HI,
+   /* Any-hit/intersection writes these words; RTcore consumes them before
+    * resuming the same private traversal context for this ray_ref. */
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE,
+   VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_LAST =
+      VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE +
+      VT_RT_CONTROL_WORD_COUNT - 1,
    VT_RT_GLOBAL_COMPLETION_FIELD_COUNT,
 };
 

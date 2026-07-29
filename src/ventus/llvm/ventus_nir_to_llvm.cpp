@@ -470,7 +470,7 @@ private:
    bool needsCompactResumeGuard(nir_shader *shader)
    {
       return !noopRtIntrinsics && globalRtCompactResume &&
-             shader->info.stage == MESA_SHADER_RAYGEN;
+             (shader->info.stage == MESA_SHADER_RAYGEN || entryPointIsKernel);
    }
 
    Value *compactResumeDispatchInBounds()
@@ -1154,6 +1154,207 @@ private:
       builder.CreateCall(fn, {imageBase, x, y, stride, packed});
    }
 
+   Value *sampledUnorm8(Value *packed, unsigned shift)
+   {
+      Value *byte = builder.CreateAnd(
+         builder.CreateLShr(packed, ConstantInt::get(i32, shift)),
+         ConstantInt::get(i32, 0xff));
+      return builder.CreateFDiv(builder.CreateUIToFP(byte, f32),
+                                ConstantFP::get(f32, 255.0));
+   }
+
+   Value *floorToI32(Value *value)
+   {
+      Value *truncated = builder.CreateFPToSI(asFloat(value), i32);
+      Value *truncated_float = builder.CreateSIToFP(truncated, f32);
+      return builder.CreateSelect(
+         builder.CreateFCmpOLT(asFloat(value), truncated_float),
+         builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
+   }
+
+   Value *wrapTexelCoord(Value *coord, Value *extent, Value *address_mode)
+   {
+      Value *safe_extent = builder.CreateSelect(
+         builder.CreateICmpUGT(extent, ConstantInt::get(i32, 0)), extent,
+         ConstantInt::get(i32, 1));
+      Value *max = builder.CreateSub(safe_extent, ConstantInt::get(i32, 1));
+      Value *clamp = builder.CreateSelect(
+         builder.CreateICmpSLT(coord, ConstantInt::get(i32, 0)),
+         ConstantInt::get(i32, 0), coord);
+      clamp = builder.CreateSelect(builder.CreateICmpSGT(clamp, max), max, clamp);
+
+      Value *repeat = builder.CreateSRem(coord, safe_extent);
+      repeat = builder.CreateSelect(builder.CreateICmpSLT(repeat,
+                                                          ConstantInt::get(i32, 0)),
+                                    builder.CreateAdd(repeat, safe_extent), repeat);
+
+      Value *period = builder.CreateMul(safe_extent, ConstantInt::get(i32, 2));
+      Value *mirrored = builder.CreateSRem(coord, period);
+      mirrored = builder.CreateSelect(builder.CreateICmpSLT(mirrored,
+                                                            ConstantInt::get(i32, 0)),
+                                      builder.CreateAdd(mirrored, period), mirrored);
+      mirrored = builder.CreateSelect(
+         builder.CreateICmpSGE(mirrored, safe_extent),
+         builder.CreateSub(builder.CreateSub(period, ConstantInt::get(i32, 1)),
+                           mirrored), mirrored);
+
+      Value *is_repeat = builder.CreateICmpEQ(
+         address_mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_REPEAT));
+      Value *is_mirrored = builder.CreateICmpEQ(
+         address_mode,
+         ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT));
+      return builder.CreateSelect(is_repeat, repeat,
+                                  builder.CreateSelect(is_mirrored, mirrored, clamp));
+   }
+
+   Value *sampleTexelRGBA8(Value *base, Value *stride, Value *x, Value *y,
+                           Value *format)
+   {
+      Value *offset = builder.CreateAdd(
+         builder.CreateMul(asAddress(y), asAddress(stride)),
+         builder.CreateMul(asAddress(x),
+                           ConstantInt::get(asAddress(x)->getType(), 4)));
+      Value *packed = loadI32At(builder.CreateAdd(asAddress(base), offset));
+      Value *r = sampledUnorm8(packed, 0);
+      Value *g = sampledUnorm8(packed, 8);
+      Value *b = sampledUnorm8(packed, 16);
+      Value *a = sampledUnorm8(packed, 24);
+      Value *is_bgra = builder.CreateICmpEQ(
+         format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM));
+      return buildVector(4, f32, [&](unsigned channel) {
+         switch (channel) {
+         case 0: return builder.CreateSelect(is_bgra, b, r);
+         case 1: return g;
+         case 2: return builder.CreateSelect(is_bgra, r, b);
+         default: return a;
+         }
+      });
+   }
+
+   Value *lowerTex(nir_tex_instr *tex)
+   {
+      nir_deref_instr *texture_deref = nullptr;
+      nir_deref_instr *sampler_deref = nullptr;
+      nir_def *coord = nullptr;
+      nir_def *lod = nullptr;
+      bool lod_is_zero = false;
+      for (unsigned i = 0; i < tex->num_srcs; ++i) {
+         switch (tex->src[i].src_type) {
+         case nir_tex_src_texture_deref:
+            texture_deref = nir_src_as_deref(tex->src[i].src);
+            break;
+         case nir_tex_src_sampler_deref:
+            sampler_deref = nir_src_as_deref(tex->src[i].src);
+            break;
+         case nir_tex_src_coord:
+            coord = tex->src[i].src.ssa;
+            break;
+         case nir_tex_src_lod:
+            lod = tex->src[i].src.ssa;
+            lod_is_zero = nir_src_is_const(tex->src[i].src) &&
+               nir_src_as_uint(tex->src[i].src) == 0;
+            break;
+         default:
+            break;
+         }
+      }
+
+      nir_variable *texture_var = texture_deref ?
+         nir_deref_instr_get_variable(texture_deref) : nullptr;
+      nir_variable *sampler_var = sampler_deref ?
+         nir_deref_instr_get_variable(sampler_deref) : nullptr;
+      const bool base_lod = (tex->op == nir_texop_txl && lod && lod_is_zero) ||
+         (tex->op == nir_texop_tex && !lod);
+      const bool supported = base_lod &&
+         tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+         tex->def.bit_size == 32 && tex->def.num_components == 4 &&
+         coord && texture_var && sampler_var &&
+         texture_var->data.descriptor_set == 0 &&
+         sampler_var->data.descriptor_set == 0 &&
+         texture_var->data.binding == sampler_var->data.binding;
+      if (!supported) {
+         if (debugLowering)
+            fprintf(stderr, "ventus-nir-to-llvm: unsupported texture op=%u\n",
+                    (unsigned)tex->op);
+         unsupportedDefs.insert(&tex->def);
+         return undefFor(&tex->def, true);
+      }
+
+      /* This mirrors RADV's texture/sampler-deref resolution at the level
+       * appropriate to the Ventus RT software descriptor ABI.  The supported
+       * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
+       * sampler derefs resolve through one software descriptor record, just
+       * as RADV first resolves them to its hardware descriptor pair. */
+      Value *binding = ConstantInt::get(i32, texture_var->data.binding);
+      Value *base = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
+      Value *format = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
+      Value *stride = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
+      Value *width = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_AUX);
+      Value *byte_size = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE);
+      Value *height = builder.CreateSelect(
+         builder.CreateICmpUGT(stride, ConstantInt::get(i32, 0)),
+         builder.CreateUDiv(byte_size, stride), ConstantInt::get(i32, 0));
+      Value *filter = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
+      Value *address_mode_u = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
+      Value *address_mode_v = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
+      Value *coord_value = value(nir_src_for_ssa(coord));
+      Value *u = asFloat(component(coord_value, 0));
+      Value *v = asFloat(component(coord_value, 1));
+      Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
+      Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
+
+      Value *nearest_x = wrapTexelCoord(floorToI32(scaled_u), width,
+                                        address_mode_u);
+      Value *nearest_y = wrapTexelCoord(floorToI32(scaled_v), height,
+                                        address_mode_v);
+      Value *nearest = sampleTexelRGBA8(base, stride, nearest_x, nearest_y,
+                                        format);
+
+      Value *linear_u = builder.CreateFSub(scaled_u, ConstantFP::get(f32, 0.5));
+      Value *linear_v = builder.CreateFSub(scaled_v, ConstantFP::get(f32, 0.5));
+      Value *linear_x0 = floorToI32(linear_u);
+      Value *linear_y0 = floorToI32(linear_v);
+      Value *frac_u = builder.CreateFSub(linear_u,
+         builder.CreateSIToFP(linear_x0, f32));
+      Value *frac_v = builder.CreateFSub(linear_v,
+         builder.CreateSIToFP(linear_y0, f32));
+      Value *linear_x1 = builder.CreateAdd(linear_x0, ConstantInt::get(i32, 1));
+      Value *linear_y1 = builder.CreateAdd(linear_y0, ConstantInt::get(i32, 1));
+      Value *c00 = sampleTexelRGBA8(base, stride,
+         wrapTexelCoord(linear_x0, width, address_mode_u),
+         wrapTexelCoord(linear_y0, height, address_mode_v), format);
+      Value *c10 = sampleTexelRGBA8(base, stride,
+         wrapTexelCoord(linear_x1, width, address_mode_u),
+         wrapTexelCoord(linear_y0, height, address_mode_v), format);
+      Value *c01 = sampleTexelRGBA8(base, stride,
+         wrapTexelCoord(linear_x0, width, address_mode_u),
+         wrapTexelCoord(linear_y1, height, address_mode_v), format);
+      Value *c11 = sampleTexelRGBA8(base, stride,
+         wrapTexelCoord(linear_x1, width, address_mode_u),
+         wrapTexelCoord(linear_y1, height, address_mode_v), format);
+      Value *linear = buildVector(4, f32, [&](unsigned channel) {
+         Value *top = builder.CreateFAdd(
+            component(c00, channel), builder.CreateFMul(frac_u,
+               builder.CreateFSub(component(c10, channel), component(c00, channel))));
+         Value *bottom = builder.CreateFAdd(
+            component(c01, channel), builder.CreateFMul(frac_u,
+               builder.CreateFSub(component(c11, channel), component(c01, channel))));
+         return builder.CreateFAdd(top, builder.CreateFMul(frac_v,
+            builder.CreateFSub(bottom, top)));
+      });
+      Value *is_linear = builder.CreateICmpEQ(
+         filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
+      return builder.CreateSelect(is_linear, linear, nearest);
+   }
+
    Value *lowerLoadConst(nir_load_const_instr *instr)
    {
       if (instr->def.num_components == 1)
@@ -1762,6 +1963,10 @@ private:
             def = &intrin->def;
          break;
       }
+      case nir_instr_type_tex:
+         result = lowerTex(nir_instr_as_tex(instr));
+         def = &nir_instr_as_tex(instr)->def;
+         break;
       case nir_instr_type_undef:
          result = zeroFor(&nir_instr_as_undef(instr)->def);
          def = &nir_instr_as_undef(instr)->def;

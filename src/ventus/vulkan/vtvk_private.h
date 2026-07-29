@@ -17,6 +17,7 @@
 #define VTVK_QUEUE_FAMILY 0
 #define VTVK_MAX_DESCRIPTOR_BINDINGS 32
 #define VTVK_MAX_BOUND_DESCRIPTOR_SETS 4
+#define VTVK_MAX_PUSH_CONSTANT_SIZE 256
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,11 +44,20 @@ struct vtvk_device {
    struct vk_device vk;
 };
 
+struct vtvk_sampler {
+   VkFilter mag_filter;
+   VkFilter min_filter;
+   VkSamplerAddressMode address_mode_u;
+   VkSamplerAddressMode address_mode_v;
+};
+
 struct vtvk_cmd_buffer {
    struct vk_command_buffer vk;
 
    VkPipeline bound_rt_pipeline;
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+   uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
+   uint32_t push_constants_size;
 };
 
 struct vtvk_acceleration_structure {
@@ -86,9 +96,15 @@ void *vtvk_buffer_host_ptr(VkBuffer buffer, VkDeviceSize offset,
                            VkDeviceSize size);
 void *vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address,
                                      VkDeviceSize size);
+bool vtvk_buffer_host_allocation_from_addr(VkDeviceAddress address,
+                                           const void **base_out,
+                                           VkDeviceSize *size_out,
+                                           VkDeviceSize *offset_out);
 VkPipeline vtvk_cmd_buffer_bound_rt_pipeline(VkCommandBuffer commandBuffer);
 VkDescriptorSet vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
                                                      uint32_t set);
+const void *vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
+                                           uint32_t *size_out);
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding);

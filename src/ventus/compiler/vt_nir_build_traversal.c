@@ -29,6 +29,7 @@ vt_nir_rt_default_config(void)
       .hit_sbt_record_stride = 64,
       .shader_group_handle_size = 32,
       .miss_depth_value = 0x7fffffff,
+      .defer_intersection_reports = false,
       .enable_monolithic_shader_callbacks = false,
       .emit_closest_hit = NULL,
       .emit_miss = NULL,

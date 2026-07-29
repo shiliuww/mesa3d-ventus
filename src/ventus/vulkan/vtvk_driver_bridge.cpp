@@ -58,6 +58,12 @@ static_assert(offsetof(struct vtvk_rt_dispatch_args, global_ray_ref_list_base) =
 static_assert(offsetof(struct vtvk_rt_dispatch_args, global_completion_field_stride) ==
               VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE,
               "RT global completion stride argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constants_addr) ==
+              VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR,
+              "RT push-constant address argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constants_size) ==
+              VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE,
+              "RT push-constant size argument ABI mismatch");
 static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
               VT_NIR_RT_DISPATCH_ARG_SIZE,
               "RT dispatch argument ABI size mismatch");
@@ -93,6 +99,9 @@ struct vtvk_driver_rt_global_consume_info {
    uint32_t max_batch_rays;
    uint64_t miss_sbt_stride_bytes;
    uint64_t hit_sbt_stride_bytes;
+   uint64_t candidate_hit_attribute_base;
+   uint32_t candidate_hit_attribute_stride_bytes;
+   uint32_t reserved;
 };
 
 struct vtvk_driver_rt_resume_request {
@@ -134,6 +143,14 @@ struct vtvk_driver_api {
    int (*vt_rt_get_resume_requests)(
       void *device, struct vtvk_driver_rt_resume_request *requests,
       uint32_t capacity, uint32_t *out_request_count);
+   int (*vt_rt_resume_global_candidates)(
+      void *device, const struct vtvk_driver_rt_global_consume_info *info,
+      const uint32_t *ray_refs, uint32_t ray_ref_count,
+      uint32_t *out_request_count);
+   int (*vt_rt_resume_global_intersections)(
+      void *device, const struct vtvk_driver_rt_global_consume_info *info,
+      const uint32_t *ray_refs, uint32_t ray_ref_count,
+      uint32_t *out_request_count);
 };
 
 struct vtvk_driver_upload {
@@ -339,35 +356,51 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
           api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
 }
 
+/* VkBufferDeviceAddress values are process addresses in this software Vulkan
+ * implementation.  A shader may carry them in an otherwise opaque push
+ * constant block, so copy every referenced Vulkan buffer once into the
+ * Spike address space and rewrite just those 64-bit words in the per-trace
+ * snapshot.  This keeps the command-buffer state API-neutral while giving
+ * physical-storage-buffer loads a real guest address. */
 static bool
-vtvk_global_callback_kernel(const struct vtvk_driver_trace_rays_info *info,
-                            uint32_t stage, uint32_t group,
-                            uint32_t *out_index, const char **out_path,
-                            uint64_t *out_entry)
+vtvk_driver_relocate_push_constant_addresses(struct vtvk_driver_api *api,
+                                              std::vector<uint8_t> *snapshot)
 {
-   uint32_t found = UINT32_MAX;
-   for (uint32_t i = 0; i < info->callback_kernel_count; i++) {
-      if (info->callback_kernel_stages[i] != stage ||
-          info->callback_kernel_groups[i] != group)
-         continue;
-      if (found != UINT32_MAX) {
-         mesa_loge("ventus-vk: global RT has duplicate callback kernels for "
-                   "stage %u SBT group %u", stage, group);
-         return false;
-      }
-      found = i;
-   }
-   if (found == UINT32_MAX || !info->callback_kernel_paths[found]) {
-      mesa_loge("ventus-vk: global RT has no emitted terminal callback kernel "
-                "for stage %u SBT group %u", stage, group);
+   std::unordered_map<uint64_t, uint64_t> guest_bases;
+   if (!snapshot)
       return false;
+
+   for (size_t byte_offset = 0; byte_offset + sizeof(uint64_t) <= snapshot->size();
+        byte_offset += sizeof(uint32_t)) {
+      uint64_t host_address;
+      memcpy(&host_address, snapshot->data() + byte_offset, sizeof(host_address));
+
+      const void *host_base = NULL;
+      VkDeviceSize host_size = 0;
+      VkDeviceSize host_offset = 0;
+      if (!vtvk_buffer_host_allocation_from_addr(host_address, &host_base,
+                                                  &host_size, &host_offset))
+         continue;
+
+      const uint64_t host_base_address = (uint64_t)(uintptr_t)host_base;
+      uint64_t guest_base = 0;
+      auto existing = guest_bases.find(host_base_address);
+      if (existing != guest_bases.end()) {
+         guest_base = existing->second;
+      } else {
+         if (!host_size ||
+             !vtvk_driver_alloc_copy(api, host_base, host_size, &guest_base))
+            return false;
+         guest_bases.emplace(host_base_address, guest_base);
+      }
+
+      if (UINT64_MAX - guest_base < host_offset)
+         return false;
+      const uint64_t guest_address = guest_base + host_offset;
+      memcpy(snapshot->data() + byte_offset, &guest_address,
+             sizeof(guest_address));
    }
-   *out_index = found;
-   *out_path = info->callback_kernel_paths[found];
-   *out_entry = info->callback_kernel_entries[found];
-   if (vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_CALLBACK_DISPATCH"))
-      mesa_logi("ventus-vk: global RT callback stage=%u group=%u index=%u entry=0x%" PRIx64
-                " path=%s", stage, group, found, *out_entry, *out_path);
+
    return true;
 }
 
@@ -600,6 +633,21 @@ vtvk_driver_descriptor_table_slots(const struct vtvk_driver_trace_rays_info *inf
 }
 
 static bool
+vtvk_driver_sampler_address_mode_supported(VkSamplerAddressMode mode)
+{
+   return mode == VK_SAMPLER_ADDRESS_MODE_REPEAT ||
+          mode == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ||
+          mode == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+}
+
+static bool
+vtvk_driver_sampled_format_supported(VkFormat format)
+{
+   return format == VK_FORMAT_R8G8B8A8_UNORM ||
+          format == VK_FORMAT_B8G8R8A8_UNORM;
+}
+
+static bool
 vtvk_driver_upload_descriptor(
    struct vtvk_driver_api *api,
    const struct vtvk_rt_descriptor_source *src,
@@ -627,7 +675,8 @@ vtvk_driver_upload_descriptor(
       break;
    }
 
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
       VkExtent3D extent = {};
       VkFormat format = VK_FORMAT_UNDEFINED;
       void *host = vtvk_image_host_ptr(src->image, &extent, &format);
@@ -636,14 +685,36 @@ vtvk_driver_upload_descriptor(
       uint64_t size = (uint64_t)stride * extent.height *
                       (extent.depth ? extent.depth : 1);
       if (!host || !vtvk_driver_alloc_copy(api, host, size, &record->device_addr)) {
-         mesa_loge("ventus-vk: failed to upload storage image descriptor binding=%u",
+         mesa_loge("ventus-vk: failed to upload image descriptor binding=%u",
                    src->binding);
+         return false;
+      }
+      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+          !vtvk_driver_sampled_format_supported(format)) {
+         mesa_loge("ventus-vk: unsupported sampled RT image format=%u binding=%u",
+                   (unsigned)format, src->binding);
          return false;
       }
       record->byte_size = size;
       record->format = format;
       record->stride = stride;
       record->aux = extent.width;
+      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+         struct vtvk_sampler *sampler =
+            (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
+         if (!sampler ||
+             !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
+             !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v)) {
+            mesa_loge("ventus-vk: unsupported RT sampler binding=%u "
+                      "(only repeat, mirrored-repeat and clamp-to-edge)",
+                      src->binding);
+            return false;
+         }
+         record->sampler_mag_filter = sampler->mag_filter;
+         record->sampler_min_filter = sampler->min_filter;
+         record->sampler_address_mode_u = sampler->address_mode_u;
+         record->sampler_address_mode_v = sampler->address_mode_v;
+      }
       break;
    }
 
@@ -706,6 +777,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t tlas_dev_addr = 0;
    uint64_t image_dev_addr = 0;
    uint64_t camera_dev_addr = 0;
+   uint64_t push_constants_dev_addr = 0;
    uint64_t descriptor_table_dev_addr = 0;
    uint64_t args_dev_addr = 0;
    uint64_t metadata_dev_addr = 0;
@@ -716,6 +788,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t global_cps_dev_addr = 0;
    uint64_t global_completion_dev_addr = 0;
    uint64_t global_hit_attribute_dev_addr = 0;
+   uint64_t global_candidate_hit_attribute_dev_addr = 0;
+   uint32_t global_hit_attribute_stride = 0;
    uint32_t image_width = info->image_extent.width ? info->image_extent.width : info->width;
    uint32_t image_height = info->image_extent.height ? info->image_extent.height : info->height;
    uint32_t image_depth = info->image_extent.depth ? info->image_extent.depth : 1;
@@ -765,7 +839,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
        (!vtvk_driver_resolve(driver.lib, "vt_rt_consume_global",
                              (void **)&driver.vt_rt_consume_global) ||
         !vtvk_driver_resolve(driver.lib, "vt_rt_get_resume_requests",
-                             (void **)&driver.vt_rt_get_resume_requests)))
+                             (void **)&driver.vt_rt_get_resume_requests) ||
+        !vtvk_driver_resolve(driver.lib, "vt_rt_resume_global_candidates",
+                             (void **)&driver.vt_rt_resume_global_candidates) ||
+        !vtvk_driver_resolve(driver.lib, "vt_rt_resume_global_intersections",
+                             (void **)&driver.vt_rt_resume_global_intersections)))
       goto out;
 
    if (info->descriptor_count) {
@@ -826,6 +904,22 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    vtvk_driver_log_u32_words("camera", info->camera_data, info->camera_range,
                              32);
 
+   if (info->push_constants_size) {
+      if (!info->push_constants) {
+         mesa_loge("ventus-vk: driver bridge received a null push-constant snapshot");
+         goto out;
+      }
+      std::vector<uint8_t> push_constants(info->push_constants_size);
+      memcpy(push_constants.data(), info->push_constants, push_constants.size());
+      if (!vtvk_driver_relocate_push_constant_addresses(&driver, &push_constants) ||
+          !vtvk_driver_alloc_copy(&driver, push_constants.data(),
+                                  push_constants.size(),
+                                  &push_constants_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to upload push constants");
+         goto out;
+      }
+   }
+
    if (!vtvk_driver_upload_sbt_region(&driver, info->raygen_sbt,
                                       &args.raygen_sbt, "raygen") ||
        !vtvk_driver_upload_sbt_region(&driver, info->miss_sbt,
@@ -853,6 +947,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.descriptor_table_addr = descriptor_table_dev_addr;
    args.descriptor_count = descriptor_table.size();
    args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
+   args.push_constants_addr = push_constants_dev_addr;
+   args.push_constants_size = info->push_constants_size;
    vtvk_driver_log_u32_words("dispatch_args", &args, sizeof(args), 40);
 
    if (!vtvk_driver_alloc_copy(&driver, &args, sizeof(args), &args_dev_addr)) {
@@ -868,6 +964,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           image_bytes) ||
           !vtvk_bridge_require_rv32_range("camera", camera_dev_addr,
                                           info->camera_range) ||
+          !vtvk_bridge_require_rv32_range("push constants", push_constants_dev_addr,
+                                          info->push_constants_size) ||
           !vtvk_bridge_require_rv32_range("descriptor table",
                                           descriptor_table_dev_addr,
                                           descriptor_table.size() *
@@ -1006,8 +1104,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           global_completion.size()))
          goto out;
 
+      global_hit_attribute_stride = VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES;
       const uint64_t global_hit_attribute_size =
-         (uint64_t)global_queue_capacity * 2 * sizeof(uint32_t);
+         (uint64_t)global_queue_capacity * global_hit_attribute_stride;
       if (!vtvk_driver_alloc_copy(&driver, NULL, global_hit_attribute_size,
                                   &global_hit_attribute_dev_addr)) {
          mesa_loge("ventus-vk: driver bridge failed to allocate global hit attributes");
@@ -1016,6 +1115,16 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       if (!rv64 &&
           !vtvk_bridge_require_rv32_range("global hit attributes",
                                           global_hit_attribute_dev_addr,
+                                          global_hit_attribute_size))
+         goto out;
+      if (!vtvk_driver_alloc_copy(&driver, NULL, global_hit_attribute_size,
+                                  &global_candidate_hit_attribute_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global candidate hit attributes");
+         goto out;
+      }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range("global candidate hit attributes",
+                                          global_candidate_hit_attribute_dev_addr,
                                           global_hit_attribute_size))
          goto out;
 
@@ -1184,10 +1293,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          .miss_sbt_base = args.miss_sbt.addr,
          .hit_sbt_base = args.hit_sbt.addr,
          .capacity_rays = global_queue_capacity,
-         .hit_attribute_stride_bytes = 2 * sizeof(uint32_t),
+         .hit_attribute_stride_bytes = global_hit_attribute_stride,
          .max_batch_rays = vtvk_rt_lanes_per_warp,
          .miss_sbt_stride_bytes = args.miss_sbt.stride,
          .hit_sbt_stride_bytes = args.hit_sbt.stride,
+         .candidate_hit_attribute_base = global_candidate_hit_attribute_dev_addr,
+         .candidate_hit_attribute_stride_bytes = global_hit_attribute_stride,
       };
       auto dispatch_compact = [&](const char *path, uint64_t entry,
                                   const std::vector<uint32_t> &ray_refs,
@@ -1328,6 +1439,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                uint32_t primitive_id = 0;
                float hit_t = -1.0f;
                uint64_t hit_attribute_address = 0;
+               uint64_t hit_shader_record_address = 0;
+               uint32_t hit_shader_record_group = UINT32_MAX;
+               uint32_t completion_status = UINT32_MAX;
                float hit_attributes[2] = {};
                if (request.completed_stage == 1) {
                   const uint32_t fields[] = {
@@ -1337,8 +1451,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                         VT_RT_HIT_RECORD_PRIMITIVE_ID,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_HI,
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO,
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
                   };
-                  uint32_t hit_words[4] = {};
+                  uint32_t hit_words[6] = {};
                   for (uint32_t field = 0; field < ARRAY_SIZE(fields); ++field) {
                      const uint64_t address = global_completion_dev_addr +
                         VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
@@ -1350,10 +1468,29 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                                  sizeof(hit_words[field]), 0, 0) != 0)
                         continue;
                   }
+                  const uint64_t status_address = global_completion_dev_addr +
+                     VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
+                     (uint64_t)request.ray_ref * sizeof(uint32_t);
+                  if (driver.vt_copy_from_dev(driver.device, status_address,
+                                              &completion_status,
+                                              sizeof(completion_status), 0, 0) != 0)
+                     mesa_loge("ventus-vk: global RT completion-status probe read failed "
+                               "ray_ref=%u", request.ray_ref);
                   memcpy(&hit_t, &hit_words[0], sizeof(hit_t));
                   primitive_id = hit_words[1];
                   hit_attribute_address = (uint64_t)hit_words[2] |
                                           ((uint64_t)hit_words[3] << 32);
+                  hit_shader_record_address = (uint64_t)hit_words[4] |
+                                              ((uint64_t)hit_words[5] << 32);
+                  if (hit_shader_record_address &&
+                      driver.vt_copy_from_dev(driver.device,
+                                              hit_shader_record_address - 28,
+                                              &hit_shader_record_group,
+                                              sizeof(hit_shader_record_group),
+                                              0, 0) != 0) {
+                     mesa_loge("ventus-vk: global RT SBT group probe read failed "
+                               "ray_ref=%u", request.ray_ref);
+                  }
                   if (hit_attribute_address &&
                       driver.vt_copy_from_dev(driver.device,
                                               hit_attribute_address,
@@ -1367,26 +1504,52 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                          "phase=%u ray_ref=%u stage=%u addr=%" PRIx64
                          " payload=(%.6f,%.6f,%.6f; d=%.6f; n=%.6f,%.6f,%.6f; r=%.6f) "
                          "bits=(%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x) "
-                         "frame=%u stack=%u continuation=%u launch=(%u,%u,%u)",
+                         "frame=%u stack=%u continuation=%u callback_group=%u "
+                         "launch=(%u,%u,%u)",
                          phase, request.ray_ref, request.completed_stage,
                          request.payload_address, values[0], values[1], values[2],
                          values[3], values[4], values[5], values[6], values[7],
                          bits[0], bits[1], bits[2], bits[3], bits[4], bits[5],
                          bits[6], bits[7], request.cps_frame,
                          request.cps_stack_size, request.continuation_id,
+                         request.callback_group,
                          request.launch_id_x, request.launch_id_y,
                          request.launch_id_z);
                if (request.completed_stage == 1)
                   mesa_logi("ventus-vk: global RT committed hit ray_ref=%u "
-                            "primitive=%u t=%.6f attr_addr=%" PRIx64
-                            " attr=(%.6f,%.6f)", request.ray_ref,
+                          "primitive=%u t=%.6f attr_addr=%" PRIx64
+                            " attr=(%.6f,%.6f) shader_record=%" PRIx64
+                            " group=%u completion_status=%u", request.ray_ref,
                             primitive_id, hit_t, hit_attribute_address,
-                            hit_attributes[0], hit_attributes[1]);
+                            hit_attributes[0], hit_attributes[1],
+                            hit_shader_record_address, hit_shader_record_group,
+                            completion_status);
             }
          };
 
       bool complete = false;
       const uint32_t max_phases = MAX2(info->max_ray_recursion_depth, 1u);
+      const auto log_request_counts =
+         [&](const char *label,
+             const std::vector<struct vtvk_driver_rt_resume_request> &requests,
+             uint32_t phase) {
+            if (!vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_GLOBAL"))
+               return;
+            uint32_t miss = 0, hit = 0, any_hit = 0, intersection = 0;
+            for (const auto &request : requests) {
+               switch (request.completed_stage) {
+               case 0: miss++; break;
+               case 1: hit++; break;
+               case 2: any_hit++; break;
+               case 3: intersection++; break;
+               default: break;
+               }
+            }
+            mesa_logi("ventus-vk: global RT %s phase=%u requests=%zu "
+                      "miss=%u hit=%u any-hit=%u intersection=%u",
+                      label, phase, requests.size(), miss, hit, any_hit,
+                      intersection);
+         };
       for (uint32_t phase = 0; phase <= max_phases; phase++) {
          uint32_t request_count = 0;
          if (driver.vt_rt_consume_global(driver.device, &consume,
@@ -1412,30 +1575,156 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             mesa_loge("ventus-vk: global RT queue consumer request export failed");
             goto out;
          }
+         log_request_counts("traversal", requests, phase);
          if (debug_trace_inputs && phase == 0) {
             for (const auto &request : requests)
                if (request.ray_ref < 16)
                   log_trace_input(request.ray_ref);
          }
+
+         /* Candidate traversal is not a new TraceRay level.  Run its compact
+          * any-hit callback, consume the global control planes, and resume the
+          * same RTcore-private traversal context until every ray reaches a
+          * terminal miss/closest-hit state. */
+         std::vector<struct vtvk_driver_rt_resume_request> terminal_requests;
+         for (uint32_t candidate_round = 0;; candidate_round++) {
+            if (candidate_round >= global_queue_capacity) {
+               mesa_loge("ventus-vk: global RT candidate loop did not converge");
+               goto out;
+            }
+            std::vector<std::vector<uint32_t>> any_hit_callback_refs(
+               info->callback_kernel_count);
+            std::vector<std::vector<uint32_t>> intersection_callback_refs(
+               info->callback_kernel_count);
+            std::vector<uint32_t> any_hit_refs;
+            std::vector<uint32_t> intersection_refs;
+            std::vector<struct vtvk_driver_rt_resume_request> next_requests;
+            for (const auto &request : requests) {
+               if (request.completed_stage != 2 && request.completed_stage != 3) {
+                  terminal_requests.push_back(request);
+                  continue;
+               }
+               const uint32_t callback_stage = request.completed_stage == 2 ?
+                  MESA_SHADER_ANY_HIT : MESA_SHADER_INTERSECTION;
+               uint32_t callback_index = UINT32_MAX;
+               for (uint32_t callback = 0;
+                    callback < info->callback_kernel_count; callback++) {
+                  if (info->callback_kernel_stages[callback] != callback_stage ||
+                      info->callback_kernel_groups[callback] != request.callback_group)
+                     continue;
+                  if (callback_index != UINT32_MAX) {
+                     mesa_loge("ventus-vk: duplicate global candidate callbacks stage=%u group=%u",
+                               callback_stage, request.callback_group);
+                     goto out;
+                  }
+                  callback_index = callback;
+               }
+               if (request.completed_stage == 2) {
+                  any_hit_refs.push_back(request.ray_ref);
+                  /* No any-hit shader is Vulkan's implicit accept path.
+                   * Spike initialized ACCEPT_HIT in this candidate plane. */
+                  if (callback_index != UINT32_MAX)
+                     any_hit_callback_refs[callback_index].push_back(request.ray_ref);
+               } else {
+                  if (callback_index == UINT32_MAX) {
+                     mesa_loge("ventus-vk: procedural candidate has no intersection callback group=%u",
+                               request.callback_group);
+                     goto out;
+                  }
+                  intersection_refs.push_back(request.ray_ref);
+                  intersection_callback_refs[callback_index].push_back(
+                     request.ray_ref);
+               }
+            }
+            if (any_hit_refs.empty() && intersection_refs.empty()) {
+               requests.swap(terminal_requests);
+               log_request_counts("terminal", requests, phase);
+               break;
+            }
+
+            for (uint32_t callback = 0;
+                 callback < intersection_callback_refs.size(); callback++) {
+               const std::vector<uint32_t> &refs = intersection_callback_refs[callback];
+               if (refs.empty())
+                  continue;
+               if (!dispatch_compact(info->callback_kernel_paths[callback],
+                                     info->callback_kernel_entries[callback], refs,
+                                     "ventus_vk_intersection", phase + 1)) {
+                  mesa_loge("ventus-vk: global RT intersection callback dispatch failed group=%u",
+                            info->callback_kernel_groups[callback]);
+                  goto out;
+               }
+            }
+            if (!intersection_refs.empty()) {
+               uint32_t count = 0;
+               if (driver.vt_rt_resume_global_intersections(
+                      driver.device, &consume, intersection_refs.data(),
+                      intersection_refs.size(), &count) != 0) {
+                  mesa_loge("ventus-vk: global RT intersection resume failed");
+                  goto out;
+               }
+               std::vector<struct vtvk_driver_rt_resume_request> resolved(count);
+               uint32_t copied = 0;
+               if (driver.vt_rt_get_resume_requests(
+                      driver.device, resolved.data(), count, &copied) != 0 ||
+                   copied != count) {
+                  mesa_loge("ventus-vk: global RT intersection request export failed");
+                  goto out;
+               }
+               next_requests.insert(next_requests.end(), resolved.begin(), resolved.end());
+            }
+            for (uint32_t callback = 0;
+                 callback < any_hit_callback_refs.size(); callback++) {
+               const std::vector<uint32_t> &refs = any_hit_callback_refs[callback];
+               if (refs.empty())
+                  continue;
+               if (!dispatch_compact(info->callback_kernel_paths[callback],
+                                     info->callback_kernel_entries[callback], refs,
+                                     "ventus_vk_any_hit", phase + 1)) {
+                  mesa_loge("ventus-vk: global RT any-hit callback dispatch failed group=%u",
+                            info->callback_kernel_groups[callback]);
+                  goto out;
+               }
+            }
+            if (!any_hit_refs.empty()) {
+               uint32_t count = 0;
+               if (driver.vt_rt_resume_global_candidates(
+                      driver.device, &consume, any_hit_refs.data(),
+                      any_hit_refs.size(), &count) != 0) {
+                  mesa_loge("ventus-vk: global RT candidate resume failed");
+                  goto out;
+               }
+               std::vector<struct vtvk_driver_rt_resume_request> resumed(count);
+               uint32_t copied = 0;
+               if (driver.vt_rt_get_resume_requests(
+                      driver.device, resumed.data(), count, &copied) != 0 ||
+                   copied != count) {
+                  mesa_loge("ventus-vk: global RT candidate request export failed");
+                  goto out;
+               }
+               next_requests.insert(next_requests.end(), resumed.begin(), resumed.end());
+            }
+            if (next_requests.empty()) {
+               mesa_loge("ventus-vk: global RT candidate handoff lost active rays");
+               goto out;
+            }
+            requests.swap(next_requests);
+            log_request_counts("candidate-resume", requests, phase);
+         }
          std::vector<uint32_t> miss_refs;
          std::vector<uint32_t> hit_refs;
-         std::vector<std::vector<uint32_t>> callback_refs(
-            info->callback_kernel_count);
          std::vector<std::vector<uint32_t>> miss_resume_refs(
             info->resume_kernel_count);
          std::vector<std::vector<uint32_t>> hit_resume_refs(
             info->resume_kernel_count);
          for (const auto &request : requests) {
-            uint32_t callback_stage = 0;
             if (request.completed_stage == 0) {
                miss_refs.push_back(request.ray_ref);
-               callback_stage = MESA_SHADER_MISS;
                if (request.continuation_id < miss_resume_refs.size())
                   miss_resume_refs[request.continuation_id].push_back(
                      request.ray_ref);
             } else if (request.completed_stage == 1) {
                hit_refs.push_back(request.ray_ref);
-               callback_stage = MESA_SHADER_CLOSEST_HIT;
                if (request.continuation_id < hit_resume_refs.size())
                   hit_resume_refs[request.continuation_id].push_back(
                      request.ray_ref);
@@ -1449,17 +1738,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                          request.continuation_id);
                goto out;
             }
-            if (info->callback_kernel_count) {
-               uint32_t callback_index = UINT32_MAX;
-               const char *callback_path = NULL;
-               uint64_t callback_entry = 0;
-               if (!vtvk_global_callback_kernel(info, callback_stage,
-                                                request.callback_group,
-                                                &callback_index, &callback_path,
-                                                &callback_entry))
-                  goto out;
-               callback_refs[callback_index].push_back(request.ray_ref);
-            }
+            /* The global root/resume ELFs already contain miss and
+             * closest-hit.  callback_kernel_* is intentionally reserved for
+             * standalone candidate callbacks (currently any-hit), so a
+             * terminal result must proceed straight to its root
+             * continuation rather than looking for a second terminal ELF. */
          }
 
          if (!hit_refs.empty() && debug_payload_rgb) {
@@ -1482,27 +1765,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                }
             }
          }
-         for (uint32_t callback = 0; callback < callback_refs.size(); callback++) {
-            const std::vector<uint32_t> &refs = callback_refs[callback];
-            if (refs.empty())
-               continue;
-            const uint32_t stage = info->callback_kernel_stages[callback];
-            const char *name = stage == MESA_SHADER_MISS ?
-               "ventus_vk_miss" : "ventus_vk_closest_hit";
-            if (!dispatch_compact(info->callback_kernel_paths[callback],
-                                  info->callback_kernel_entries[callback], refs,
-                                  name, phase + 1)) {
-               mesa_loge("ventus-vk: global RT callback dispatch failed "
-                         "stage=%u group=%u", stage,
-                         info->callback_kernel_groups[callback]);
-               goto out;
-            }
-         }
-         /* Completion stage is uniform within each terminal callback.  Keep
-          * it uniform for its resume batch as well: mixing miss and hit
-          * records here immediately re-diverges the raygen post-trace path,
-          * even though those records have no data dependency on one another.
-          */
+         /* Keep miss and hit root-resume batches separate.  Mixing them would
+          * immediately re-diverge the raygen post-trace path even though the
+          * records themselves have no data dependency on one another. */
          for (uint32_t continuation = 0;
               continuation < miss_resume_refs.size(); continuation++) {
             if (!dispatch_compact(info->resume_kernel_paths[continuation],

@@ -89,6 +89,37 @@ vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
    return NULL;
 }
 
+bool
+vtvk_buffer_host_allocation_from_addr(VkDeviceAddress address,
+                                      const void **base_out,
+                                      VkDeviceSize *size_out,
+                                      VkDeviceSize *offset_out)
+{
+   for (struct vtvk_buffer *buffer = vtvk_buffer_list; buffer;
+        buffer = buffer->next) {
+      if (!buffer->map)
+         continue;
+
+      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
+      if (address < base)
+         continue;
+
+      VkDeviceSize offset = address - base;
+      if (offset > buffer->size)
+         continue;
+
+      if (base_out)
+         *base_out = buffer->map;
+      if (size_out)
+         *size_out = buffer->size;
+      if (offset_out)
+         *offset_out = offset;
+      return true;
+   }
+
+   return false;
+}
+
 void *
 vtvk_image_host_ptr(VkImage _image, VkExtent3D *extent_out,
                     VkFormat *format_out)

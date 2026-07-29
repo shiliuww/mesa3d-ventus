@@ -57,6 +57,9 @@ struct vtvk_rt_dispatch_args {
    uint32_t global_ray_ref_generation;
    uint32_t global_completion_field_stride;
    uint32_t reserved_global;
+   uint64_t push_constants_addr;
+   uint32_t push_constants_size;
+   uint32_t reserved_push_constants;
 };
 
 struct vtvk_rt_descriptor_record {
@@ -68,6 +71,10 @@ struct vtvk_rt_descriptor_record {
    uint64_t byte_size;
    uint32_t stride;
    uint32_t aux;
+   uint32_t sampler_mag_filter;
+   uint32_t sampler_min_filter;
+   uint32_t sampler_address_mode_u;
+   uint32_t sampler_address_mode_v;
 };
 
 struct vtvk_rt_descriptor_source {
@@ -76,6 +83,7 @@ struct vtvk_rt_descriptor_source {
    uint32_t binding;
    VkAccelerationStructureKHR acceleration_structure;
    VkImage image;
+   VkSampler sampler;
    VkBuffer buffer;
    VkDeviceSize offset;
    VkDeviceSize range;
@@ -88,6 +96,8 @@ struct vtvk_driver_trace_rays_info {
    VkFormat image_format;
    void *camera_data;
    VkDeviceSize camera_range;
+   const void *push_constants;
+   uint32_t push_constants_size;
    const VkStridedDeviceAddressRegionKHR *raygen_sbt;
    const VkStridedDeviceAddressRegionKHR *miss_sbt;
    const VkStridedDeviceAddressRegionKHR *hit_sbt;

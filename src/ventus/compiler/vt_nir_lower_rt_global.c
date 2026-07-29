@@ -37,6 +37,26 @@ static nir_def *global_callback_slot_addr(
    nir_def *ray_ref);
 static bool constant_def_u32(nir_def *def, uint32_t *value);
 
+static bool
+lower_global_push_constants(nir_builder *b, nir_intrinsic_instr *intrin,
+                            void *data)
+{
+   (void)data;
+   if (intrin->intrinsic != nir_intrinsic_load_push_constant)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *base = load_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR, 64);
+   nir_def *offset = nir_iadd_imm(b, nir_u2u64(b, intrin->src[0].ssa),
+                                  nir_intrinsic_base(intrin));
+   nir_def_rewrite_uses(&intrin->def,
+      nir_load_global(b, intrin->def.num_components, intrin->def.bit_size,
+                      nir_iadd(b, base, offset)));
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
 /* Completion owns the logical frame identity.  All callback and resume
  * accesses to mutable ray state must derive their physical CPS address from
  * that one identity; do not introduce a second payload-address authority in
@@ -322,6 +342,8 @@ lower_global_shader(nir_shader *shader, const struct vt_nir_rt_config *config,
    };
    bool progress = nir_shader_intrinsics_pass(
       shader, lower_global_cps_stack_base, nir_metadata_none, (void *)&state);
+   progress |= nir_shader_intrinsics_pass(shader, lower_global_push_constants,
+                                          nir_metadata_none, NULL);
    progress |= nir_shader_intrinsics_pass(shader, lower_global_worker_slot,
                                           nir_metadata_none, (void *)&state);
    if (resume_shader)
@@ -375,6 +397,12 @@ callback_ray_ref(nir_builder *b)
    return nir_load_global(b, 1, 32, nir_iadd(b, list, offset));
 }
 
+nir_def *
+vt_nir_rt_global_callback_ray_ref(nir_builder *b)
+{
+   return callback_ray_ref(b);
+}
+
 static nir_def *
 completion_field_addr(nir_builder *b, nir_def *ray_ref,
                       enum vt_rt_global_completion_field field)
@@ -423,6 +451,13 @@ load_completion_addr(nir_builder *b, nir_def *ray_ref,
    return nir_pack_64_2x32_split(
       b, load_completion_field(b, ray_ref, lo),
       load_completion_field(b, ray_ref, lo + 1));
+}
+
+nir_def *
+vt_nir_rt_global_load_completion_addr(
+   nir_builder *b, nir_def *ray_ref, enum vt_rt_global_completion_field lo)
+{
+   return load_completion_addr(b, ray_ref, lo);
 }
 
 static bool
@@ -503,6 +538,24 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
          (enum vt_rt_global_completion_field)(
             VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE + word));
    }
+   if (offset >= sp->candidate_hit_record_base_bytes &&
+       offset < sp->candidate_hit_record_base_bytes +
+                    VT_RT_HIT_RECORD_WORD_COUNT * 4) {
+      uint32_t word =
+         (offset - sp->candidate_hit_record_base_bytes) / 4;
+      return completion_field_addr(
+         b, ray_ref,
+         (enum vt_rt_global_completion_field)(
+            VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE + word));
+   }
+   if (offset >= sp->control_base_bytes &&
+       offset < sp->control_base_bytes + VT_RT_CONTROL_WORD_COUNT * 4) {
+      uint32_t word = (offset - sp->control_base_bytes) / 4;
+      return completion_field_addr(
+         b, ray_ref,
+         (enum vt_rt_global_completion_field)(
+            VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE + word));
+   }
    if (offset >= sp->payload_base_bytes &&
        offset < sp->total_size_bytes) {
       uint32_t payload_offset = offset - sp->payload_base_bytes;
@@ -516,10 +569,20 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
    if (offset >= sp->hit_attrib_base_bytes &&
        offset < sp->hit_attrib_base_bytes + sp->hit_attrib_size_bytes) {
       uint32_t attrib_offset = offset - sp->hit_attrib_base_bytes;
-      return nir_iadd_imm(b, load_completion_addr(
-                              b, ray_ref,
-                              VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO),
-                          attrib_offset);
+      nir_def *status = load_completion_field(
+         b, ray_ref, VT_RT_GLOBAL_COMPLETION_STATUS);
+      nir_def *candidate = nir_ior(
+         b, nir_ieq_imm(b, status,
+                         VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE),
+         nir_ieq_imm(b, status,
+                         VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB));
+      nir_def *committed_addr = load_completion_addr(
+         b, ray_ref, VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO);
+      nir_def *candidate_addr = load_completion_addr(
+         b, ray_ref,
+         VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
+      return nir_iadd_imm(b, nir_bcsel(b, candidate, candidate_addr,
+                                       committed_addr), attrib_offset);
    }
    return NULL;
 }
@@ -579,11 +642,15 @@ vt_nir_lower_rt_global_callback(nir_shader *shader,
    if (!shader || !config ||
        config->execution_model != VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK ||
        (shader->info.stage != MESA_SHADER_MISS &&
-        shader->info.stage != MESA_SHADER_CLOSEST_HIT))
+        shader->info.stage != MESA_SHADER_CLOSEST_HIT &&
+        shader->info.stage != MESA_SHADER_ANY_HIT &&
+        shader->info.stage != MESA_SHADER_INTERSECTION))
       return false;
 
    NIR_PASS(_, shader, nir_opt_constant_folding);
    bool progress = false;
+   progress |= nir_shader_intrinsics_pass(shader, lower_global_push_constants,
+                                          nir_metadata_none, NULL);
    progress |= nir_shader_intrinsics_pass(shader, lower_global_callback_slot,
                                           nir_metadata_none, (void *)config);
    progress |= nir_shader_intrinsics_pass(shader, lower_global_callback_launch_id,

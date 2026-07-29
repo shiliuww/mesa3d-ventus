@@ -153,6 +153,10 @@ struct vt_nir_rt_config {
    uint32_t hit_sbt_record_stride;
    uint32_t shader_group_handle_size;
    uint32_t miss_depth_value;
+   /* Keep reportIntersectionEXT in an intersection shader intact until the
+    * per-hit-group callback builder can inline that group's any-hit code at
+    * the report site. */
+   bool defer_intersection_reports;
    bool enable_monolithic_shader_callbacks;
    vt_nir_rt_emit_shader_cb emit_closest_hit;
    vt_nir_rt_emit_shader_cb emit_miss;
@@ -244,6 +248,11 @@ nir_def *vt_nir_load_payload_word(nir_builder *b,
                                   enum vt_rt_payload_word word,
                                   uint32_t bit_size);
 
+nir_def *vt_nir_load_ray_state_word(nir_builder *b,
+                                    const struct vt_nir_rt_config *config,
+                                    enum vt_rt_shader_layout layout,
+                                    enum vt_rt_slot_word word);
+
 void vt_nir_store_payload_word(nir_builder *b,
                                const struct vt_nir_rt_config *config,
                                enum vt_rt_shader_layout layout,
@@ -315,6 +324,11 @@ bool vt_nir_lower_rt_global_resume(nir_shader *shader,
  * the global queue/completion planes selected by the compact dispatch list. */
 bool vt_nir_lower_rt_global_callback(nir_shader *shader,
                                      const struct vt_nir_rt_config *config);
+
+/* Compact callback helpers for driver-side report-site lowering. */
+nir_def *vt_nir_rt_global_callback_ray_ref(nir_builder *b);
+nir_def *vt_nir_rt_global_load_completion_addr(
+   nir_builder *b, nir_def *ray_ref, enum vt_rt_global_completion_field lo);
 
 bool vt_nir_lower_rt_abi(nir_shader *shader,
                          const struct vt_nir_rt_config *config);
@@ -426,7 +440,10 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT = 256,
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_GENERATION = 260,
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE = 264,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 272,
+   /* Immutable Vulkan push-constant snapshot shared by all RT ELFs. */
+   VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR = 272,
+   VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE = 280,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 288,
 };
 
 enum vt_nir_rt_descriptor_record {
@@ -438,7 +455,14 @@ enum vt_nir_rt_descriptor_record {
    VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE = 24,
    VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE = 32,
    VT_NIR_RT_DESCRIPTOR_RECORD_AUX = 36,
-   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 40,
+   /* Sampler state for combined image samplers.  Keep this in the software
+    * descriptor ABI rather than baking a default sampler into the LLVM
+    * lowering: different Vulkan descriptors may share one image. */
+   VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER = 40,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIN_FILTER = 44,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U = 48,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V = 52,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 56,
 };
 
 #ifdef __cplusplus

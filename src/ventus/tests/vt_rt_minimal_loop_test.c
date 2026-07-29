@@ -163,6 +163,17 @@ count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
    return count;
 }
 
+static unsigned
+count_variables(nir_shader *shader, nir_variable_mode mode)
+{
+   unsigned count = 0;
+   nir_foreach_variable_in_shader(var, shader) {
+      if (var->data.mode == mode)
+         count++;
+   }
+   return count;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -185,6 +196,8 @@ main(int argc, char **argv)
       build_abi_probe_closest_hit(&options);
    nir_shader *any_hit = build_abi_probe_any_hit(&options);
    nir_shader *intersection = build_abi_probe_intersection(&options);
+   nir_shader *deferred_intersection =
+      build_abi_probe_intersection(&options);
    nir_shader *terminating_any_hit =
       build_abi_probe_terminating_any_hit(&options);
    nir_shader *payload_location_probe =
@@ -340,6 +353,7 @@ main(int argc, char **argv)
                closest_before.ventus_rt_load_slot);
    VT_RT_CHECK(closest_after.ventus_rt_store_slot >
                closest_before.ventus_rt_store_slot);
+   VT_RT_CHECK(count_variables(closest_hit, nir_var_shader_call_data) == 0);
 
    /* Terminal global closest-hit consumes a compact ray_ref list, reads the
     * queue/completion planes, and writes the original payload address. */
@@ -409,6 +423,21 @@ main(int argc, char **argv)
                intersection_before.ventus_rt_load_slot);
    VT_RT_CHECK(intersection_after.ventus_rt_store_slot >
                intersection_before.ventus_rt_store_slot);
+
+   struct vt_nir_rt_config deferred_config = config;
+   deferred_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+   deferred_config.defer_intersection_reports = true;
+   struct vt_rt_intrinsic_counts deferred_intersection_before;
+   vt_rt_count_intrinsics(deferred_intersection, &deferred_intersection_before);
+   progress = vt_nir_lower_rt_abi(deferred_intersection, &deferred_config);
+   VT_RT_CHECK(!progress);
+   struct vt_rt_intrinsic_counts deferred_intersection_after;
+   vt_rt_count_intrinsics(deferred_intersection, &deferred_intersection_after);
+   /* The per-group callback builder must still see the original report so it
+    * can inline the matching any-hit shader at precisely this program point. */
+   VT_RT_CHECK(deferred_intersection_after.report_ray_intersection == 1);
+   VT_RT_CHECK(deferred_intersection_after.ventus_rt_load_slot ==
+               deferred_intersection_before.ventus_rt_load_slot);
 
    progress = vt_nir_lower_rt_payload(payload_location_probe, &config);
    VT_RT_CHECK(progress);
