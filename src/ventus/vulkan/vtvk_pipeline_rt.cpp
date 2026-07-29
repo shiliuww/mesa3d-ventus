@@ -1058,6 +1058,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &abi);
+      if (vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
+         rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE;
       rt_io_config.enable_monolithic_shader_callbacks = true;
       rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
       rt_io_config.emit_closest_hit =

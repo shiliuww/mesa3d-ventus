@@ -67,6 +67,28 @@ if prog_glslang.found()
     build_by_default : false,
   )
 
+  vt_rt_global_abi_test = executable(
+    'vt_rt_global_abi_test',
+    [
+      'vt_rt_global_abi_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil],
+    build_by_default : false,
+  )
+
+  vt_rt_global_queue_nir_test = executable(
+    'vt_rt_global_queue_nir_test',
+    [
+      'vt_rt_global_queue_nir_test.c',
+      libventus_nir_files,
+    ],
+    include_directories : [inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil],
+    build_by_default : false,
+  )
+
   test(
     'vt_rt_minimal_loop',
     vt_rt_minimal_loop_test,
@@ -97,6 +119,18 @@ if prog_glslang.found()
   test(
     'vt_nir_rt_canonicalize',
     vt_nir_rt_canonicalize_test,
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_rt_global_abi',
+    vt_rt_global_abi_test,
+    suite : ['ventus'],
+  )
+
+  test(
+    'vt_rt_global_queue_nir',
+    vt_rt_global_queue_nir_test,
     suite : ['ventus'],
   )
 endif

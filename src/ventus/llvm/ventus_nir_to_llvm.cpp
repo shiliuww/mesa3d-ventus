@@ -1509,6 +1509,50 @@ private:
          return loadGlobalForDef(value(intrin->src[0]), ConstantInt::get(i32, 0),
                                 &intrin->def);
       }
+      case nir_intrinsic_store_global: {
+         Value *addr = asInt32(value(intrin->src[1]));
+         Value *stored = value(intrin->src[0]);
+         const unsigned components = nir_src_num_components(intrin->src[0]);
+
+         for (unsigned i = 0; i < components; ++i) {
+            Value *componentAddr = addr;
+            if (i)
+               componentAddr = builder.CreateAdd(componentAddr,
+                                                  ConstantInt::get(i32, i * 4));
+            StoreInst *store = builder.CreateStore(asInt32(component(stored, i)),
+                                                    globalPtr(componentAddr));
+            store->setAlignment(Align(4));
+         }
+         return nullptr;
+      }
+      case nir_intrinsic_global_atomic: {
+         const nir_atomic_op op = nir_intrinsic_atomic_op(intrin);
+         AtomicRMWInst::BinOp binop;
+
+         switch (op) {
+         case nir_atomic_op_iadd:
+            binop = AtomicRMWInst::Add;
+            break;
+         case nir_atomic_op_iand:
+            binop = AtomicRMWInst::And;
+            break;
+         case nir_atomic_op_ior:
+            binop = AtomicRMWInst::Or;
+            break;
+         case nir_atomic_op_ixor:
+            binop = AtomicRMWInst::Xor;
+            break;
+         default:
+            unsupportedDefs.insert(&intrin->def);
+            return undefFor(&intrin->def);
+         }
+
+         AtomicRMWInst *atomic = builder.CreateAtomicRMW(
+            binop, globalPtr(asInt32(value(intrin->src[0]))),
+            asInt32(value(intrin->src[1])), MaybeAlign(4),
+            AtomicOrdering::SequentiallyConsistent);
+         return atomic;
+      }
       case nir_intrinsic_image_deref_store:
       case nir_intrinsic_image_store: {
          storeStorageImage(value(intrin->src[1]), value(intrin->src[3]));

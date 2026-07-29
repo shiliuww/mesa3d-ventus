@@ -157,6 +157,7 @@ main(int argc, char **argv)
    config.hit_sbt_record_stride = 96;
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *miss =
       vt_rt_build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
    nir_shader *closest_hit = build_abi_probe_closest_hit(&options);
@@ -180,22 +181,23 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.payload_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
    VT_RT_CHECK(abi.payload_size_bytes == 48);
-   VT_RT_CHECK(abi.continuation_base_bytes >=
-               abi.payload_base_bytes + abi.payload_size_bytes);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
-   VT_RT_CHECK(abi.continuation_size_bytes == 640);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(abi.control_base_bytes == 96);
-   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 128);
-   VT_RT_CHECK(abi.hit_record_base_bytes == 208);
-   VT_RT_CHECK(abi.hit_attrib_base_bytes == 288);
-   VT_RT_CHECK(abi.payload_base_bytes == 320);
-   VT_RT_CHECK(abi.continuation_base_bytes == 368);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 2);
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
+   VT_RT_CHECK(abi.control_base_bytes == 112);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 224);
+   VT_RT_CHECK(abi.hit_attrib_base_bytes == 304);
+   VT_RT_CHECK(abi.payload_base_bytes == 336);
+   VT_RT_CHECK(abi.total_size_bytes ==
+               VT_RT_ABI_PDS_BASE_BYTES + 384);
    VT_RT_CHECK(abi.total_size_bytes ==
                VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
@@ -204,6 +206,18 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
    VT_RT_CHECK(before.trace_ray == 1);
+
+   void *cps_mem_ctx = ralloc_context(NULL);
+   struct vt_nir_rt_cps_info cps = {};
+   VT_RT_CHECK(vt_nir_lower_rt_cps(cps_raygen, &cps, cps_mem_ctx));
+   VT_RT_CHECK(cps.num_resume_shaders == 1);
+   VT_RT_CHECK(cps.resume_shaders[0] != NULL);
+   /* This shader ends immediately after traceRayEXT, so it has no live CPS
+    * state.  The pass must report the real zero-sized frame, not invent one. */
+   VT_RT_CHECK(cps.frame_size_bytes == 0);
+   struct vt_rt_intrinsic_counts cps_after;
+   vt_rt_count_intrinsics(cps_raygen, &cps_after);
+   VT_RT_CHECK(cps_after.trace_ray == 0);
 
    bool progress = vt_nir_lower_rt_io_monolithic(raygen, &config);
    VT_RT_CHECK(progress);
@@ -359,7 +373,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
    printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
-          "rt_traverse=1 rt_release=1 "
+          "rt_traverse=1 rt_release=1 traversal_resumable=1 "
+          "cps_resume_shaders=%u cps_frame=%u "
           "abi_candidate_committed=1 abi_control=1 sbt_entry_calc=1 "
           "hit_sbt_base=0x%llx "
           "hit_sbt_stride=%u shader_group_handle_size=%u "
@@ -367,6 +382,7 @@ main(int argc, char **argv)
           "per_lane_scratch=%u "
           "abi_total=%u control_base=%u candidate_base=%u committed_base=%u "
           "hit_attrib_base=%u payload_base=%u manual_max_scratch=%u\n",
+          cps.num_resume_shaders, cps.frame_size_bytes,
           (unsigned long long)config.hit_sbt_base_addr,
           config.hit_sbt_record_stride, config.shader_group_handle_size,
           after.ventus_rt_store_slot + closest_after.ventus_rt_store_slot +
@@ -387,6 +403,7 @@ main(int argc, char **argv)
           manual_per_lane_scratch);
 
    ralloc_free(raygen);
+   ralloc_free(cps_mem_ctx);
    ralloc_free(miss);
    ralloc_free(closest_hit);
    ralloc_free(any_hit);

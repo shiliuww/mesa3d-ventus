@@ -11,6 +11,7 @@
 
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
+#include "ventus/compiler/vt_rt_global_abi.h"
 #include "ventus/compiler/vt_rt_abi.h"
 
 #ifdef __cplusplus
@@ -19,6 +20,7 @@ extern "C" {
 
 enum vt_rt_execution_model {
    VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP = 0,
+   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE = 1,
 };
 
 enum vt_rt_shader_layout {
@@ -54,8 +56,6 @@ struct vt_nir_scratchpad_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   uint32_t continuation_base_bytes;
-   uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -72,8 +72,6 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   uint32_t continuation_base_bytes;
-   uint32_t continuation_size_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -110,6 +108,22 @@ struct vt_nir_rt_result {
    nir_def *shader_record_ptr;
 };
 
+struct vt_nir_rt_global_queue_args {
+   /*
+    * Low 32-bit Ventus global address of a RayQueueHeader followed by
+    * field-major planes.  Vulkan device-address values are normalized to this
+    * target address domain by the driver before reaching NIR.
+    */
+   nir_def *base_addr;
+   nir_def *field_stride_bytes;
+};
+
+struct vt_nir_rt_submission_mailbox_args {
+   /* Low 32-bit global address of this lane's reusable submit mailbox. */
+   nir_def *base_addr;
+   nir_def *generation;
+};
+
 struct vt_nir_pipeline_scratch_info {
    uint32_t per_lane_scratch_size;
    uint32_t shader_scratch_size[VT_RT_LAYOUT_COUNT];
@@ -138,6 +152,18 @@ struct vt_nir_rt_config {
 struct vt_nir_rt_config vt_nir_rt_default_config(void);
 
 struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
+
+struct vt_rt_global_queue_layout
+vt_nir_rt_global_queue_layout(uint32_t capacity_rays);
+
+nir_def *vt_nir_rt_global_queue_field_addr(
+   nir_builder *b, const struct vt_nir_rt_global_queue_args *queue,
+   enum vt_rt_global_trace_field field, nir_def *ray_ref);
+
+void vt_nir_rt_store_submission_mailbox(
+   nir_builder *b, const struct vt_nir_rt_submission_mailbox_args *mailbox,
+   const struct vt_nir_rt_trace_params *params, nir_def *parent_frame,
+   nir_def *phase_generation, nir_def *depth);
 
 void vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
                                        const struct vt_nir_rt_abi_layout *layout);
@@ -249,6 +275,21 @@ bool vt_nir_lower_shader_scratch(nir_shader *shader,
 
 bool vt_nir_lower_descriptors(nir_shader *shader);
 
+/*
+ * CPS preparation for raygen traceRayEXT calls.  Mesa owns the exact live SSA
+ * spill layout; Ventus only consumes the resulting frame size and resume
+ * shaders.  The caller owns mem_ctx and therefore the returned shader array.
+ */
+struct vt_nir_rt_cps_info {
+   nir_shader **resume_shaders;
+   uint32_t num_resume_shaders;
+   uint32_t frame_size_bytes;
+};
+
+bool vt_nir_lower_rt_cps(nir_shader *shader,
+                         struct vt_nir_rt_cps_info *info,
+                         void *mem_ctx);
+
 enum vt_nir_rt_canonicalize_status {
    VT_NIR_RT_CANONICALIZE_SUCCESS = 0,
    VT_NIR_RT_CANONICALIZE_RESIDUAL_FUNCTION_TEMP,
@@ -300,7 +341,15 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR = 152,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_COUNT = 160,
    VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE = 164,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 168,
+   /* Driver-private CPS spill arena.  It is unused by the legacy path. */
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_ARENA_ADDR = 168,
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_FRAME_STRIDE = 176,
+   VT_NIR_RT_DISPATCH_ARG_CONTINUATION_CONTEXT_COUNT = 180,
+   /* Transitional wavefront handoff pool; legacy traversal ignores it. */
+   VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_BASE = 184,
+   VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_STRIDE = 192,
+   VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_GENERATION = 196,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 200,
 };
 
 enum vt_nir_rt_descriptor_record {

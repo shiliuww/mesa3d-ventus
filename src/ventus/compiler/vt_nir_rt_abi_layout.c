@@ -30,8 +30,6 @@ vt_nir_rt_default_abi_layout(void)
    layout.payload_base_bytes = VT_RT_ABI_PAYLOAD_BASE_BYTES;
    layout.payload_size_bytes = VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES;
 
-   layout.continuation_base_bytes = VT_RT_ABI_CONTINUATION_BASE_BYTES;
-   layout.continuation_size_bytes = VT_RT_ABI_CONTINUATION_SIZE_BYTES;
    layout.total_size_bytes = VT_RT_ABI_TOTAL_SIZE_BYTES;
 
    return layout;
@@ -66,10 +64,6 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
          layout->hit_attrib_base_bytes;
       config->scratchpad[i].hit_attrib_size_bytes =
          layout->hit_attrib_size_bytes;
-      config->scratchpad[i].continuation_base_bytes =
-         layout->continuation_base_bytes;
-      config->scratchpad[i].continuation_size_bytes =
-         layout->continuation_size_bytes;
       config->scratchpad[i].total_size_bytes = layout->total_size_bytes;
       config->scratchpad[i].stride_bytes =
          MAX2(config->scratchpad[i].stride_bytes, layout->total_size_bytes);
