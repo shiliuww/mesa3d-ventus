@@ -122,6 +122,21 @@ vtvk_buffer_resolve_device_address(VkDeviceAddress address,
    return false;
 }
 
+bool
+vtvk_buffer_host_allocation_from_addr(VkDeviceAddress address,
+                                      const void **base_out,
+                                      VkDeviceSize *size_out,
+                                      VkDeviceSize *offset_out)
+{
+   void *host_base = NULL;
+   if (!vtvk_buffer_resolve_device_address(address, &host_base, NULL,
+                                           size_out, offset_out))
+      return false;
+   if (base_out)
+      *base_out = host_base;
+   return true;
+}
+
 void *
 vtvk_image_host_ptr(VkImage _image, VkExtent3D *extent_out,
                     VkFormat *format_out)

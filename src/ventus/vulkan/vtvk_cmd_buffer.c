@@ -52,16 +52,16 @@ vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
 }
 
 const void *
-vtvk_cmd_buffer_rt_push_constants(VkCommandBuffer commandBuffer,
-                                  uint32_t *size_out,
-                                  VkShaderStageFlags *stages_out)
+vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
+                               uint32_t *size_out,
+                               VkShaderStageFlags *stages_out)
 {
    struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
    if (size_out)
-      *size_out = cmd ? cmd->rt_push_constant_size : 0;
+      *size_out = cmd ? cmd->push_constants_size : 0;
    if (stages_out)
-      *stages_out = cmd ? cmd->rt_push_constant_stages : 0;
-   return cmd && cmd->rt_push_constant_size ? cmd->rt_push_constants : NULL;
+      *stages_out = cmd ? cmd->push_constants_stages : 0;
+   return cmd && cmd->push_constants_size ? cmd->push_constants : NULL;
 }
 static VkResult
 vtvk_cmd_buffer_create(struct vk_command_pool *pool,
@@ -94,9 +94,9 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
    cmd->bound_rt_pipeline = VK_NULL_HANDLE;
    memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
-   memset(cmd->rt_push_constants, 0, sizeof(cmd->rt_push_constants));
-   cmd->rt_push_constant_size = 0;
-   cmd->rt_push_constant_stages = 0;
+   memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
+   cmd->push_constants_size = 0;
+   cmd->push_constants_stages = 0;
    vk_command_buffer_reset(cmd_buffer);
 }
 
@@ -223,13 +223,21 @@ vtvk_CmdPushConstants(VkCommandBuffer commandBuffer,
 {
    struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
    (void)layout;
-   if (!cmd || !pValues || offset > VTVK_MAX_PUSH_CONSTANTS_SIZE ||
-       size > VTVK_MAX_PUSH_CONSTANTS_SIZE - offset)
+   const VkShaderStageFlags rt_stages =
+      VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+      VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+      VK_SHADER_STAGE_MISS_BIT_KHR |
+      VK_SHADER_STAGE_INTERSECTION_BIT_KHR |
+      VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+   if (!cmd || !(stageFlags & rt_stages) ||
+       !pValues || offset > VTVK_MAX_PUSH_CONSTANT_SIZE ||
+       size > VTVK_MAX_PUSH_CONSTANT_SIZE - offset)
       return;
 
-   memcpy(cmd->rt_push_constants + offset, pValues, size);
-   cmd->rt_push_constant_size = MAX2(cmd->rt_push_constant_size, offset + size);
-   cmd->rt_push_constant_stages |= stageFlags;
+   memcpy(cmd->push_constants + offset, pValues, size);
+   cmd->push_constants_size = MAX2(cmd->push_constants_size, offset + size);
+   cmd->push_constants_stages |= stageFlags & rt_stages;
 }
 
 VKAPI_ATTR void VKAPI_CALL

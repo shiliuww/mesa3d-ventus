@@ -15,6 +15,7 @@
  */
 
 #define VT_RT_ABI_VERSION 2
+/* Legacy scratch traversal records carry this tag; the global ABI does not. */
 #define VT_RT_ABI_TAG (0x56540000u | VT_RT_ABI_VERSION)
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16

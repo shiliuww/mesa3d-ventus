@@ -21,7 +21,16 @@ struct vt_nir_to_llvm_options {
    const char *module_name;
    const char *target_triple;
    const char *data_layout;
+   /* Optional entry symbol for independently dispatched RT callback kernels. */
+   const char *entry_point_name;
+   bool entry_point_is_kernel;
    bool require_ssa_function_temps;
+   /* Global RT has no PDS-visible launch-id slots. */
+   bool global_rt_wavefront;
+   /* A global CPS resume uses a compact physical dispatch and restores its
+    * logical launch ID from the completion plane.  It needs a ray-ref-count
+    * guard, not the root raygen image-extent guard. */
+   bool global_rt_compact_resume;
 };
 
 llvm::Module *vt_nir_to_llvm_translate(nir_shader **shaders,

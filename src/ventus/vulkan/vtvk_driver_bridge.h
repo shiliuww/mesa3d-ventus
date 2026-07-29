@@ -40,9 +40,26 @@ struct vtvk_rt_dispatch_args {
    uint64_t continuation_arena_addr;
    uint32_t continuation_frame_stride;
    uint32_t continuation_context_count;
-   uint64_t push_constant_addr;
-   uint32_t push_constant_size;
-   uint32_t push_constant_reserved;
+   uint64_t submission_mailbox_base;
+   uint32_t submission_mailbox_stride;
+   uint32_t submission_mailbox_generation;
+   uint64_t global_queue_base;
+   uint32_t global_queue_capacity;
+   uint32_t global_queue_generation;
+   uint64_t global_cps_arena_addr;
+   uint32_t global_cps_frame_stride;
+   uint32_t max_ray_recursion_depth;
+   uint64_t global_completion_base;
+   uint32_t global_completion_capacity;
+   uint32_t global_completion_generation;
+   uint64_t global_ray_ref_list_base;
+   uint32_t global_ray_ref_count;
+   uint32_t global_ray_ref_generation;
+   uint32_t global_completion_field_stride;
+   uint32_t reserved_global;
+   uint64_t push_constants_addr;
+   uint32_t push_constants_size;
+   uint32_t reserved_push_constants;
 };
 
 struct vtvk_rt_descriptor_record {
@@ -54,6 +71,10 @@ struct vtvk_rt_descriptor_record {
    uint64_t byte_size;
    uint32_t stride;
    uint32_t aux;
+   uint32_t sampler_mag_filter;
+   uint32_t sampler_min_filter;
+   uint32_t sampler_address_mode_u;
+   uint32_t sampler_address_mode_v;
 };
 
 struct vtvk_rt_descriptor_source {
@@ -75,6 +96,9 @@ struct vtvk_driver_trace_rays_info {
    VkFormat image_format;
    void *camera_data;
    VkDeviceSize camera_range;
+   const void *push_constants;
+   uint32_t push_constants_size;
+   VkShaderStageFlags push_constants_stages;
    const VkStridedDeviceAddressRegionKHR *raygen_sbt;
    const VkStridedDeviceAddressRegionKHR *miss_sbt;
    const VkStridedDeviceAddressRegionKHR *hit_sbt;
@@ -84,13 +108,21 @@ struct vtvk_driver_trace_rays_info {
    uint32_t depth;
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
+   uint32_t max_ray_recursion_depth;
+   enum vtvk_rt_execution_profile execution_profile;
+   bool rt_uses_rv64;
    const char *kernel_path;
    uint64_t kernel_entry;
+   const char *const *resume_kernel_paths;
+   const uint64_t *resume_kernel_entries;
+   uint32_t resume_kernel_count;
+   const char *const *callback_kernel_paths;
+   const uint64_t *callback_kernel_entries;
+   const uint32_t *callback_kernel_groups;
+   const uint32_t *callback_kernel_stages;
+   uint32_t callback_kernel_count;
    const struct vtvk_rt_descriptor_source *descriptors;
    uint32_t descriptor_count;
-   const void *push_constant_data;
-   uint32_t push_constant_size;
-   VkShaderStageFlags push_constant_stages;
 };
 
 bool vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info);

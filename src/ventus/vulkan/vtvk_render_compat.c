@@ -7,17 +7,6 @@
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 
-struct vtvk_sampler {
-   VkFilter mag_filter;
-   VkFilter min_filter;
-   VkSamplerAddressMode address_mode_u;
-   VkSamplerAddressMode address_mode_v;
-   VkBool32 compare_enable;
-   VkBool32 unnormalized_coordinates;
-   float min_lod;
-   float max_lod;
-};
-
 struct vtvk_render_pass {
    uint32_t attachment_count;
    uint32_t subpass_count;
@@ -45,6 +34,7 @@ vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
 }
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_CreateSampler(VkDevice _device,
                    const VkSamplerCreateInfo *pCreateInfo,
@@ -590,15 +580,15 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
 {
    (void)commandBuffer;
    (void)dstImageLayout;
-   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)dstImage);
-   if (!image || !image->map || !pRegions)
+   struct vtvk_image *dst = vtvk_handle_to_ptr((uint64_t)dstImage);
+   if (!dst || !dst->map || !pRegions)
       return;
 
-   const uint32_t bpp = vtvk_format_bytes_per_pixel(image->format);
+   const uint32_t bpp = vtvk_format_bytes_per_pixel(dst->format);
    for (uint32_t r = 0; r < regionCount; r++) {
       const VkBufferImageCopy *region = &pRegions[r];
 
-      /* The current image carrier stores the base mip only. */
+      /* The current image carrier stores only mip 0 and layer 0. */
       if (region->imageSubresource.mipLevel != 0 ||
           region->imageSubresource.baseArrayLayer != 0 ||
           region->imageSubresource.layerCount != 1 ||
@@ -606,30 +596,35 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
           region->imageOffset.z < 0)
          continue;
 
-      uint32_t row_length = region->bufferRowLength ?
-                               region->bufferRowLength :
-                               region->imageExtent.width;
-      uint32_t image_height = region->bufferImageHeight ?
-                                 region->bufferImageHeight :
-                                 region->imageExtent.height;
-      if (row_length < region->imageExtent.width ||
-          image_height < region->imageExtent.height)
+      const uint32_t width = region->imageExtent.width;
+      const uint32_t height = region->imageExtent.height;
+      const uint32_t depth = region->imageExtent.depth;
+      const uint32_t row_length =
+         region->bufferRowLength ? region->bufferRowLength : width;
+      const uint32_t image_height =
+         region->bufferImageHeight ? region->bufferImageHeight : height;
+      const uint32_t x = (uint32_t)region->imageOffset.x;
+      const uint32_t y0 = (uint32_t)region->imageOffset.y;
+      const uint32_t z0 = (uint32_t)region->imageOffset.z;
+      if (!width || !height || !depth ||
+          row_length < width || image_height < height ||
+          x > dst->extent.width || width > dst->extent.width - x ||
+          y0 > dst->extent.height || height > dst->extent.height - y0 ||
+          z0 > dst->extent.depth || depth > dst->extent.depth - z0)
          continue;
 
-      for (uint32_t z = 0; z < region->imageExtent.depth; z++) {
-         for (uint32_t y = 0; y < region->imageExtent.height; y++) {
-            VkDeviceSize src_offset = region->bufferOffset +
-               (((VkDeviceSize)z * image_height + y) * row_length * bpp);
-            VkDeviceSize dst_offset =
-               (((VkDeviceSize)(region->imageOffset.z + (int32_t)z) *
-                    image->extent.height +
-                  (uint32_t)region->imageOffset.y + y) * image->extent.width +
-                 (uint32_t)region->imageOffset.x) * bpp;
-            VkDeviceSize bytes = (VkDeviceSize)region->imageExtent.width * bpp;
+      for (uint32_t z = 0; z < depth; z++) {
+         for (uint32_t y = 0; y < height; y++) {
+            const VkDeviceSize src_offset = region->bufferOffset +
+               ((VkDeviceSize)z * image_height + y) * row_length * bpp;
+            const VkDeviceSize dst_offset =
+               (((VkDeviceSize)(z0 + z) * dst->extent.height + y0 + y) *
+                   dst->extent.width + x) * bpp;
+            const VkDeviceSize bytes = (VkDeviceSize)width * bpp;
             void *src = vtvk_buffer_host_ptr(srcBuffer, src_offset, bytes);
-            if (src && dst_offset <= image->size &&
-                bytes <= image->size - dst_offset)
-               memcpy((uint8_t *)image->map + dst_offset, src, bytes);
+            if (src && dst_offset <= dst->size &&
+                bytes <= dst->size - dst_offset)
+               memcpy((uint8_t *)dst->map + dst_offset, src, bytes);
          }
       }
    }

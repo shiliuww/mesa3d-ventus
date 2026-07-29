@@ -172,10 +172,39 @@ count_load_slot_from_const_addr(nir_shader *shader, uint32_t addr)
    return count;
 }
 
+static unsigned
+count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
+static unsigned
+count_variables(nir_shader *shader, nir_variable_mode mode)
+{
+   unsigned count = 0;
+   nir_foreach_variable_in_shader(var, shader) {
+      if (var->data.mode == mode)
+         count++;
+   }
+   return count;
+}
+
 int
 main(int argc, char **argv)
 {
-   VT_RT_CHECK(argc == 2);
+   VT_RT_CHECK(argc == 3);
    glsl_type_singleton_init_or_ref();
 
    const nir_shader_compiler_options options = {0};
@@ -184,11 +213,18 @@ main(int argc, char **argv)
    config.hit_sbt_record_stride = 96;
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *global_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *global_loop_raygen = vt_rt_load_raygen_spirv(argv[2], &options);
    nir_shader *miss =
       vt_rt_build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
    nir_shader *closest_hit = build_abi_probe_closest_hit(&options);
+   nir_shader *global_callback_closest_hit =
+      build_abi_probe_closest_hit(&options);
    nir_shader *any_hit = build_abi_probe_any_hit(&options);
    nir_shader *intersection = build_abi_probe_intersection(&options);
+   nir_shader *deferred_intersection =
+      build_abi_probe_intersection(&options);
    nir_shader *terminating_any_hit =
       build_abi_probe_terminating_any_hit(&options);
    nir_shader *payload_location_probe =
@@ -225,9 +261,10 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_ABI_CPS_HEADER_BASE_BYTES);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_ABI_TAG == 148);
-   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_ADDR == 184);
-   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_SIZE == 192);
-   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 200);
+   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR == 272);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE == 280);
+   VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 288);
    VT_RT_CHECK(abi.control_base_bytes == 112);
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
    VT_RT_CHECK(abi.hit_record_base_bytes == 224);
@@ -236,6 +273,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.payload_base_bytes + abi.payload_size_bytes ==
                VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(abi.total_size_bytes ==
+               VT_RT_ABI_PDS_BASE_BYTES + 384);
+   VT_RT_CHECK(abi.total_size_bytes ==
                VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
@@ -243,6 +282,82 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
    VT_RT_CHECK(before.trace_ray == 1);
+
+   void *cps_mem_ctx = ralloc_context(NULL);
+   fprintf(stderr, "stage cps-terminal\n");
+   struct vt_nir_rt_cps_info cps = {};
+   VT_RT_CHECK(vt_nir_lower_rt_cps(cps_raygen, &cps, cps_mem_ctx));
+   VT_RT_CHECK(cps.num_resume_shaders == 1);
+   VT_RT_CHECK(cps.resume_shaders[0] != NULL);
+   /* This shader ends immediately after traceRayEXT, so it has no live CPS
+    * state.  The pass must report the real zero-sized frame, not invent one. */
+   VT_RT_CHECK(cps.frame_size_bytes == 0);
+   struct vt_rt_intrinsic_counts cps_after;
+   vt_rt_count_intrinsics(cps_raygen, &cps_after);
+   VT_RT_CHECK(cps_after.trace_ray == 0);
+
+   struct vt_nir_rt_config global_config = vt_nir_rt_default_config();
+   fprintf(stderr, "stage global-terminal\n");
+   global_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+   /* The profile gate must not accidentally invoke any PDS ABI lower. */
+   VT_RT_CHECK(!vt_nir_lower_rt_abi(global_raygen, &global_config));
+   struct vt_nir_rt_cps_info global_cps = {};
+   VT_RT_CHECK(vt_nir_lower_rt_cps(global_raygen, &global_cps, cps_mem_ctx));
+   fprintf(stderr, "stage global-terminal-cps-done\n");
+   VT_RT_CHECK(global_cps.num_resume_shaders == 1);
+   VT_RT_CHECK(vt_nir_lower_rt_global_raygen(global_raygen, &global_config));
+   fprintf(stderr, "stage global-terminal-lowered\n");
+   nir_validate_shader(global_raygen, "after Ventus global RT raygen lowering");
+   struct vt_rt_intrinsic_counts global_after;
+   vt_rt_count_intrinsics(global_raygen, &global_after);
+   VT_RT_CHECK(global_after.trace_ray == 0);
+   VT_RT_CHECK(global_after.ventus_rt_enqueue == 1);
+   VT_RT_CHECK(vt_nir_lower_rt_enqueue(global_raygen));
+   VT_RT_CHECK(count_intrinsic(global_raygen,
+                               nir_intrinsic_ventus_rt_enqueue) == 0);
+   VT_RT_CHECK(count_intrinsic(global_raygen,
+                               nir_intrinsic_global_atomic) >= 4);
+   VT_RT_CHECK(global_after.ventus_rt_traverse == 0);
+   VT_RT_CHECK(global_after.ventus_rt_release == 0);
+   VT_RT_CHECK(global_after.ventus_rt_load_slot == 0);
+   VT_RT_CHECK(global_after.ventus_rt_store_slot == 0);
+   VT_RT_CHECK(global_after.load_shared == 0);
+   VT_RT_CHECK(global_after.store_shared == 0);
+   VT_RT_CHECK(count_intrinsic(global_raygen,
+                               nir_intrinsic_ventus_rt_worker_id) == 1);
+   VT_RT_CHECK(global_raygen->scratch_size == 0);
+   fprintf(stderr, "stage cps-loop\n");
+
+   /* A loop with code after traceRayEXT must become a CPS resume, not a
+    * terminal producer.  Lower both parts and require the re-trace path to
+    * publish a second mailbox record through the same root CPS frame ABI. */
+   struct vt_nir_rt_cps_info loop_cps = {};
+   VT_RT_CHECK(vt_nir_lower_rt_cps(global_loop_raygen, &loop_cps, cps_mem_ctx));
+   VT_RT_CHECK(loop_cps.num_resume_shaders == 1);
+   VT_RT_CHECK(loop_cps.frame_size_bytes > 0);
+   VT_RT_CHECK(vt_nir_lower_rt_global_raygen(global_loop_raygen, &global_config));
+   fprintf(stderr, "stage global-loop-resume\n");
+   VT_RT_CHECK(count_intrinsic(global_loop_raygen,
+                               nir_intrinsic_rt_trace_ray) == 0);
+   VT_RT_CHECK(count_intrinsic(global_loop_raygen,
+                               nir_intrinsic_ventus_rt_enqueue) == 1);
+   VT_RT_CHECK(vt_nir_lower_rt_enqueue(global_loop_raygen));
+   VT_RT_CHECK(count_intrinsic(global_loop_raygen,
+                               nir_intrinsic_ventus_rt_enqueue) == 0);
+   VT_RT_CHECK(vt_nir_lower_rt_global_resume(loop_cps.resume_shaders[0],
+                                               &global_config));
+   nir_validate_shader(loop_cps.resume_shaders[0],
+                       "after Ventus global CPS loop resume lowering");
+   VT_RT_CHECK(count_intrinsic(loop_cps.resume_shaders[0],
+                               nir_intrinsic_rt_resume) == 0);
+   VT_RT_CHECK(count_intrinsic(loop_cps.resume_shaders[0],
+                               nir_intrinsic_rt_trace_ray) == 0);
+   VT_RT_CHECK(count_intrinsic(loop_cps.resume_shaders[0],
+                               nir_intrinsic_ventus_rt_enqueue) >= 1);
+   VT_RT_CHECK(vt_nir_lower_rt_enqueue(loop_cps.resume_shaders[0]));
+   VT_RT_CHECK(count_intrinsic(loop_cps.resume_shaders[0],
+                               nir_intrinsic_ventus_rt_enqueue) == 0);
+   fprintf(stderr, "stage legacy\n");
 
    bool progress = vt_nir_lower_rt_io_monolithic(raygen, &config);
    VT_RT_CHECK(progress);
@@ -292,6 +407,28 @@ main(int argc, char **argv)
                closest_before.ventus_rt_load_slot);
    VT_RT_CHECK(closest_after.ventus_rt_store_slot >
                closest_before.ventus_rt_store_slot);
+   VT_RT_CHECK(count_variables(closest_hit, nir_var_shader_call_data) == 0);
+
+   /* Terminal global closest-hit consumes a compact ray_ref list, reads the
+    * queue/completion planes, and writes the original payload address. */
+   progress = vt_nir_lower_rt_abi(global_callback_closest_hit, &config);
+   VT_RT_CHECK(progress);
+   struct vt_nir_rt_config callback_config = vt_nir_rt_default_config();
+   callback_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK;
+   VT_RT_CHECK(vt_nir_lower_rt_global_callback(global_callback_closest_hit,
+                                                &callback_config));
+   nir_validate_shader(global_callback_closest_hit,
+                       "after Ventus global terminal closest-hit lowering");
+   struct vt_rt_intrinsic_counts callback_after;
+   vt_rt_count_intrinsics(global_callback_closest_hit, &callback_after);
+   VT_RT_CHECK(callback_after.ventus_rt_load_slot == 0);
+   VT_RT_CHECK(callback_after.ventus_rt_store_slot == 0);
+   VT_RT_CHECK(count_intrinsic(global_callback_closest_hit,
+                               nir_intrinsic_ventus_rt_dispatch_index) > 0);
+   VT_RT_CHECK(count_intrinsic(global_callback_closest_hit,
+                               nir_intrinsic_load_global) > 0);
+   VT_RT_CHECK(count_intrinsic(global_callback_closest_hit,
+                               nir_intrinsic_store_global) > 0);
 
    struct vt_rt_intrinsic_counts any_before;
    vt_rt_count_intrinsics(any_hit, &any_before);
@@ -354,6 +491,21 @@ main(int argc, char **argv)
                      abi.hit_record_base_bytes +
                      VT_RT_HIT_RECORD_HIT_T * 4) == 1);
 
+   struct vt_nir_rt_config deferred_config = config;
+   deferred_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+   deferred_config.defer_intersection_reports = true;
+   struct vt_rt_intrinsic_counts deferred_intersection_before;
+   vt_rt_count_intrinsics(deferred_intersection, &deferred_intersection_before);
+   progress = vt_nir_lower_rt_abi(deferred_intersection, &deferred_config);
+   VT_RT_CHECK(!progress);
+   struct vt_rt_intrinsic_counts deferred_intersection_after;
+   vt_rt_count_intrinsics(deferred_intersection, &deferred_intersection_after);
+   /* The per-group callback builder must still see the original report so it
+    * can inline the matching any-hit shader at precisely this program point. */
+   VT_RT_CHECK(deferred_intersection_after.report_ray_intersection == 1);
+   VT_RT_CHECK(deferred_intersection_after.ventus_rt_load_slot ==
+               deferred_intersection_before.ventus_rt_load_slot);
+
    progress = vt_nir_lower_rt_payload(payload_location_probe, &config);
    VT_RT_CHECK(progress);
    uint32_t absolute_payload_base =
@@ -413,7 +565,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(manual_scratch_info.shader_scratch_size[VT_RT_LAYOUT_CLOSEST_HIT] == 80);
 
    printf("PASS vt_rt_minimal_loop spirv_input=1 trace_ray_lowered=1 "
-          "rt_traverse=1 rt_release=1 "
+          "rt_traverse=1 rt_release=1 traversal_resumable=1 "
+          "cps_resume_shaders=%u cps_frame=%u "
           "abi_candidate_committed=1 abi_control=1 sbt_entry_calc=1 "
           "hit_sbt_base=0x%llx "
           "hit_sbt_stride=%u shader_group_handle_size=%u "
@@ -421,6 +574,7 @@ main(int argc, char **argv)
           "per_lane_scratch=%u "
           "abi_total=%u control_base=%u candidate_base=%u committed_base=%u "
           "hit_attrib_base=%u payload_base=%u manual_max_scratch=%u\n",
+          cps.num_resume_shaders, cps.frame_size_bytes,
           (unsigned long long)config.hit_sbt_base_addr,
           config.hit_sbt_record_stride, config.shader_group_handle_size,
           after.ventus_rt_store_slot + closest_after.ventus_rt_store_slot +
@@ -441,6 +595,10 @@ main(int argc, char **argv)
           manual_per_lane_scratch);
 
    ralloc_free(raygen);
+   ralloc_free(cps_mem_ctx);
+   ralloc_free(global_raygen);
+   ralloc_free(global_callback_closest_hit);
+   ralloc_free(global_loop_raygen);
    ralloc_free(miss);
    ralloc_free(closest_hit);
    ralloc_free(any_hit);

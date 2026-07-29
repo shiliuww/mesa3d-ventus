@@ -56,9 +56,11 @@ load_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
       b, 1, 32, vt_nir_scratchpad_addr(b, config, layout, byte_offset));
 }
 
-static nir_def *
-load_ray_state_word(nir_builder *b, const struct vt_nir_rt_config *config,
-                    enum vt_rt_shader_layout layout, enum vt_rt_slot_word word)
+nir_def *
+vt_nir_load_ray_state_word(nir_builder *b,
+                           const struct vt_nir_rt_config *config,
+                           enum vt_rt_shader_layout layout,
+                           enum vt_rt_slot_word word)
 {
    const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
    return load_rt_slot_word(b, config, layout,
@@ -70,9 +72,9 @@ load_ray_state_vec3(nir_builder *b, const struct vt_nir_rt_config *config,
                     enum vt_rt_shader_layout layout, enum vt_rt_slot_word first_word)
 {
    return nir_vec3(b,
-                   load_ray_state_word(b, config, layout, first_word),
-                   load_ray_state_word(b, config, layout, first_word + 1),
-                   load_ray_state_word(b, config, layout, first_word + 2));
+                   vt_nir_load_ray_state_word(b, config, layout, first_word),
+                   vt_nir_load_ray_state_word(b, config, layout, first_word + 1),
+                   vt_nir_load_ray_state_word(b, config, layout, first_word + 2));
 }
 
 static void
@@ -231,7 +233,11 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
       return false;
    if (state->require_explicit_location && !var->data.explicit_location)
       return false;
-   if (var->data.explicit_location && var->data.location < 0)
+   /* A callback payload without a SPIR-V Location decoration is still a
+    * valid single payload interface in the global CPS ABI.  Its driver
+    * location is the canonical fallback; only callers that explicitly
+    * require a Location must reject it. */
+   if (state->require_explicit_location && var->data.location < 0)
       return false;
 
    b->cursor = nir_after_instr(instr);
@@ -369,8 +375,15 @@ vt_nir_lower_rt_payload(nir_shader *shader,
       build_payload_location_map(shader, payload_modes);
 
    bool progress = false;
+   /* Global CPS frames preserve ray payload state without allocating any PDS.
+    * Raygen payload interfaces may be shader_temp variables without an
+    * explicit Vulkan location, so use their lowered driver location here.
+    * Keep ordinary function temporaries as CPS SSA spills. */
+   const bool global_cps_payload =
+      config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
    progress |= lower_rt_vars(shader, nir_var_shader_temp, config,
-                             payload_base, true, &payload_locations);
+                             payload_base, !global_cps_payload,
+                             &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_function_temp, config,
                              payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,
@@ -433,13 +446,13 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                                 VT_RT_HIT_RECORD_HIT_T, 32);
       break;
    case nir_intrinsic_load_ray_t_min:
-      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
+      replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
       break;
    case nir_intrinsic_load_ray_flags:
-      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_FLAGS);
+      replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_FLAGS);
       break;
    case nir_intrinsic_load_cull_mask:
-      replacement = load_ray_state_word(b, config, layout, VT_RT_SLOT_CULL_MASK);
+      replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_CULL_MASK);
       break;
    case nir_intrinsic_load_primitive_id:
       replacement = load_active_hit_record_word(b, config, layout,
@@ -521,6 +534,9 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_instr_remove(&intrin->instr);
       return true;
    case nir_intrinsic_report_ray_intersection: {
+      if (config->defer_intersection_reports &&
+          b->shader->info.stage == MESA_SHADER_INTERSECTION)
+         return false;
       nir_def *hit_t = intrin->src[0].ssa;
       nir_def *hit_kind = intrin->src[1].ssa;
       nir_def *committed_status =
@@ -530,11 +546,11 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          vt_nir_load_hit_record_word(b, config, layout,
                                      VT_RT_HIT_RECORD_HIT_T, 32);
       nir_def *ray_tmax =
-         load_ray_state_word(b, config, layout, VT_RT_SLOT_TMAX);
+         vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMAX);
       nir_def *current_tmax =
          nir_bcsel(b, nir_ieq_imm(b, committed_status, VT_RT_STATUS_HIT),
                    committed_tmax, ray_tmax);
-      nir_def *tmin = load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
+      nir_def *tmin = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
       nir_def *accepted =
          nir_iand(b, nir_fge(b, current_tmax, hit_t),
                   nir_fge(b, hit_t, tmin));
@@ -612,7 +628,7 @@ lower_shader_record_ptr_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          config->shader_group_handle_size);
    } else if (layout == VT_RT_LAYOUT_MISS) {
       nir_def *miss_index = nir_u2u64(
-         b, load_ray_state_word(b, config, layout, VT_RT_SLOT_MISS_INDEX));
+         b, vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_MISS_INDEX));
       nir_def *miss_stride =
          load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_STRIDE, 64);
       nir_def *miss_offset = nir_iadd_imm(

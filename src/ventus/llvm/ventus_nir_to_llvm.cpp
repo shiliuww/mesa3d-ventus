@@ -25,6 +25,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -33,15 +34,13 @@
 #include "vulkan/vulkan_core.h"
 
 #include "ventus/compiler/vt_nir.h"
+#include "ventus/common/ventus_kernel_metadata.h"
 
 using namespace llvm;
 
 namespace {
 
-enum {
-   VTVK_KNL_ARG_BASE = 4,
-   VENTUS_KERNEL_CALLING_CONV = 104,
-};
+enum { VENTUS_KERNEL_CALLING_CONV = 104 };
 
 static std::string
 stage_name(mesa_shader_stage stage)
@@ -107,13 +106,19 @@ residual_function_temp(const nir_shader *shader)
 
 class VentusNirToLlvm {
 public:
-   VentusNirToLlvm(LLVMContext &context, Module &module)
+   VentusNirToLlvm(LLVMContext &context, Module &module,
+                   const struct vt_nir_to_llvm_options *options)
       : context(context), module(module), builder(context),
         i1(Type::getInt1Ty(context)), i32(Type::getInt32Ty(context)),
         i64(Type::getInt64Ty(context)), f32(Type::getFloatTy(context)),
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
-        debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")) {}
+        debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")),
+        globalRtWavefront(options && options->global_rt_wavefront),
+        globalRtCompactResume(options && options->global_rt_compact_resume),
+        entryPointName(options && options->entry_point_name ?
+                       options->entry_point_name : ""),
+        entryPointIsKernel(options && options->entry_point_is_kernel) {}
 
    bool translate(nir_shader *shader, bool requireSsaFunctionTemps)
    {
@@ -151,9 +156,11 @@ public:
 
       BasicBlock *first = firstBlock(&impl->body);
       if (first) {
-         if (needsRaygenLaunchGuard(shader)) {
+         if (needsRaygenLaunchGuard(shader) || needsCompactResumeGuard(shader)) {
             returnTarget = BasicBlock::Create(context, "raygen.exit", fn);
-            builder.CreateCondBr(raygenLaunchIdInBounds(), first, returnTarget);
+            Value *inBounds = globalRtCompactResume ?
+               compactResumeDispatchInBounds() : raygenLaunchIdInBounds();
+            builder.CreateCondBr(inBounds, first, returnTarget);
          } else {
             builder.CreateBr(first);
          }
@@ -190,6 +197,10 @@ private:
    bool noopRtIntrinsics;
    bool earlyExit;
    bool debugLowering;
+   bool globalRtWavefront;
+   bool globalRtCompactResume;
+   std::string entryPointName;
+   bool entryPointIsKernel;
    bool translationFailed = false;
 
    std::unordered_map<const nir_def *, Value *> defs;
@@ -335,17 +346,17 @@ private:
 
    Value *sharedPtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 3));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 3));
    }
 
    Value *globalPtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 1));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 1));
    }
 
    Value *privatePtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 5));
    }
 
    Value *rtScratchBase()
@@ -387,9 +398,9 @@ private:
 
    Value *loadI32Global(Value *base, uint32_t offset)
    {
-      Value *addr = asInt32(base);
+      Value *addr = asAddress(base);
       if (offset)
-         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+         addr = builder.CreateAdd(addr, ConstantInt::get(addr->getType(), offset));
       LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
       load->setAlignment(Align(4));
       return load;
@@ -397,9 +408,9 @@ private:
 
    Value *loadI32GlobalVolatile(Value *base, uint32_t offset)
    {
-      Value *addr = asInt32(base);
+      Value *addr = asAddress(base);
       if (offset)
-         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+         addr = builder.CreateAdd(addr, ConstantInt::get(addr->getType(), offset));
       LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
       load->setAlignment(Align(4));
       load->setVolatile(true);
@@ -409,8 +420,15 @@ private:
    Value *dispatchArgsBase()
    {
       Value *metadataBase =
-         callI32Intrinsic("llvm.riscv.ventus.kernel.metadata");
-      return loadI32Global(metadataBase, VTVK_KNL_ARG_BASE);
+         callAddressIntrinsic("llvm.riscv.ventus.kernel.metadata");
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(metadataBase, ConstantInt::get(i64,
+               VENTUS_KNL64_ARG_BASE))));
+         load->setAlignment(Align(8));
+         return load;
+      }
+      return loadI32Global(metadataBase, VENTUS_KNL32_ARG_BASE);
    }
 
    Value *dispatchArgI32(uint32_t offset)
@@ -435,6 +453,16 @@ private:
       }
    }
 
+   Value *rtWorkerId()
+   {
+      /* One Ventus hart owns one resident vector warp, so mhartid is the
+       * globally unique physical worker ID required by the mailbox ABI. */
+      FunctionType *type = FunctionType::get(i32, false);
+      InlineAsm *read_mhartid =
+         InlineAsm::get(type, "csrr $0, mhartid", "=r", false);
+      return builder.CreateCall(type, read_mhartid, {});
+   }
+
    Value *raygenLaunchIdComponent(unsigned i)
    {
       assert(i < 3);
@@ -445,7 +473,21 @@ private:
 
    bool needsRaygenLaunchGuard(nir_shader *shader)
    {
-      return !noopRtIntrinsics && shader->info.stage == MESA_SHADER_RAYGEN;
+      return !noopRtIntrinsics && !globalRtCompactResume &&
+             shader->info.stage == MESA_SHADER_RAYGEN;
+   }
+
+   bool needsCompactResumeGuard(nir_shader *shader)
+   {
+      return !noopRtIntrinsics && globalRtCompactResume &&
+             (shader->info.stage == MESA_SHADER_RAYGEN || entryPointIsKernel);
+   }
+
+   Value *compactResumeDispatchInBounds()
+   {
+      Value *index = primaryDispatchPixelComponent(0);
+      Value *count = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT);
+      return builder.CreateICmpULT(index, count);
    }
 
    Value *raygenLaunchIdInBounds()
@@ -471,15 +513,21 @@ private:
          raygenLaunchId[i] = primaryDispatchPixelComponent(i);
       }
 
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
-      storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
+      if (!globalRtWavefront) {
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
+         storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
+      }
    }
 
    Value *rayLaunchId()
    {
       if (noopRtIntrinsics)
          return ConstantAggregateZero::get(StructType::get(context, {i32, i32, i32}));
+      if (globalRtWavefront)
+         return buildVector(3, i32, [&](unsigned i) {
+            return raygenLaunchIdComponent(i);
+         });
       return buildVector(3, i32, [&](unsigned i) {
          switch (i) {
          case 0:
@@ -514,11 +562,20 @@ private:
 
    Value *descriptorRecordBase(Value *binding)
    {
-      Value *table = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR);
+      Value *table = dispatchArgsBase();
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(table, ConstantInt::get(i64,
+               VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR))));
+         load->setAlignment(Align(8));
+         table = load;
+      } else {
+         table = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR);
+      }
       Value *stride =
          dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE);
       return builder.CreateAdd(
-         table, builder.CreateMul(asInt32(binding), stride));
+         asAddress(table), builder.CreateMul(asAddress(binding), asAddress(stride)));
    }
 
    Value *descriptorRecordI32(Value *binding, uint32_t offset)
@@ -529,6 +586,14 @@ private:
    Value *descriptorAddressForBinding(Value *binding, const nir_def *def)
    {
       (void)def;
+      Value *base = descriptorRecordBase(binding);
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(base, ConstantInt::get(i64,
+               VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR))));
+         load->setAlignment(Align(8));
+         return load;
+      }
       return descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
    }
 
@@ -539,8 +604,8 @@ private:
 
    Value *descriptorValueForDef(const nir_def *def, Value *addr)
    {
-      if (def->bit_size == 64 && addr->getType()->isIntegerTy(64))
-         return addr;
+      if (def->bit_size == 64)
+         return asInt64(addr);
       Value *addr32 = asInt32(addr);
       if (def->bit_size == 64)
          return builder.CreateZExt(addr32, i64);
@@ -560,17 +625,18 @@ private:
 
    Value *loadGlobalForDef(Value *base, Value *offset, const nir_def *def)
    {
-      Value *addr = builder.CreateAdd(asInt32(base), asInt32(offset));
+      Value *addr = builder.CreateAdd(asAddress(base), asAddress(offset));
       auto loadScalar = [&](unsigned component) -> Value * {
          Value *componentAddr = addr;
          if (component)
             componentAddr =
-               builder.CreateAdd(componentAddr, ConstantInt::get(i32, component * 4));
+               builder.CreateAdd(componentAddr, ConstantInt::get(addr->getType(),
+                                                                  component * 4));
 
          if (def->bit_size == 64) {
             Value *lo = loadI32At(componentAddr);
             Value *hi = loadI32At(builder.CreateAdd(componentAddr,
-                                                    ConstantInt::get(i32, 4)));
+                                                    ConstantInt::get(addr->getType(), 4)));
             return builder.CreateOr(builder.CreateZExt(lo, i64),
                                     builder.CreateShl(builder.CreateZExt(hi, i64),
                                                       ConstantInt::get(i64, 32)));
@@ -595,7 +661,7 @@ private:
       if (!bb)
          return false;
       Function *fn = bb->getParent();
-      return fn && fn->getName() == "main";
+      return fn && (entryPointIsKernel || fn->getName() == "main");
    }
 
    void emitKernelReturn()
@@ -629,12 +695,14 @@ private:
    Function *createEntry(nir_shader *shader)
    {
       std::string name = "vt_" + stage_name(shader->info.stage);
-      if (shader->info.stage == MESA_SHADER_RAYGEN)
+      if (!entryPointName.empty())
+         name = entryPointName;
+      else if (shader->info.stage == MESA_SHADER_RAYGEN)
          name = "main";
       Function *fn =
          Function::Create(FunctionType::get(Type::getVoidTy(context), false),
                           GlobalValue::ExternalLinkage, name, module);
-      if (name == "main")
+      if (entryPointIsKernel || name == "main")
          fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
       return fn;
    }
@@ -642,6 +710,13 @@ private:
    Value *callI32Intrinsic(StringRef name)
    {
       Function *fn = declare(name, i32, {});
+      return builder.CreateCall(fn);
+   }
+
+   Value *callAddressIntrinsic(StringRef name)
+   {
+      Type *addressType = addressBits() == 64 ? i64 : i32;
+      Function *fn = declare(name, addressType, {});
       return builder.CreateCall(fn);
    }
 
@@ -830,6 +905,16 @@ private:
       if (v->getType()->isIntegerTy())
          return builder.CreateZExtOrTrunc(v, i64);
       return builder.CreateZExt(asInt32(v), i64);
+   }
+
+   unsigned addressBits() const
+   {
+      return module.getDataLayout().getPointerSizeInBits(1);
+   }
+
+   Value *asAddress(Value *v)
+   {
+      return addressBits() == 64 ? asInt64(v) : asInt32(v);
    }
 
    Value *asSignedInt64(Value *v)
@@ -1080,117 +1165,205 @@ private:
       builder.CreateCall(fn, {imageBase, x, y, stride, packed});
    }
 
-   Value *floorToI32(Value *value)
+   Value *sampledUnorm8(Value *packed, unsigned shift)
    {
-      Value *number = asFloat(value);
-      Value *truncated = builder.CreateFPToSI(number, i32);
-      Value *truncatedFloat = builder.CreateSIToFP(truncated, f32);
-      Value *needsAdjustment = builder.CreateFCmpOLT(number, truncatedFloat);
-      return builder.CreateSelect(
-         needsAdjustment,
-         builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
-   }
-
-   Value *wrapRepeatI32(Value *value, Value *extent)
-   {
-      Value *remainder = builder.CreateSRem(asInt32(value), asInt32(extent));
-      return builder.CreateSelect(
-         builder.CreateICmpSLT(remainder, ConstantInt::get(i32, 0)),
-         builder.CreateAdd(remainder, extent), remainder);
-   }
-
-   Value *sampleRgba8Channel(Value *base, Value *stride, Value *x, Value *y,
-                             unsigned channel)
-   {
-      Value *row = builder.CreateMul(y, stride);
-      Value *column = builder.CreateMul(x, ConstantInt::get(i32, 4));
-      Value *pixel = loadI32At(builder.CreateAdd(
-         base, builder.CreateAdd(row, column)));
       Value *byte = builder.CreateAnd(
-         builder.CreateLShr(pixel, ConstantInt::get(i32, channel * 8)),
+         builder.CreateLShr(packed, ConstantInt::get(i32, shift)),
          ConstantInt::get(i32, 0xff));
       return builder.CreateFDiv(builder.CreateUIToFP(byte, f32),
                                 ConstantFP::get(f32, 255.0));
    }
 
+   Value *floorToI32(Value *value)
+   {
+      Value *truncated = builder.CreateFPToSI(asFloat(value), i32);
+      Value *truncated_float = builder.CreateSIToFP(truncated, f32);
+      return builder.CreateSelect(
+         builder.CreateFCmpOLT(asFloat(value), truncated_float),
+         builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
+   }
+
+   Value *wrapTexelCoord(Value *coord, Value *extent, Value *address_mode)
+   {
+      Value *safe_extent = builder.CreateSelect(
+         builder.CreateICmpUGT(extent, ConstantInt::get(i32, 0)), extent,
+         ConstantInt::get(i32, 1));
+      Value *max = builder.CreateSub(safe_extent, ConstantInt::get(i32, 1));
+      Value *clamp = builder.CreateSelect(
+         builder.CreateICmpSLT(coord, ConstantInt::get(i32, 0)),
+         ConstantInt::get(i32, 0), coord);
+      clamp = builder.CreateSelect(builder.CreateICmpSGT(clamp, max), max, clamp);
+
+      Value *repeat = builder.CreateSRem(coord, safe_extent);
+      repeat = builder.CreateSelect(builder.CreateICmpSLT(repeat,
+                                                          ConstantInt::get(i32, 0)),
+                                    builder.CreateAdd(repeat, safe_extent), repeat);
+
+      Value *period = builder.CreateMul(safe_extent, ConstantInt::get(i32, 2));
+      Value *mirrored = builder.CreateSRem(coord, period);
+      mirrored = builder.CreateSelect(builder.CreateICmpSLT(mirrored,
+                                                            ConstantInt::get(i32, 0)),
+                                      builder.CreateAdd(mirrored, period), mirrored);
+      mirrored = builder.CreateSelect(
+         builder.CreateICmpSGE(mirrored, safe_extent),
+         builder.CreateSub(builder.CreateSub(period, ConstantInt::get(i32, 1)),
+                           mirrored), mirrored);
+
+      Value *is_repeat = builder.CreateICmpEQ(
+         address_mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_REPEAT));
+      Value *is_mirrored = builder.CreateICmpEQ(
+         address_mode,
+         ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT));
+      return builder.CreateSelect(is_repeat, repeat,
+                                  builder.CreateSelect(is_mirrored, mirrored, clamp));
+   }
+
+   Value *sampleTexelRGBA8Channel(Value *base, Value *stride, Value *x,
+                                  Value *y, Value *format, unsigned channel)
+   {
+      Value *offset = builder.CreateAdd(
+         builder.CreateMul(asAddress(y), asAddress(stride)),
+         builder.CreateMul(asAddress(x),
+                           ConstantInt::get(asAddress(x)->getType(), 4)));
+      Value *packed = loadI32At(builder.CreateAdd(asAddress(base), offset));
+      Value *is_bgra = builder.CreateICmpEQ(
+         format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM));
+      switch (channel) {
+      case 0:
+         return builder.CreateSelect(is_bgra, sampledUnorm8(packed, 16),
+                                     sampledUnorm8(packed, 0));
+      case 1:
+         return sampledUnorm8(packed, 8);
+      case 2:
+         return builder.CreateSelect(is_bgra, sampledUnorm8(packed, 0),
+                                     sampledUnorm8(packed, 16));
+      default:
+         return sampledUnorm8(packed, 24);
+      }
+   }
+
    Value *lowerTex(nir_tex_instr *tex)
    {
-      int coordIndex = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-      int lodIndex = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-      nir_deref_instr *textureDeref =
-         nir_get_tex_deref(tex, nir_tex_src_texture_deref);
-      nir_variable *textureVar = textureDeref ?
-         nir_deref_instr_get_variable(textureDeref) : nullptr;
-
-      bool supported = tex->op == nir_texop_txl &&
-                       tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
-                       tex->coord_components == 2 && !tex->is_array &&
-                       !tex->is_shadow && tex->dest_type == nir_type_float32 &&
-                       tex->def.num_components == 4 && coordIndex >= 0 &&
-                       lodIndex >= 0 &&
-                       nir_src_is_const(tex->src[lodIndex].src) &&
-                       nir_src_as_float(tex->src[lodIndex].src) == 0.0f &&
-                       textureVar && textureVar->data.descriptor_set == 0;
-      if (!supported) {
-         if (debugLowering)
-            fprintf(stderr,
-                    "ventus-nir-to-llvm: unsupported texture operation "
-                    "op=%u dim=%u components=%u\n",
-                    tex->op, tex->sampler_dim, tex->coord_components);
-         unsupportedDefs.insert(&tex->def);
-         translationFailed = true;
-         return undefFor(&tex->def);
+      nir_deref_instr *texture_deref = nullptr;
+      nir_deref_instr *sampler_deref = nullptr;
+      nir_def *coord = nullptr;
+      nir_def *lod = nullptr;
+      bool lod_is_zero = false;
+      for (unsigned i = 0; i < tex->num_srcs; ++i) {
+         switch (tex->src[i].src_type) {
+         case nir_tex_src_texture_deref:
+            texture_deref = nir_src_as_deref(tex->src[i].src);
+            break;
+         case nir_tex_src_sampler_deref:
+            sampler_deref = nir_src_as_deref(tex->src[i].src);
+            break;
+         case nir_tex_src_coord:
+            coord = tex->src[i].src.ssa;
+            break;
+         case nir_tex_src_lod:
+            lod = tex->src[i].src.ssa;
+            lod_is_zero = nir_src_is_const(tex->src[i].src) &&
+               nir_src_as_uint(tex->src[i].src) == 0;
+            break;
+         default:
+            break;
+         }
       }
 
-      Value *binding = ConstantInt::get(i32, textureVar->data.binding);
+      nir_variable *texture_var = texture_deref ?
+         nir_deref_instr_get_variable(texture_deref) : nullptr;
+      nir_variable *sampler_var = sampler_deref ?
+         nir_deref_instr_get_variable(sampler_deref) : nullptr;
+      const bool base_lod = (tex->op == nir_texop_txl && lod && lod_is_zero) ||
+         (tex->op == nir_texop_tex && !lod);
+      const bool supported = base_lod &&
+         tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+         tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
+         tex->dest_type == nir_type_float32 &&
+         tex->def.bit_size == 32 && tex->def.num_components == 4 &&
+         coord && texture_var && sampler_var &&
+         texture_var->data.descriptor_set == 0 &&
+         sampler_var->data.descriptor_set == 0 &&
+         texture_var->data.binding == sampler_var->data.binding;
+      if (!supported) {
+         if (debugLowering)
+            fprintf(stderr, "ventus-nir-to-llvm: unsupported texture op=%u\n",
+                    (unsigned)tex->op);
+         unsupportedDefs.insert(&tex->def);
+         translationFailed = true;
+         return undefFor(&tex->def, true);
+      }
+
+      /* This mirrors RADV's texture/sampler-deref resolution at the level
+       * appropriate to the Ventus RT software descriptor ABI.  The supported
+       * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
+       * sampler derefs resolve through one software descriptor record, just
+       * as RADV first resolves them to its hardware descriptor pair. */
+      Value *binding = ConstantInt::get(i32, texture_var->data.binding);
       Value *base = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
-      Value *byteSize = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE);
+      Value *format = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *stride = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
       Value *width = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_AUX);
-      Value *height = builder.CreateUDiv(byteSize, stride);
+      Value *byte_size = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE);
+      Value *height = builder.CreateSelect(
+         builder.CreateICmpUGT(stride, ConstantInt::get(i32, 0)),
+         builder.CreateUDiv(byte_size, stride), ConstantInt::get(i32, 0));
+      Value *filter = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
+      Value *address_mode_u = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
+      Value *address_mode_v = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
+      Value *coord_value = value(nir_src_for_ssa(coord));
+      Value *u = asFloat(component(coord_value, 0));
+      Value *v = asFloat(component(coord_value, 1));
+      Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
+      Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
 
-      Value *coord = value(tex->src[coordIndex].src);
-      Value *u = asFloat(component(coord, 0));
-      Value *v = asFloat(component(coord, 1));
-      Value *uFloor = builder.CreateSIToFP(floorToI32(u), f32);
-      Value *vFloor = builder.CreateSIToFP(floorToI32(v), f32);
-      Value *uRepeat = builder.CreateFSub(u, uFloor);
-      Value *vRepeat = builder.CreateFSub(v, vFloor);
+      Value *nearest_x = wrapTexelCoord(floorToI32(scaled_u), width,
+                                        address_mode_u);
+      Value *nearest_y = wrapTexelCoord(floorToI32(scaled_v), height,
+                                        address_mode_v);
 
-      Value *xScaled = builder.CreateFSub(
-         builder.CreateFMul(uRepeat, builder.CreateUIToFP(width, f32)),
-         ConstantFP::get(f32, 0.5));
-      Value *yScaled = builder.CreateFSub(
-         builder.CreateFMul(vRepeat, builder.CreateUIToFP(height, f32)),
-         ConstantFP::get(f32, 0.5));
-      Value *xFloor = floorToI32(xScaled);
-      Value *yFloor = floorToI32(yScaled);
-      Value *xWeight = builder.CreateFSub(
-         xScaled, builder.CreateSIToFP(xFloor, f32));
-      Value *yWeight = builder.CreateFSub(
-         yScaled, builder.CreateSIToFP(yFloor, f32));
-      Value *x0 = wrapRepeatI32(xFloor, width);
-      Value *x1 = wrapRepeatI32(
-         builder.CreateAdd(xFloor, ConstantInt::get(i32, 1)), width);
-      Value *y0 = wrapRepeatI32(yFloor, height);
-      Value *y1 = wrapRepeatI32(
-         builder.CreateAdd(yFloor, ConstantInt::get(i32, 1)), height);
-
+      Value *linear_u = builder.CreateFSub(scaled_u, ConstantFP::get(f32, 0.5));
+      Value *linear_v = builder.CreateFSub(scaled_v, ConstantFP::get(f32, 0.5));
+      Value *linear_x0 = floorToI32(linear_u);
+      Value *linear_y0 = floorToI32(linear_v);
+      Value *frac_u = builder.CreateFSub(linear_u,
+         builder.CreateSIToFP(linear_x0, f32));
+      Value *frac_v = builder.CreateFSub(linear_v,
+         builder.CreateSIToFP(linear_y0, f32));
+      Value *linear_x1 = builder.CreateAdd(linear_x0, ConstantInt::get(i32, 1));
+      Value *linear_y1 = builder.CreateAdd(linear_y0, ConstantInt::get(i32, 1));
+      Value *x0 = wrapTexelCoord(linear_x0, width, address_mode_u);
+      Value *x1 = wrapTexelCoord(linear_x1, width, address_mode_u);
+      Value *y0 = wrapTexelCoord(linear_y0, height, address_mode_v);
+      Value *y1 = wrapTexelCoord(linear_y1, height, address_mode_v);
+      Value *is_linear = builder.CreateICmpEQ(
+         filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
       return floatResult(&tex->def, [&](unsigned channel) {
-         Value *c00 = sampleRgba8Channel(base, stride, x0, y0, channel);
-         Value *c10 = sampleRgba8Channel(base, stride, x1, y0, channel);
-         Value *c01 = sampleRgba8Channel(base, stride, x0, y1, channel);
-         Value *c11 = sampleRgba8Channel(base, stride, x1, y1, channel);
+         Value *nearest = sampleTexelRGBA8Channel(
+            base, stride, nearest_x, nearest_y, format, channel);
+         Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format,
+                                              channel);
+         Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format,
+                                              channel);
+         Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format,
+                                              channel);
+         Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format,
+                                              channel);
          Value *top = builder.CreateFAdd(
-            c00, builder.CreateFMul(builder.CreateFSub(c10, c00), xWeight));
+            c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));
          Value *bottom = builder.CreateFAdd(
-            c01, builder.CreateFMul(builder.CreateFSub(c11, c01), xWeight));
-         return builder.CreateFAdd(
-            top, builder.CreateFMul(builder.CreateFSub(bottom, top), yWeight));
+            c01, builder.CreateFMul(frac_u, builder.CreateFSub(c11, c01)));
+         Value *linear = builder.CreateFAdd(
+            top, builder.CreateFMul(frac_v, builder.CreateFSub(bottom, top)));
+         return builder.CreateSelect(is_linear, linear, nearest);
       });
    }
 
@@ -1211,7 +1384,7 @@ private:
       if (deref->deref_type == nir_deref_type_var && deref->var) {
          derefVars[&deref->def] = deref->var;
          if (deref->var->data.mode == nir_var_mem_push_const)
-            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANT_ADDR);
+            return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR);
          auto it = variables.find(deref->var);
          if (it != variables.end())
             return it->second;
@@ -1608,6 +1781,14 @@ private:
          return loadGlobalForDef(dispatchArgsBase(), asInt32(value(intrin->src[0])),
                                 &intrin->def);
       }
+      case nir_intrinsic_ventus_rt_worker_id: {
+         return rtWorkerId();
+      }
+      case nir_intrinsic_ventus_rt_dispatch_index: {
+         /* Compact global callback/resume dispatches are one-dimensional;
+          * their physical X invocation selects ray_ref_list[index]. */
+         return primaryDispatchPixelComponent(0);
+      }
       case nir_intrinsic_load_ray_launch_size: {
          return rayLaunchSize();
       }
@@ -1624,13 +1805,57 @@ private:
          return descriptorValueForDef(&intrin->def, addr);
       }
       case nir_intrinsic_load_ubo: {
-         Value *base = asInt32(value(intrin->src[0]));
-         Value *offset = asInt32(value(intrin->src[1]));
+         Value *base = asAddress(value(intrin->src[0]));
+         Value *offset = asAddress(value(intrin->src[1]));
          return loadGlobalForDef(base, offset, &intrin->def);
       }
       case nir_intrinsic_load_global: {
          return loadGlobalForDef(value(intrin->src[0]), ConstantInt::get(i32, 0),
                                 &intrin->def);
+      }
+      case nir_intrinsic_store_global: {
+         Value *addr = asAddress(value(intrin->src[1]));
+         Value *stored = value(intrin->src[0]);
+         const unsigned components = nir_src_num_components(intrin->src[0]);
+
+         for (unsigned i = 0; i < components; ++i) {
+            Value *componentAddr = addr;
+            if (i)
+               componentAddr = builder.CreateAdd(componentAddr,
+                                                  ConstantInt::get(addr->getType(), i * 4));
+            StoreInst *store = builder.CreateStore(asInt32(component(stored, i)),
+                                                    globalPtr(componentAddr));
+            store->setAlignment(Align(4));
+         }
+         return nullptr;
+      }
+      case nir_intrinsic_global_atomic: {
+         const nir_atomic_op op = nir_intrinsic_atomic_op(intrin);
+         AtomicRMWInst::BinOp binop;
+
+         switch (op) {
+         case nir_atomic_op_iadd:
+            binop = AtomicRMWInst::Add;
+            break;
+         case nir_atomic_op_iand:
+            binop = AtomicRMWInst::And;
+            break;
+         case nir_atomic_op_ior:
+            binop = AtomicRMWInst::Or;
+            break;
+         case nir_atomic_op_ixor:
+            binop = AtomicRMWInst::Xor;
+            break;
+         default:
+            unsupportedDefs.insert(&intrin->def);
+            return undefFor(&intrin->def);
+         }
+
+         AtomicRMWInst *atomic = builder.CreateAtomicRMW(
+            binop, globalPtr(asAddress(value(intrin->src[0]))),
+            asInt32(value(intrin->src[1])), MaybeAlign(4),
+            AtomicOrdering::SequentiallyConsistent);
+         return atomic;
       }
       case nir_intrinsic_image_deref_store:
       case nir_intrinsic_image_store: {
@@ -1708,6 +1933,12 @@ private:
          Function *fn = declare("llvm.riscv.ventus.rt.release.i32",
                                 Type::getVoidTy(context), {i32});
          builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_enqueue: {
+         fprintf(stderr,
+                 "ventus-nir-to-llvm: unlowered ventus_rt_enqueue pseudo\n");
+         translationFailed = true;
          return nullptr;
       }
       default:
@@ -1922,22 +2153,53 @@ private:
       return it == blocks.end() ? nullptr : it->second;
    }
 
+   /* A structured NIR loop may have several break blocks, while LLVM uses
+    * one synthetic loop-end block before the following NIR block.  A phi in
+    * that following block therefore receives one LLVM edge, not one edge per
+    * NIR break block. */
+   BasicBlock *phiEdgeBlock(BasicBlock *pred, BasicBlock *phiBlock)
+   {
+      auto *branch = dyn_cast_or_null<BranchInst>(pred->getTerminator());
+      if (!branch || !branch->isUnconditional())
+         return pred;
+
+      BasicBlock *bridge = branch->getSuccessor(0);
+      if (bridge == phiBlock)
+         return pred;
+
+      auto *bridgeBranch =
+         dyn_cast_or_null<BranchInst>(bridge->getTerminator());
+      if (bridgeBranch && bridgeBranch->isUnconditional() &&
+          bridgeBranch->getSuccessor(0) == phiBlock)
+         return bridge;
+
+      return pred;
+   }
+
    void finishPhis()
    {
       for (auto &entry : phis) {
          nir_phi_instr *nirPhi = entry.first;
          PHINode *llvmPhi = entry.second;
 
+         struct Incoming {
+            BasicBlock *pred;
+            BasicBlock *edge;
+            Value *value;
+         };
+         std::vector<Incoming> incomings;
+
          nir_foreach_phi_src(src, nirPhi) {
             BasicBlock *pred = endBlockFor(src->pred);
             if (!pred)
                continue;
+            Instruction *terminator = pred->getTerminator();
             Value *incoming = value(src->src);
 
             /* The conversion belongs to the incoming CFG edge, not to the
              * block where finishPhis() happens to leave the IRBuilder. */
             IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
-            if (Instruction *terminator = pred->getTerminator())
+            if (terminator)
                builder.SetInsertPoint(terminator);
             else
                builder.SetInsertPoint(pred);
@@ -1945,7 +2207,40 @@ private:
             builder.restoreIP(savedInsertPoint);
             if (incoming->getType() != llvmPhi->getType())
                incoming = UndefValue::get(llvmPhi->getType());
-            llvmPhi->addIncoming(incoming, pred);
+            incomings.push_back(
+               {pred, phiEdgeBlock(pred, llvmPhi->getParent()), incoming});
+         }
+
+         for (const Incoming &incoming : incomings) {
+            bool firstOnEdge = true;
+            for (const Incoming &previous : incomings) {
+               if (&previous == &incoming)
+                  break;
+               if (previous.edge == incoming.edge) {
+                  firstOnEdge = false;
+                  break;
+               }
+            }
+            if (!firstOnEdge)
+               continue;
+
+            unsigned edgeCount = 0;
+            for (const Incoming &candidate : incomings)
+               edgeCount += candidate.edge == incoming.edge;
+
+            if (edgeCount == 1) {
+               llvmPhi->addIncoming(incoming.value, incoming.edge);
+               continue;
+            }
+
+            PHINode *edgePhi = PHINode::Create(llvmPhi->getType(), edgeCount,
+                                                "nir.phi.edge",
+                                                incoming.edge->getFirstNonPHIIt());
+            for (const Incoming &candidate : incomings) {
+               if (candidate.edge == incoming.edge)
+                  edgePhi->addIncoming(candidate.value, candidate.pred);
+            }
+            llvmPhi->addIncoming(edgePhi, incoming.edge);
          }
       }
    }
@@ -1964,7 +2259,7 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
    module->setTargetTriple(options && options->target_triple ? options->target_triple : "riscv32-unknown-elf");
    module->setDataLayout(options && options->data_layout ? options->data_layout : "e-m:e-p:32:32-i64:64-n32-S128");
 
-   VentusNirToLlvm translator(context, *module);
+   VentusNirToLlvm translator(context, *module, options);
    for (unsigned i = 0; i < shader_count; ++i) {
       if (shaders[i] && !translator.translate(
                             shaders[i],

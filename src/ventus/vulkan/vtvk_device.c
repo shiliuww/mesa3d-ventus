@@ -41,6 +41,8 @@ vtvk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_device;
 
+   device->rt_execution_profile = physical_device->rt_execution_profile;
+   device->rt_uses_rv64 = physical_device->rt_uses_rv64;
    device->vk.command_buffer_ops = &vtvk_command_buffer_ops;
 
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {

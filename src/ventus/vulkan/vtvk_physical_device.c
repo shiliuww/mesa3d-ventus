@@ -1,5 +1,7 @@
 #include "vtvk_private.h"
 
+#include <stdlib.h>
+
 #include "util/list.h"
 #include "vk_format.h"
 #include "vk_util.h"
@@ -135,7 +137,8 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxDescriptorSetAccelerationStructures = 64;
    p->minAccelerationStructureScratchOffsetAlignment = 128;
    p->shaderGroupHandleSize = 32;
-   p->maxRayRecursionDepth = 1;
+   p->maxRayRecursionDepth =
+      pdev->rt_execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL ? 4 : 1;
    p->maxShaderGroupStride = 4096;
    p->shaderGroupBaseAlignment = 64;
    p->shaderGroupHandleCaptureReplaySize = 32;
@@ -149,6 +152,15 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->uniformBufferDescriptorSize = 16;
    p->combinedImageSamplerDescriptorSize = 32;
    p->samplerDescriptorSize = 16;
+}
+
+static bool
+vtvk_profile_env_enabled(const char *name)
+{
+   const char *value = getenv(name);
+   return value && value[0] && strcmp(value, "0") != 0 &&
+          strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
+          strcmp(value, "off") != 0 && strcmp(value, "OFF") != 0;
 }
 
 static void
@@ -216,6 +228,14 @@ vtvk_enumerate_physical_devices(struct vk_instance *vk_instance)
                 VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
    if (!pdev)
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   if (vtvk_profile_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL"))
+      pdev->rt_execution_profile = VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
+   else if (vtvk_profile_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
+      pdev->rt_execution_profile = VTVK_RT_EXECUTION_WAVEFRONT_MIRROR;
+   else
+      pdev->rt_execution_profile = VTVK_RT_EXECUTION_COMPAT;
+   pdev->rt_uses_rv64 = vtvk_profile_env_enabled("VENTUS_VK_RT_RV64");
 
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(

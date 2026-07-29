@@ -49,6 +49,7 @@ struct vt_rt_intrinsic_counts {
    unsigned terminate_ray;
    unsigned ventus_rt_traverse;
    unsigned ventus_rt_release;
+   unsigned ventus_rt_enqueue;
 };
 
 static inline unsigned
@@ -228,6 +229,9 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_ventus_rt_release:
                counts->ventus_rt_release++;
+               break;
+            case nir_intrinsic_ventus_rt_enqueue:
+               counts->ventus_rt_enqueue++;
                break;
             default:
                break;

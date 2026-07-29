@@ -17,11 +17,17 @@
 #define VTVK_QUEUE_FAMILY 0
 #define VTVK_MAX_DESCRIPTOR_BINDINGS 32
 #define VTVK_MAX_BOUND_DESCRIPTOR_SETS 4
-#define VTVK_MAX_PUSH_CONSTANTS_SIZE 256
+#define VTVK_MAX_PUSH_CONSTANT_SIZE 256
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+enum vtvk_rt_execution_profile {
+   VTVK_RT_EXECUTION_COMPAT = 0,
+   VTVK_RT_EXECUTION_WAVEFRONT_MIRROR,
+   VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL,
+};
 
 struct vtvk_instance {
    struct vk_instance vk;
@@ -34,6 +40,8 @@ struct vtvk_physical_device {
    VkMemoryType memory_types[1];
 
    const struct vk_sync_type *sync_types[1];
+   enum vtvk_rt_execution_profile rt_execution_profile;
+   bool rt_uses_rv64;
 };
 
 struct vtvk_queue {
@@ -42,6 +50,19 @@ struct vtvk_queue {
 
 struct vtvk_device {
    struct vk_device vk;
+   enum vtvk_rt_execution_profile rt_execution_profile;
+   bool rt_uses_rv64;
+};
+
+struct vtvk_sampler {
+   VkFilter mag_filter;
+   VkFilter min_filter;
+   VkSamplerAddressMode address_mode_u;
+   VkSamplerAddressMode address_mode_v;
+   VkBool32 compare_enable;
+   VkBool32 unnormalized_coordinates;
+   float min_lod;
+   float max_lod;
 };
 
 struct vtvk_cmd_buffer {
@@ -49,9 +70,9 @@ struct vtvk_cmd_buffer {
 
    VkPipeline bound_rt_pipeline;
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
-   uint8_t rt_push_constants[VTVK_MAX_PUSH_CONSTANTS_SIZE];
-   uint32_t rt_push_constant_size;
-   VkShaderStageFlags rt_push_constant_stages;
+   uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
+   uint32_t push_constants_size;
+   VkShaderStageFlags push_constants_stages;
 };
 
 struct vtvk_acceleration_structure {
@@ -95,12 +116,16 @@ bool vtvk_buffer_resolve_device_address(VkDeviceAddress address,
                                         VkDeviceAddress *host_address_out,
                                         VkDeviceSize *size_out,
                                         VkDeviceSize *offset_out);
+bool vtvk_buffer_host_allocation_from_addr(VkDeviceAddress address,
+                                           const void **base_out,
+                                           VkDeviceSize *size_out,
+                                           VkDeviceSize *offset_out);
 VkPipeline vtvk_cmd_buffer_bound_rt_pipeline(VkCommandBuffer commandBuffer);
 VkDescriptorSet vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
                                                      uint32_t set);
-const void *vtvk_cmd_buffer_rt_push_constants(VkCommandBuffer commandBuffer,
-                                              uint32_t *size_out,
-                                              VkShaderStageFlags *stages_out);
+const void *vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
+                                           uint32_t *size_out,
+                                           VkShaderStageFlags *stages_out);
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding);

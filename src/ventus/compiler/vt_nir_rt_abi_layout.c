@@ -29,6 +29,7 @@ vt_nir_rt_default_abi_layout(void)
 
    layout.payload_base_bytes = VT_RT_ABI_PAYLOAD_BASE_BYTES;
    layout.payload_size_bytes = VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES;
+   layout.region_size_bytes = VT_RT_ABI_REGION_SIZE_BYTES;
 
    layout.total_size_bytes = VT_RT_ABI_TOTAL_SIZE_BYTES;
 
@@ -67,5 +68,43 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
       config->scratchpad[i].total_size_bytes = layout->total_size_bytes;
       config->scratchpad[i].stride_bytes =
          MAX2(config->scratchpad[i].stride_bytes, layout->total_size_bytes);
+   }
+}
+
+void
+vt_nir_rt_config_apply_global_cps_layout(
+   struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_abi_layout *layout)
+{
+   if (!config)
+      return;
+
+   struct vt_nir_rt_abi_layout default_layout;
+   if (!layout) {
+      default_layout = vt_nir_rt_default_abi_layout();
+      layout = &default_layout;
+   }
+
+   const uint32_t frame_size = layout->region_size_bytes;
+   for (unsigned i = 0; i < VT_RT_LAYOUT_COUNT; ++i) {
+      config->scratchpad[i].base_bytes = 0;
+      config->scratchpad[i].ray_state_base_bytes =
+         layout->ray_state_base_bytes;
+      config->scratchpad[i].payload_base_bytes =
+         layout->payload_base_bytes;
+      config->scratchpad[i].control_base_bytes =
+         layout->control_base_bytes;
+      config->scratchpad[i].candidate_hit_record_base_bytes =
+         layout->candidate_hit_record_base_bytes;
+      config->scratchpad[i].hit_record_base_bytes =
+         layout->hit_record_base_bytes;
+      config->scratchpad[i].hit_attrib_base_bytes =
+         layout->hit_attrib_base_bytes;
+      config->scratchpad[i].hit_attrib_size_bytes =
+         layout->hit_attrib_size_bytes;
+      config->scratchpad[i].total_size_bytes = frame_size;
+      /* Global CPS is independent from legacy PDS sizing.  CPS lowering
+       * grows scratch beyond this static RT region for call spills. */
+      config->scratchpad[i].stride_bytes = frame_size;
    }
 }

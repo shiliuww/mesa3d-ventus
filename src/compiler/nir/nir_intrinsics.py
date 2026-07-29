@@ -771,14 +771,25 @@ intrinsic("rt_trace_ray", src_comp=[-1, 1, 1, 1, 1, 1, 3, 1, 3, 1, -1],
 # are not marked CAN_ELIMINATE/CAN_REORDER.
 intrinsic("ventus_rt_dispatch_arg", src_comp=[1], dest_comp=1,
           bit_sizes=[32, 64])
+# Globally unique resident worker/warp identity.  It is not a Vulkan launch
+# ID and is used only to select bounded RT submission staging storage.
+intrinsic("ventus_rt_worker_id", dest_comp=1, bit_sizes=[32])
+# Compact global callback/resume dispatch index.  Unlike a Vulkan launch ID it
+# names an entry in the RTcore-owned ray_ref list for this kernel dispatch.
+intrinsic("ventus_rt_dispatch_index", dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_release", src_comp=[1])
+# Global-wavefront producer doorbell.  The source is the lane's global submit
+# mailbox address; it is valid only after the producer has published VALID.
+intrinsic("ventus_rt_enqueue", src_comp=[1])
 
-# Ventus RT per-lane slot memory.  This is private/PDS scratch, not shared/LDS
-# memory.  Loads may be eliminated when unused, but neither loads nor stores are
-# marked CAN_REORDER because vt.rt.traverse/release observe the same slot.
+# Ventus RT slot memory is observed and written by a TraceRay continuation.
+# In particular, a closest-hit payload store before a nested TraceRayEXT must
+# not let a later payload load reuse that pre-call SSA value: miss/closest-hit
+# code in the resumed continuation may have changed the slot.  Keep loads
+# non-eliminable as well as non-reorderable so CPS preserves that dependency.
 intrinsic("ventus_rt_load_slot", src_comp=[1], dest_comp=0,
-          bit_sizes=[8, 16, 32, 64], flags=[CAN_ELIMINATE])
+          bit_sizes=[8, 16, 32, 64])
 intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
 
 

@@ -42,6 +42,7 @@ libvulkan_ventus = shared_library(
     dep_m,
     dep_thread,
     dep_llvm,
+    dep_elf,
     idep_mesautil,
     idep_nir,
     idep_vtn,
