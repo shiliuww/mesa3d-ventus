@@ -11,6 +11,7 @@
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_queue.h"
+#include "vtvk_rt_profile.h"
 
 #define VTVK_VENDOR_ID 0x5654
 #define VTVK_DEVICE_ID 0x5254
@@ -22,12 +23,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-enum vtvk_rt_execution_profile {
-   VTVK_RT_EXECUTION_COMPAT = 0,
-   VTVK_RT_EXECUTION_WAVEFRONT_MIRROR,
-   VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL,
-};
 
 struct vtvk_instance {
    struct vk_instance vk;

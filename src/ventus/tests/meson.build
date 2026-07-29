@@ -1,3 +1,19 @@
+vt_rt_profile_test = executable(
+  'vt_rt_profile_test',
+  [
+    'vt_rt_profile_test.c',
+    '../vulkan/vtvk_rt_profile.c',
+  ],
+  include_directories : [inc_src],
+  build_by_default : false,
+)
+
+test(
+  'vt_rt_profile',
+  vt_rt_profile_test,
+  suite : ['ventus'],
+)
+
 if prog_glslang.found()
   vt_rt_minimal_raygen_spv = custom_target(
     'vt_rt_minimal_raygen.spv',

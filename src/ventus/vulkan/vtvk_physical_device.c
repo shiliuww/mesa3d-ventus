@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "util/list.h"
+#include "util/log.h"
 #include "vk_format.h"
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
@@ -229,12 +230,18 @@ vtvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    if (!pdev)
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   if (vtvk_profile_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL"))
-      pdev->rt_execution_profile = VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
-   else if (vtvk_profile_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
-      pdev->rt_execution_profile = VTVK_RT_EXECUTION_WAVEFRONT_MIRROR;
-   else
-      pdev->rt_execution_profile = VTVK_RT_EXECUTION_COMPAT;
+   const char *profile_selector = getenv("VENTUS_VK_RT_EXECUTION_PROFILE");
+   if (!vtvk_rt_execution_profile_resolve(
+          profile_selector,
+          getenv("VENTUS_VK_RT_WAVEFRONT_GLOBAL"),
+          getenv("VENTUS_VK_RT_WAVEFRONT_MIRROR"),
+          &pdev->rt_execution_profile)) {
+      mesa_loge("ventus-vk: invalid RT execution profile '%s'; "
+                "expected compat, global, or mirror",
+                profile_selector ? profile_selector : "");
+      vk_free(&instance->vk.alloc, pdev);
+      return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+   }
    pdev->rt_uses_rv64 = vtvk_profile_env_enabled("VENTUS_VK_RT_RV64");
 
    struct vk_physical_device_dispatch_table dispatch_table;
