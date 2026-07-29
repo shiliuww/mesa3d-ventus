@@ -197,7 +197,9 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->descriptorBindingVariableDescriptorCount = false;
    f->runtimeDescriptorArray = false;
    f->accelerationStructure = true;
-   f->accelerationStructureHostCommands = true;
+   f->accelerationStructureCaptureReplay = false;
+   f->accelerationStructureIndirectBuild = false;
+   f->accelerationStructureHostCommands = false;
    f->rayTracingPipeline = true;
    f->descriptorBindingAccelerationStructureUpdateAfterBind = false;
 }

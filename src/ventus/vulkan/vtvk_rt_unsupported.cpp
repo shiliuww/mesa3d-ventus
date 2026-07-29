@@ -1,5 +1,6 @@
 #include "vtvk_private.h"
 
+#include "vk_common_entrypoints.h"
 #include "vtvk_entrypoints.h"
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -170,10 +171,8 @@ vtvk_CreateDeferredOperationKHR(VkDevice device,
                                 const VkAllocationCallbacks *pAllocator,
                                 VkDeferredOperationKHR *pDeferredOperation)
 {
-   (void)device;
-   (void)pAllocator;
-   *pDeferredOperation = VK_NULL_HANDLE;
-   return VK_ERROR_FEATURE_NOT_PRESENT;
+   return vk_common_CreateDeferredOperationKHR(device, pAllocator,
+                                               pDeferredOperation);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -181,35 +180,26 @@ vtvk_DestroyDeferredOperationKHR(VkDevice device,
                                  VkDeferredOperationKHR operation,
                                  const VkAllocationCallbacks *pAllocator)
 {
-   (void)device;
-   (void)operation;
-   (void)pAllocator;
+   vk_common_DestroyDeferredOperationKHR(device, operation, pAllocator);
 }
 
 VKAPI_ATTR uint32_t VKAPI_CALL
 vtvk_GetDeferredOperationMaxConcurrencyKHR(VkDevice device,
                                            VkDeferredOperationKHR operation)
 {
-   (void)device;
-   (void)operation;
-   return 0;
+   return vk_common_GetDeferredOperationMaxConcurrencyKHR(device, operation);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_GetDeferredOperationResultKHR(VkDevice device,
                                    VkDeferredOperationKHR operation)
 {
-   (void)device;
-   (void)operation;
-   return VK_SUCCESS;
+   return vk_common_GetDeferredOperationResultKHR(device, operation);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_DeferredOperationJoinKHR(VkDevice device,
                               VkDeferredOperationKHR operation)
 {
-   (void)device;
-   (void)operation;
-   return VK_SUCCESS;
+   return vk_common_DeferredOperationJoinKHR(device, operation);
 }
-
