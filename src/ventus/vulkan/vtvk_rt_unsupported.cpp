@@ -60,15 +60,6 @@ vtvk_WriteAccelerationStructuresPropertiesKHR(
 }
 
 VKAPI_ATTR void VKAPI_CALL
-vtvk_CmdCopyAccelerationStructureKHR(
-   VkCommandBuffer commandBuffer,
-   const VkCopyAccelerationStructureInfoKHR *pInfo)
-{
-   (void)commandBuffer;
-   (void)pInfo;
-}
-
-VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdCopyAccelerationStructureToMemoryKHR(
    VkCommandBuffer commandBuffer,
    const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo)

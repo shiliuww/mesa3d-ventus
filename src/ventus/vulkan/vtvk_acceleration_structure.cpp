@@ -1033,6 +1033,64 @@ vtvk_CmdBuildAccelerationStructuresKHR(
              infoCount);
 }
 
+static VkResult
+vtvk_clone_acceleration_structure(
+   struct vtvk_device *device,
+   const VkCopyAccelerationStructureInfoKHR *info)
+{
+   if (!info || info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR)
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   struct vtvk_acceleration_structure *src =
+      (struct vtvk_acceleration_structure *)
+         vtvk_handle_to_ptr((uint64_t)info->src);
+   struct vtvk_acceleration_structure *dst =
+      (struct vtvk_acceleration_structure *)
+         vtvk_handle_to_ptr((uint64_t)info->dst);
+   if (!src || !dst || src == dst || src->type != dst->type ||
+       !src->snapshot || !src->snapshot_size)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   if (dst->size < src->snapshot_size)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   uint8_t *new_snapshot = (uint8_t *)malloc(src->snapshot_size);
+   if (!new_snapshot)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   void *dst_data = vtvk_buffer_host_ptr(dst->buffer, dst->offset, dst->size);
+   if (!dst_data) {
+      free(new_snapshot);
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   }
+
+   memcpy(new_snapshot, src->snapshot, src->snapshot_size);
+   memset(dst_data, 0, dst->size);
+   memcpy(dst_data, src->snapshot, src->snapshot_size);
+
+   free(dst->snapshot);
+   dst->data = dst_data;
+   dst->snapshot = new_snapshot;
+   dst->snapshot_size = src->snapshot_size;
+   dst->address = (VkDeviceAddress)(uintptr_t)new_snapshot;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdCopyAccelerationStructureKHR(
+   VkCommandBuffer commandBuffer,
+   const VkCopyAccelerationStructureInfoKHR *pInfo)
+{
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   struct vtvk_device *device =
+      container_of(vk_cmd->base.device, struct vtvk_device, vk);
+
+   VkResult result = vtvk_clone_acceleration_structure(device, pInfo);
+   if (result != VK_SUCCESS) {
+      mesa_loge("ventus-vk: AS clone failed (%d)", result);
+      vk_command_buffer_set_error(vk_cmd, result);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdBuildAccelerationStructuresIndirectKHR(
    VkCommandBuffer commandBuffer,
