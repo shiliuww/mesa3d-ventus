@@ -4,6 +4,7 @@
 
 #include "util/list.h"
 #include "util/log.h"
+#include "vk_enum_defines.h"
 #include "vk_format.h"
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
@@ -328,28 +329,53 @@ vtvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                                         VkFormat format,
                                         VkFormatProperties2 *pFormatProperties)
 {
-   memset(&pFormatProperties->formatProperties, 0,
-          sizeof(pFormatProperties->formatProperties));
+   VkFormatFeatureFlags2 linear_features = 0;
+   VkFormatFeatureFlags2 optimal_features = 0;
+   VkFormatFeatureFlags2 buffer_features = 0;
 
    if (format == VK_FORMAT_R8G8B8A8_UNORM ||
        format == VK_FORMAT_B8G8R8A8_UNORM) {
-      pFormatProperties->formatProperties.linearTilingFeatures =
+      linear_features =
          VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
          VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
-      pFormatProperties->formatProperties.optimalTilingFeatures =
-         pFormatProperties->formatProperties.linearTilingFeatures;
-      pFormatProperties->formatProperties.bufferFeatures =
-         VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT;
+      optimal_features = linear_features;
+      buffer_features = VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT;
    } else if (format == VK_FORMAT_D16_UNORM ||
               format == VK_FORMAT_D32_SFLOAT ||
               format == VK_FORMAT_D24_UNORM_S8_UINT ||
               format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
-      pFormatProperties->formatProperties.optimalTilingFeatures =
+      optimal_features =
          VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   } else if (format == VK_FORMAT_R32G32B32_SFLOAT) {
+      buffer_features =
+         VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+   }
+
+   pFormatProperties->formatProperties = (VkFormatProperties){
+      .linearTilingFeatures =
+         vk_format_features2_to_features(linear_features),
+      .optimalTilingFeatures =
+         vk_format_features2_to_features(optimal_features),
+      .bufferFeatures = vk_format_features2_to_features(buffer_features),
+   };
+
+   vk_foreach_struct(ext, pFormatProperties->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: {
+         VkFormatProperties3 *properties = (void *)ext;
+         properties->linearTilingFeatures = linear_features;
+         properties->optimalTilingFeatures = optimal_features;
+         properties->bufferFeatures = buffer_features;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(ext->sType);
+         break;
+      }
    }
 }
 
