@@ -7,6 +7,7 @@
 
 #include "compiler/glsl_types.h"
 #include "nir/nir_deref.h"
+#include "ventus/common/ventus_rt_bvh.h"
 
 #define VT_RT_MAX_PAYLOAD_LOCATIONS 32
 
@@ -421,6 +422,17 @@ load_active_hit_record_word(nir_builder *b, const struct vt_nir_rt_config *confi
    return vt_nir_load_hit_record_word(b, config, layout, word, bit_size);
 }
 
+static nir_def *
+load_active_hit_record_u64(nir_builder *b,
+                           const struct vt_nir_rt_config *config,
+                           enum vt_rt_shader_layout layout,
+                           enum vt_rt_hit_record_word lo_word)
+{
+   return nir_pack_64_2x32_split(
+      b, load_active_hit_record_word(b, config, layout, lo_word, 32),
+      load_active_hit_record_word(b, config, layout, lo_word + 1, 32));
+}
+
 static bool
 lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
@@ -462,6 +474,15 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_INSTANCE_ID, 32);
       break;
+   case nir_intrinsic_load_ray_instance_custom_index: {
+      nir_def *instance_addr =
+         load_active_hit_record_u64(b, config, layout,
+                                    VT_RT_HIT_RECORD_INSTANCE_ADDR_LO);
+      replacement = nir_load_global(
+         b, 1, 32,
+         nir_iadd_imm(b, instance_addr, VENTUS_INSTANCE_CUSTOM_INDEX));
+      break;
+   }
    case nir_intrinsic_load_ray_geometry_index:
       replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_GEOMETRY_ID, 32);

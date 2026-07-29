@@ -38,6 +38,7 @@ struct vt_rt_intrinsic_counts {
    unsigned load_ray_t_max;
    unsigned load_primitive_id;
    unsigned load_instance_id;
+   unsigned load_ray_instance_custom_index;
    unsigned load_ray_geometry_index;
    unsigned load_ray_hit_kind;
    unsigned load_front_face;
@@ -196,6 +197,9 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_load_instance_id:
                counts->load_instance_id++;
+               break;
+            case nir_intrinsic_load_ray_instance_custom_index:
+               counts->load_ray_instance_custom_index++;
                break;
             case nir_intrinsic_load_ray_geometry_index:
                counts->load_ray_geometry_index++;
