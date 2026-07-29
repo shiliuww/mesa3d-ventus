@@ -24,6 +24,8 @@ struct vtvk_build_node {
 };
 static std::vector<struct vtvk_acceleration_structure *> vtvk_as_registry;
 
+#define VTVK_AS_DEVICE_ADDRESS_ALIGNMENT 256u
+
 static void *
 vtvk_handle_to_ptr(uint64_t handle)
 {
@@ -35,6 +37,24 @@ vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
 }
+
+static uint8_t *
+vtvk_alloc_as_snapshot(VkDeviceSize size)
+{
+   if (!size || size > SIZE_MAX ||
+       size_t(size) > SIZE_MAX - (VTVK_AS_DEVICE_ADDRESS_ALIGNMENT - 1))
+      return nullptr;
+
+   const size_t allocation_size =
+      (size_t(size) + VTVK_AS_DEVICE_ADDRESS_ALIGNMENT - 1) &
+      ~size_t(VTVK_AS_DEVICE_ADDRESS_ALIGNMENT - 1);
+   uint8_t *snapshot = (uint8_t *)aligned_alloc(
+      VTVK_AS_DEVICE_ADDRESS_ALIGNMENT, allocation_size);
+   if (snapshot)
+      memset(snapshot, 0, allocation_size);
+   return snapshot;
+}
+
 static void
 vtvk_aabb_empty(struct vtvk_aabb *aabb)
 {
@@ -749,7 +769,6 @@ vtvk_build_blas(struct vtvk_device *device,
                 info->geometryCount, primitive_count, node_count, root.ref);
       vtvk_log_aabb("BLAS root", &root.bounds);
    }
-   as->address = (VkDeviceAddress)(uintptr_t)as->data;
    return VK_SUCCESS;
 }
 
@@ -868,7 +887,6 @@ vtvk_build_tlas(struct vtvk_device *device,
                 instance_count, node_count, root.ref);
       vtvk_log_aabb("TLAS root", &root.bounds);
    }
-   as->address = (VkDeviceAddress)(uintptr_t)as->data;
    return VK_SUCCESS;
 }
 
@@ -901,16 +919,9 @@ vtvk_build_as(struct vtvk_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   free(as->snapshot);
-   as->snapshot = (uint8_t *)malloc(as->size);
-   if (!as->snapshot) {
-      as->snapshot_size = 0;
+   if (!as->snapshot || as->snapshot_size < as->size)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-   }
-
    memcpy(as->snapshot, as->data, as->size);
-   as->snapshot_size = as->size;
-   as->address = (VkDeviceAddress)(uintptr_t)as->snapshot;
    if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS") &&
        info->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
       uint32_t root_ref =
@@ -935,12 +946,6 @@ vtvk_GetAccelerationStructureDeviceAddressKHR(
    struct vtvk_acceleration_structure *as =
       (struct vtvk_acceleration_structure *)
          vtvk_handle_to_ptr((uint64_t)pInfo->accelerationStructure);
-   if (as && as->snapshot)
-      return (VkDeviceAddress)(uintptr_t)as->snapshot;
-   if (as && !as->address) {
-      as->data = vtvk_buffer_host_ptr(as->buffer, as->offset, as->size);
-      as->address = (VkDeviceAddress)(uintptr_t)as->data;
-   }
    return as ? as->address : 0;
 }
 
@@ -966,7 +971,13 @@ vtvk_CreateAccelerationStructureKHR(
    as->offset = pCreateInfo->offset;
    as->size = pCreateInfo->size;
    as->data = vtvk_buffer_host_ptr(as->buffer, as->offset, as->size);
-   as->address = (VkDeviceAddress)(uintptr_t)as->data;
+   as->snapshot = vtvk_alloc_as_snapshot(as->size);
+   if (!as->snapshot) {
+      vk_free(alloc, as);
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   as->snapshot_size = as->size;
+   as->address = (VkDeviceAddress)(uintptr_t)as->snapshot;
 
    *pAccelerationStructure =
       (VkAccelerationStructureKHR)vtvk_ptr_to_handle(as);
@@ -1086,25 +1097,16 @@ vtvk_clone_acceleration_structure(
    if (dst->size < src->snapshot_size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   uint8_t *new_snapshot = (uint8_t *)malloc(src->snapshot_size);
-   if (!new_snapshot)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
    void *dst_data = vtvk_buffer_host_ptr(dst->buffer, dst->offset, dst->size);
-   if (!dst_data) {
-      free(new_snapshot);
+   if (!dst_data || !dst->snapshot ||
+       dst->snapshot_size < src->snapshot_size)
       return vk_error(device, VK_ERROR_UNKNOWN);
-   }
 
-   memcpy(new_snapshot, src->snapshot, src->snapshot_size);
    memset(dst_data, 0, dst->size);
    memcpy(dst_data, src->snapshot, src->snapshot_size);
-
-   free(dst->snapshot);
+   memset(dst->snapshot, 0, dst->snapshot_size);
+   memcpy(dst->snapshot, src->snapshot, src->snapshot_size);
    dst->data = dst_data;
-   dst->snapshot = new_snapshot;
-   dst->snapshot_size = src->snapshot_size;
-   dst->address = (VkDeviceAddress)(uintptr_t)new_snapshot;
    return VK_SUCCESS;
 }
 
