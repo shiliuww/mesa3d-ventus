@@ -40,7 +40,7 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxMemoryAllocationCount = 4096;
    p->maxSamplerAllocationCount = 4096;
    p->bufferImageGranularity = 64;
-   p->maxBoundDescriptorSets = 8;
+   p->maxBoundDescriptorSets = VTVK_MAX_BOUND_DESCRIPTOR_SETS;
    p->maxPerStageDescriptorSamplers = 1024;
    p->maxPerStageDescriptorUniformBuffers = 64;
    p->maxPerStageDescriptorStorageBuffers = 1024;
@@ -126,10 +126,10 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->shaderDenormPreserveFloat32 = true;
    p->shaderRoundingModeRTEFloat32 = true;
    p->shaderRoundingModeRTZFloat32 = true;
-   p->shaderUniformBufferArrayNonUniformIndexingNative = true;
-   p->shaderSampledImageArrayNonUniformIndexingNative = true;
-   p->shaderStorageBufferArrayNonUniformIndexingNative = true;
-   p->shaderStorageImageArrayNonUniformIndexingNative = true;
+   p->shaderUniformBufferArrayNonUniformIndexingNative = false;
+   p->shaderSampledImageArrayNonUniformIndexingNative = false;
+   p->shaderStorageBufferArrayNonUniformIndexingNative = false;
+   p->shaderStorageImageArrayNonUniformIndexingNative = false;
 
    p->maxGeometryCount = 1 << 20;
    p->maxInstanceCount = 1 << 20;
@@ -180,26 +180,26 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->bufferDeviceAddress = true;
    f->vulkanMemoryModel = true;
    f->descriptorIndexing = true;
-   f->shaderUniformBufferArrayNonUniformIndexing = true;
-   f->shaderSampledImageArrayNonUniformIndexing = true;
-   f->shaderStorageBufferArrayNonUniformIndexing = true;
-   f->shaderStorageImageArrayNonUniformIndexing = true;
-   f->shaderUniformTexelBufferArrayNonUniformIndexing = true;
-   f->shaderStorageTexelBufferArrayNonUniformIndexing = true;
-   f->descriptorBindingUniformBufferUpdateAfterBind = true;
-   f->descriptorBindingSampledImageUpdateAfterBind = true;
-   f->descriptorBindingStorageImageUpdateAfterBind = true;
-   f->descriptorBindingStorageBufferUpdateAfterBind = true;
-   f->descriptorBindingUniformTexelBufferUpdateAfterBind = true;
-   f->descriptorBindingStorageTexelBufferUpdateAfterBind = true;
-   f->descriptorBindingUpdateUnusedWhilePending = true;
-   f->descriptorBindingPartiallyBound = true;
-   f->descriptorBindingVariableDescriptorCount = true;
-   f->runtimeDescriptorArray = true;
+   f->shaderUniformBufferArrayNonUniformIndexing = false;
+   f->shaderSampledImageArrayNonUniformIndexing = false;
+   f->shaderStorageBufferArrayNonUniformIndexing = false;
+   f->shaderStorageImageArrayNonUniformIndexing = false;
+   f->shaderUniformTexelBufferArrayNonUniformIndexing = false;
+   f->shaderStorageTexelBufferArrayNonUniformIndexing = false;
+   f->descriptorBindingUniformBufferUpdateAfterBind = false;
+   f->descriptorBindingSampledImageUpdateAfterBind = false;
+   f->descriptorBindingStorageImageUpdateAfterBind = false;
+   f->descriptorBindingStorageBufferUpdateAfterBind = false;
+   f->descriptorBindingUniformTexelBufferUpdateAfterBind = false;
+   f->descriptorBindingStorageTexelBufferUpdateAfterBind = false;
+   f->descriptorBindingUpdateUnusedWhilePending = false;
+   f->descriptorBindingPartiallyBound = false;
+   f->descriptorBindingVariableDescriptorCount = false;
+   f->runtimeDescriptorArray = false;
    f->accelerationStructure = true;
    f->accelerationStructureHostCommands = true;
    f->rayTracingPipeline = true;
-   f->descriptorBindingAccelerationStructureUpdateAfterBind = true;
+   f->descriptorBindingAccelerationStructureUpdateAfterBind = false;
 }
 
 static void
