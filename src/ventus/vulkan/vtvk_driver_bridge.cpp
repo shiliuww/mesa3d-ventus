@@ -163,6 +163,8 @@ struct vtvk_driver_api {
       void *device, const struct vtvk_driver_rt_global_consume_info *info,
       const uint32_t *ray_refs, uint32_t ray_ref_count,
       uint32_t *out_request_count);
+   int (*vt_rt_end_global)(
+      void *device, const struct vtvk_driver_rt_global_consume_info *info);
 };
 
 struct vtvk_driver_upload {
@@ -1055,6 +1057,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t global_hit_attribute_dev_addr = 0;
    uint64_t global_candidate_hit_attribute_dev_addr = 0;
    uint32_t global_hit_attribute_stride = 0;
+   struct vtvk_driver_rt_global_consume_info global_consume = {};
+   bool global_session_teardown_armed = false;
    uint32_t image_width = info->image_extent.width ? info->image_extent.width : info->width;
    uint32_t image_height = info->image_extent.height ? info->image_extent.height : info->height;
    uint32_t image_depth = info->image_extent.depth ? info->image_extent.depth : 1;
@@ -1144,7 +1148,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
         !vtvk_driver_resolve(driver.lib, "vt_rt_resume_global_candidates",
                              (void **)&driver.vt_rt_resume_global_candidates) ||
         !vtvk_driver_resolve(driver.lib, "vt_rt_resume_global_intersections",
-                             (void **)&driver.vt_rt_resume_global_intersections)))
+                             (void **)&driver.vt_rt_resume_global_intersections) ||
+        !vtvk_driver_resolve(driver.lib, "vt_rt_end_global",
+                             (void **)&driver.vt_rt_end_global)))
       goto out;
 
    if (info->descriptor_count) {
@@ -1672,7 +1678,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                       ready_count, unready_count, first_unready);
          }
       }
-      const struct vtvk_driver_rt_global_consume_info consume = {
+      global_consume = {
          .queue_base = global_queue_dev_addr,
          .completion_base = global_completion_dev_addr,
          .hit_attribute_base = global_hit_attribute_dev_addr,
@@ -1687,6 +1693,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          .candidate_hit_attribute_base = global_candidate_hit_attribute_dev_addr,
          .candidate_hit_attribute_stride_bytes = global_hit_attribute_stride,
       };
+      global_session_teardown_armed = true;
       auto dispatch_compact = [&](const char *path, uint64_t entry,
                                   const std::vector<uint32_t> &ray_refs,
                                   const char *name,
@@ -1947,7 +1954,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          };
       for (uint32_t phase = 0; phase <= max_phases; phase++) {
          uint32_t request_count = 0;
-         if (driver.vt_rt_consume_global(driver.device, &consume,
+         if (driver.vt_rt_consume_global(driver.device, &global_consume,
                                          &request_count) != 0) {
             mesa_loge("ventus-vk: global RT queue consumer failed");
             goto out;
@@ -2053,7 +2060,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             if (!intersection_refs.empty()) {
                uint32_t count = 0;
                if (driver.vt_rt_resume_global_intersections(
-                      driver.device, &consume, intersection_refs.data(),
+                      driver.device, &global_consume, intersection_refs.data(),
                       intersection_refs.size(), &count) != 0) {
                   mesa_loge("ventus-vk: global RT intersection resume failed");
                   goto out;
@@ -2084,7 +2091,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             if (!any_hit_refs.empty()) {
                uint32_t count = 0;
                if (driver.vt_rt_resume_global_candidates(
-                      driver.device, &consume, any_hit_refs.data(),
+                      driver.device, &global_consume, any_hit_refs.data(),
                       any_hit_refs.size(), &count) != 0) {
                   mesa_loge("ventus-vk: global RT candidate resume failed");
                   goto out;
@@ -2218,6 +2225,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    ok = true;
 
 out:
+   if (global_session_teardown_armed && driver.device &&
+       driver.vt_rt_end_global &&
+       driver.vt_rt_end_global(driver.device, &global_consume) != 0) {
+      mesa_loge("ventus-vk: global RT session teardown failed");
+      ok = false;
+   }
    vtvk_driver_close(&driver);
    return ok;
 }
