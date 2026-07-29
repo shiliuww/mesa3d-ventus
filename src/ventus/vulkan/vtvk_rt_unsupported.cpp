@@ -101,23 +101,6 @@ vtvk_GetRayTracingCaptureReplayShaderGroupHandlesKHR(
                                                   groupCount, dataSize, pData);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-vtvk_CmdTraceRaysIndirectKHR(
-   VkCommandBuffer commandBuffer,
-   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
-   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
-   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
-   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
-   VkDeviceAddress indirectDeviceAddress)
-{
-   (void)commandBuffer;
-   (void)pRaygenShaderBindingTable;
-   (void)pMissShaderBindingTable;
-   (void)pHitShaderBindingTable;
-   (void)pCallableShaderBindingTable;
-   (void)indirectDeviceAddress;
-}
-
 VKAPI_ATTR VkDeviceSize VKAPI_CALL
 vtvk_GetRayTracingShaderGroupStackSizeKHR(
    VkDevice device,

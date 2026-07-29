@@ -123,6 +123,9 @@ void *vtvk_buffer_host_ptr(VkBuffer buffer, VkDeviceSize offset,
                            VkDeviceSize size);
 void *vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address,
                                      VkDeviceSize size);
+void *vtvk_buffer_host_ptr_from_addr_with_usage(
+   VkDeviceAddress address, VkDeviceSize size,
+   VkBufferUsageFlags required_usage);
 bool vtvk_buffer_resolve_device_address(VkDeviceAddress address,
                                         void **host_base_out,
                                         VkDeviceAddress *host_address_out,

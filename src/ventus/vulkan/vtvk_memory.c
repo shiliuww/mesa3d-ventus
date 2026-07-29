@@ -71,11 +71,14 @@ vtvk_buffer_host_ptr(VkBuffer _buffer, VkDeviceSize offset, VkDeviceSize size)
 }
 
 void *
-vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
+vtvk_buffer_host_ptr_from_addr_with_usage(
+   VkDeviceAddress address, VkDeviceSize size,
+   VkBufferUsageFlags required_usage)
 {
    for (struct vtvk_buffer *buffer = vtvk_buffer_list; buffer;
         buffer = buffer->next) {
-      if (!buffer->map)
+      if (!buffer->map ||
+          (buffer->usage & required_usage) != required_usage)
          continue;
 
       VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
@@ -90,6 +93,12 @@ vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
    }
 
    return NULL;
+}
+
+void *
+vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address, VkDeviceSize size)
+{
+   return vtvk_buffer_host_ptr_from_addr_with_usage(address, size, 0);
 }
 
 bool
@@ -229,6 +238,7 @@ vtvk_CreateBuffer(VkDevice _device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    buffer->size = pCreateInfo->size;
+   buffer->usage = pCreateInfo->usage;
    buffer->next = vtvk_buffer_list;
    vtvk_buffer_list = buffer;
    *pBuffer = (VkBuffer)vtvk_ptr_to_handle(buffer);

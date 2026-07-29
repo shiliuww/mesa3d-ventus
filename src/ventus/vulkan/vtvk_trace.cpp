@@ -175,3 +175,46 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
 
    vtvk_driver_trace_rays(&trace);
 }
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdTraceRaysIndirectKHR(
+   VkCommandBuffer commandBuffer,
+   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+   VkDeviceAddress indirectDeviceAddress)
+{
+   if (indirectDeviceAddress & 3) {
+      mesa_loge("ventus-vk: indirect RT dispatch address is not 4-byte "
+                "aligned: 0x%" PRIx64,
+                (uint64_t)indirectDeviceAddress);
+      return;
+   }
+
+   const VkTraceRaysIndirectCommandKHR *command =
+      (const VkTraceRaysIndirectCommandKHR *)
+         vtvk_buffer_host_ptr_from_addr_with_usage(
+            indirectDeviceAddress, sizeof(*command),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+   if (!command) {
+      mesa_loge("ventus-vk: indirect RT dispatch address is not a complete "
+                "INDIRECT_BUFFER range: 0x%" PRIx64,
+                (uint64_t)indirectDeviceAddress);
+      return;
+   }
+
+   static bool logged;
+   if (!logged) {
+      logged = true;
+      mesa_logi("ventus-vk: vkCmdTraceRaysIndirectKHR resolved "
+                "%ux%ux%u from 0x%" PRIx64,
+                command->width, command->height, command->depth,
+                (uint64_t)indirectDeviceAddress);
+   }
+
+   vtvk_CmdTraceRaysKHR(
+      commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
+      pHitShaderBindingTable, pCallableShaderBindingTable,
+      command->width, command->height, command->depth);
+}

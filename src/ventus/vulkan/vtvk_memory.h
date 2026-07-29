@@ -10,6 +10,7 @@ struct vtvk_memory {
 
 struct vtvk_buffer {
    VkDeviceSize size;
+   VkBufferUsageFlags usage;
    VkDeviceMemory memory;
    VkDeviceSize memory_offset;
    void *map;
