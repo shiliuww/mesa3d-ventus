@@ -65,6 +65,12 @@ vtvk_aabb_empty(struct vtvk_aabb *aabb)
 }
 
 static void
+vtvk_aabb_zero(struct vtvk_aabb *aabb)
+{
+   memset(aabb, 0, sizeof(*aabb));
+}
+
+static void
 vtvk_aabb_include_point(struct vtvk_aabb *aabb, const float p[3])
 {
    for (unsigned i = 0; i < 3; i++) {
@@ -697,11 +703,23 @@ vtvk_build_blas(struct vtvk_device *device,
                 const VkAccelerationStructureBuildGeometryInfoKHR *info,
                 const VkAccelerationStructureBuildRangeInfoKHR *ranges)
 {
-   if (!info->geometryCount || !ranges)
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (!info->geometryCount) {
+      if (as->size < VENTUS_AS_HEADER_SIZE)
+         return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      struct vtvk_aabb bounds;
+      vtvk_aabb_zero(&bounds);
+      memset(as->data, 0, as->size);
+      vtvk_write_header((uint8_t *)as->data, VENTUS_AS_TYPE_BLAS,
+                        VENTUS_AS_INVALID_NODE, 0, 0, 0, 0, &bounds);
+      return VK_SUCCESS;
+   }
+   if (!ranges)
+      return vk_error(device, VK_ERROR_UNKNOWN);
 
    const VkAccelerationStructureGeometryKHR *first_geom =
       vtvk_build_geometry(info, 0);
+   if (!first_geom)
+      return vk_error(device, VK_ERROR_UNKNOWN);
    const VkGeometryTypeKHR geometry_type = first_geom->geometryType;
    if (geometry_type != VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
        geometry_type != VK_GEOMETRY_TYPE_AABBS_KHR)
@@ -712,8 +730,7 @@ vtvk_build_blas(struct vtvk_device *device,
         geometry_id++) {
       const VkAccelerationStructureGeometryKHR *geom =
          vtvk_build_geometry(info, geometry_id);
-      if (!geom || geom->geometryType != geometry_type ||
-          !ranges[geometry_id].primitiveCount)
+      if (!geom || geom->geometryType != geometry_type)
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       primitive_count += ranges[geometry_id].primitiveCount;
       if (primitive_count > UINT32_MAX)
@@ -743,6 +760,8 @@ vtvk_build_blas(struct vtvk_device *device,
         geometry_id++) {
       const VkAccelerationStructureGeometryKHR *geom =
          vtvk_build_geometry(info, geometry_id);
+      if (!ranges[geometry_id].primitiveCount)
+         continue;
       VkResult result;
       if (geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR) {
          result = vtvk_append_aabb_geometry(
@@ -757,8 +776,13 @@ vtvk_build_blas(struct vtvk_device *device,
          return result;
    }
 
-   struct vtvk_build_node root =
-      vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+   struct vtvk_build_node root;
+   if (leaves.empty()) {
+      root.ref = VENTUS_AS_INVALID_NODE;
+      vtvk_aabb_zero(&root.bounds);
+   } else {
+      root = vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+   }
    vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE,
                      uint32_t(primitive_count), 0,
@@ -786,8 +810,27 @@ vtvk_build_tlas(struct vtvk_device *device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    uint32_t instance_count = range ? range->primitiveCount : 0;
-   if (!instance_count)
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (!range)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   uint8_t *dst = (uint8_t *)as->data;
+   if (!dst)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   const uint64_t required_size =
+      VENTUS_AS_HEADER_SIZE +
+      uint64_t(instance_count) * VENTUS_AS_INSTANCE_NODE_SIZE +
+      vtvk_internal_box_count(instance_count) * VENTUS_AS_BOX4_NODE_SIZE;
+   if (required_size > as->size || required_size > UINT32_MAX)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   if (!instance_count) {
+      struct vtvk_aabb bounds;
+      vtvk_aabb_zero(&bounds);
+      memset(dst, 0, as->size);
+      vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, VENTUS_AS_INVALID_NODE,
+                        0, 0, 0, 0, &bounds);
+      return VK_SUCCESS;
+   }
 
    const VkAccelerationStructureGeometryInstancesDataKHR *instances =
       &geom->geometry.instances;
@@ -815,10 +858,6 @@ vtvk_build_tlas(struct vtvk_device *device,
          return vk_error(device, VK_ERROR_UNKNOWN);
    }
 
-   uint8_t *dst = (uint8_t *)as->data;
-   if (!dst)
-      return vk_error(device, VK_ERROR_UNKNOWN);
-
    memset(dst, 0, as->size);
    uint32_t cursor = VENTUS_AS_HEADER_SIZE;
    uint32_t node_count = 0;
@@ -845,7 +884,7 @@ vtvk_build_tlas(struct vtvk_device *device,
       struct vtvk_acceleration_structure *blas_as =
          vtvk_find_as_by_address(blas_address);
       const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_address;
-      if (!blas_as || !blas ||
+      if (!blas_as || !blas_as->built || !blas ||
           vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
          return vk_error(device, VK_ERROR_UNKNOWN);
 
@@ -900,6 +939,23 @@ vtvk_build_as(struct vtvk_device *device,
          vtvk_handle_to_ptr((uint64_t)info->dstAccelerationStructure);
    if (!as)
       return vk_error(device, VK_ERROR_UNKNOWN);
+   if (as->type != VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR &&
+       as->type != info->type)
+      return vk_error(device, VK_ERROR_UNKNOWN);
+
+   if (info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+      struct vtvk_acceleration_structure *src =
+         (struct vtvk_acceleration_structure *)
+            vtvk_handle_to_ptr((uint64_t)info->srcAccelerationStructure);
+      if (!src || !src->built ||
+          !(src->build_flags &
+            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) ||
+          src->build_flags != info->flags ||
+          src->built_type != info->type)
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   } else if (info->mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    as->data = vtvk_buffer_host_ptr(as->buffer, as->offset, as->size);
    if (!as->data)
@@ -922,6 +978,9 @@ vtvk_build_as(struct vtvk_device *device,
    if (!as->snapshot || as->snapshot_size < as->size)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    memcpy(as->snapshot, as->data, as->size);
+   as->build_flags = info->flags;
+   as->built_type = info->type;
+   as->built = true;
    if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS") &&
        info->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
       uint32_t root_ref =
@@ -1022,8 +1081,6 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
       primitive_count =
          pMaxPrimitiveCounts && pBuildInfo->geometryCount ?
          pMaxPrimitiveCounts[0] : 1;
-      if (!primitive_count)
-         primitive_count = 1;
       primitive_bytes = primitive_count * VENTUS_AS_INSTANCE_NODE_SIZE;
    } else if (pBuildInfo && pBuildInfo->geometryCount) {
       for (uint32_t i = 0; i < pBuildInfo->geometryCount; i++) {
@@ -1031,17 +1088,12 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
             vtvk_build_geometry(pBuildInfo, i);
          uint64_t geometry_primitive_count =
             pMaxPrimitiveCounts ? pMaxPrimitiveCounts[i] : 1;
-         if (!geometry_primitive_count)
-            geometry_primitive_count = 1;
          const uint64_t leaf_size =
             geom && geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR ?
             VENTUS_AS_AABB_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE;
          primitive_count += geometry_primitive_count;
          primitive_bytes += geometry_primitive_count * leaf_size;
       }
-   } else {
-      primitive_count = 1;
-      primitive_bytes = VENTUS_AS_TRIANGLE_NODE_SIZE;
    }
    uint64_t internal_count = vtvk_internal_box_count(primitive_count);
    uint64_t internal_bytes = internal_count * VENTUS_AS_BOX4_NODE_SIZE;
@@ -1092,7 +1144,7 @@ vtvk_clone_acceleration_structure(
       (struct vtvk_acceleration_structure *)
          vtvk_handle_to_ptr((uint64_t)info->dst);
    if (!src || !dst || src == dst || src->type != dst->type ||
-       !src->snapshot || !src->snapshot_size)
+       !src->built || !src->snapshot || !src->snapshot_size)
       return vk_error(device, VK_ERROR_UNKNOWN);
    if (dst->size < src->snapshot_size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -1107,6 +1159,9 @@ vtvk_clone_acceleration_structure(
    memset(dst->snapshot, 0, dst->snapshot_size);
    memcpy(dst->snapshot, src->snapshot, src->snapshot_size);
    dst->data = dst_data;
+   dst->build_flags = src->build_flags;
+   dst->built_type = src->built_type;
+   dst->built = true;
    return VK_SUCCESS;
 }
 

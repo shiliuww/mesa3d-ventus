@@ -79,6 +79,9 @@ struct vtvk_acceleration_structure {
    void *data;
    uint8_t *snapshot;
    VkDeviceSize snapshot_size;
+   VkBuildAccelerationStructureFlagsKHR build_flags;
+   VkAccelerationStructureTypeKHR built_type;
+   bool built;
 };
 
 struct vtvk_descriptor_binding_info {
