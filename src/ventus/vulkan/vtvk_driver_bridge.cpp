@@ -86,15 +86,20 @@ struct vtvk_driver_rt_global_consume_info {
    uint64_t queue_base;
    uint64_t completion_base;
    uint64_t hit_attribute_base;
+   uint64_t miss_sbt_base;
+   uint64_t hit_sbt_base;
    uint32_t capacity_rays;
    uint32_t hit_attribute_stride_bytes;
    uint32_t max_batch_rays;
+   uint64_t miss_sbt_stride_bytes;
+   uint64_t hit_sbt_stride_bytes;
 };
 
 struct vtvk_driver_rt_resume_request {
    uint64_t payload_address;
    uint32_t ray_ref;
    uint32_t completed_stage;
+   uint32_t callback_group;
    uint32_t cps_frame;
    uint32_t cps_stack_size;
    uint32_t continuation_id;
@@ -336,30 +341,33 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
 
 static bool
 vtvk_global_callback_kernel(const struct vtvk_driver_trace_rays_info *info,
-                            uint32_t stage, const char **out_path,
+                            uint32_t stage, uint32_t group,
+                            uint32_t *out_index, const char **out_path,
                             uint64_t *out_entry)
 {
    uint32_t found = UINT32_MAX;
    for (uint32_t i = 0; i < info->callback_kernel_count; i++) {
-      if (info->callback_kernel_stages[i] != stage)
+      if (info->callback_kernel_stages[i] != stage ||
+          info->callback_kernel_groups[i] != group)
          continue;
       if (found != UINT32_MAX) {
-         mesa_loge("ventus-vk: global RT requires one callback kernel per "
-                   "terminal stage; multiple SBT groups are not scheduled yet");
+         mesa_loge("ventus-vk: global RT has duplicate callback kernels for "
+                   "stage %u SBT group %u", stage, group);
          return false;
       }
       found = i;
    }
    if (found == UINT32_MAX || !info->callback_kernel_paths[found]) {
       mesa_loge("ventus-vk: global RT has no emitted terminal callback kernel "
-                "for stage %u", stage);
+                "for stage %u SBT group %u", stage, group);
       return false;
    }
+   *out_index = found;
    *out_path = info->callback_kernel_paths[found];
    *out_entry = info->callback_kernel_entries[found];
    if (vtvk_bridge_env_enabled("VENTUS_VK_RT_DEBUG_CALLBACK_DISPATCH"))
-      mesa_logi("ventus-vk: global RT callback stage=%u index=%u entry=0x%" PRIx64
-                " path=%s", stage, found, *out_entry, *out_path);
+      mesa_logi("ventus-vk: global RT callback stage=%u group=%u index=%u entry=0x%" PRIx64
+                " path=%s", stage, group, found, *out_entry, *out_path);
    return true;
 }
 
@@ -1173,9 +1181,13 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          .queue_base = global_queue_dev_addr,
          .completion_base = global_completion_dev_addr,
          .hit_attribute_base = global_hit_attribute_dev_addr,
+         .miss_sbt_base = args.miss_sbt.addr,
+         .hit_sbt_base = args.hit_sbt.addr,
          .capacity_rays = global_queue_capacity,
          .hit_attribute_stride_bytes = 2 * sizeof(uint32_t),
          .max_batch_rays = vtvk_rt_lanes_per_warp,
+         .miss_sbt_stride_bytes = args.miss_sbt.stride,
+         .hit_sbt_stride_bytes = args.hit_sbt.stride,
       };
       auto dispatch_compact = [&](const char *path, uint64_t entry,
                                   const std::vector<uint32_t> &ray_refs,
@@ -1409,18 +1421,23 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          }
          std::vector<uint32_t> miss_refs;
          std::vector<uint32_t> hit_refs;
+         std::vector<std::vector<uint32_t>> callback_refs(
+            info->callback_kernel_count);
          std::vector<std::vector<uint32_t>> miss_resume_refs(
             info->resume_kernel_count);
          std::vector<std::vector<uint32_t>> hit_resume_refs(
             info->resume_kernel_count);
          for (const auto &request : requests) {
+            uint32_t callback_stage = 0;
             if (request.completed_stage == 0) {
                miss_refs.push_back(request.ray_ref);
+               callback_stage = MESA_SHADER_MISS;
                if (request.continuation_id < miss_resume_refs.size())
                   miss_resume_refs[request.continuation_id].push_back(
                      request.ray_ref);
             } else if (request.completed_stage == 1) {
                hit_refs.push_back(request.ray_ref);
+               callback_stage = MESA_SHADER_CLOSEST_HIT;
                if (request.continuation_id < hit_resume_refs.size())
                   hit_resume_refs[request.continuation_id].push_back(
                      request.ray_ref);
@@ -1434,46 +1451,50 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                          request.continuation_id);
                goto out;
             }
+            uint32_t callback_index = UINT32_MAX;
+            const char *callback_path = NULL;
+            uint64_t callback_entry = 0;
+            if (!vtvk_global_callback_kernel(info, callback_stage,
+                                             request.callback_group,
+                                             &callback_index, &callback_path,
+                                             &callback_entry))
+               goto out;
+            callback_refs[callback_index].push_back(request.ray_ref);
          }
 
-         const char *callback_path = NULL;
-         uint64_t callback_entry = 0;
-         if (!miss_refs.empty()) {
-            if (!vtvk_global_callback_kernel(info, MESA_SHADER_MISS,
-                                             &callback_path, &callback_entry) ||
-                !dispatch_compact(callback_path, callback_entry, miss_refs,
-                                  "ventus_vk_miss", phase + 1)) {
-               mesa_loge("ventus-vk: global RT miss callback dispatch failed");
-               goto out;
-            }
-         }
-         if (!hit_refs.empty()) {
+         if (!hit_refs.empty() && debug_payload_rgb) {
             /* Poison the complete hit payload before the callback.  This
              * opt-in diagnostic separates "callback wrote zero" from
              * "callback never reached its global stores" without changing
              * normal global-wavefront execution. */
-            if (debug_payload_rgb) {
-               const uint32_t poison[8] = {
-                  0x7fc01234u, 0x7fc01235u, 0x7fc01236u, 0x7fc01237u,
-                  0x7fc01238u, 0x7fc01239u, 0x7fc0123au, 0x7fc0123bu,
-               };
-               for (const auto &request : requests) {
-                  if (request.completed_stage != 1)
-                     continue;
-                  if (driver.vt_copy_to_dev(driver.device,
-                                            request.payload_address, poison,
-                                            sizeof(poison), 0, 0) != 0) {
-                     mesa_loge("ventus-vk: global RT hit payload poison failed "
-                               "ray_ref=%u", request.ray_ref);
-                     goto out;
-                  }
+            const uint32_t poison[8] = {
+               0x7fc01234u, 0x7fc01235u, 0x7fc01236u, 0x7fc01237u,
+               0x7fc01238u, 0x7fc01239u, 0x7fc0123au, 0x7fc0123bu,
+            };
+            for (const auto &request : requests) {
+               if (request.completed_stage != 1)
+                  continue;
+               if (driver.vt_copy_to_dev(driver.device, request.payload_address,
+                                         poison, sizeof(poison), 0, 0) != 0) {
+                  mesa_loge("ventus-vk: global RT hit payload poison failed "
+                            "ray_ref=%u", request.ray_ref);
+                  goto out;
                }
             }
-            if (!vtvk_global_callback_kernel(info, MESA_SHADER_CLOSEST_HIT,
-                                             &callback_path, &callback_entry) ||
-                !dispatch_compact(callback_path, callback_entry, hit_refs,
-                                  "ventus_vk_closest_hit", phase + 1)) {
-               mesa_loge("ventus-vk: global RT closest-hit callback dispatch failed");
+         }
+         for (uint32_t callback = 0; callback < callback_refs.size(); callback++) {
+            const std::vector<uint32_t> &refs = callback_refs[callback];
+            if (refs.empty())
+               continue;
+            const uint32_t stage = info->callback_kernel_stages[callback];
+            const char *name = stage == MESA_SHADER_MISS ?
+               "ventus_vk_miss" : "ventus_vk_closest_hit";
+            if (!dispatch_compact(info->callback_kernel_paths[callback],
+                                  info->callback_kernel_entries[callback], refs,
+                                  name, phase + 1)) {
+               mesa_loge("ventus-vk: global RT callback dispatch failed "
+                         "stage=%u group=%u", stage,
+                         info->callback_kernel_groups[callback]);
                goto out;
             }
          }

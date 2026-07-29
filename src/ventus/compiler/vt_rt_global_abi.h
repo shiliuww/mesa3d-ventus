@@ -14,7 +14,7 @@
  * Shader-visible wavefront RT ABI.  A ray reference is an ordinal in a
  * field-major global queue, never a PDS address or a physical lane number.
  */
-#define VT_RT_GLOBAL_ABI_VERSION 8
+#define VT_RT_GLOBAL_ABI_VERSION 9
 #define VT_RT_GLOBAL_WARP_SIZE 32u
 #define VT_RT_GLOBAL_ALIGNMENT_BYTES 128u
 #define VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES VT_RT_GLOBAL_ALIGNMENT_BYTES
@@ -101,6 +101,8 @@ enum vt_rt_global_completion_field {
    VT_RT_GLOBAL_COMPLETION_LAUNCH_ID_X,
    VT_RT_GLOBAL_COMPLETION_LAUNCH_ID_Y,
    VT_RT_GLOBAL_COMPLETION_LAUNCH_ID_Z,
+   /* Pipeline shader-group index decoded from the terminal SBT record. */
+   VT_RT_GLOBAL_COMPLETION_CALLBACK_GROUP,
    /* Written last by RTcore after the result and payload are visible. */
    VT_RT_GLOBAL_COMPLETION_READY,
    VT_RT_GLOBAL_COMPLETION_FIELD_COUNT,
