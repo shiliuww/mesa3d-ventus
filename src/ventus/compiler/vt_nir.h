@@ -20,7 +20,12 @@ extern "C" {
 
 enum vt_rt_execution_model {
    VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP = 0,
+   /* Compatibility mirror: it publishes a global mailbox but still executes
+    * the legacy PDS traversal loop. */
    VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE = 1,
+   /* PDS-free profile.  Raygen publishes level-zero requests in global
+    * mailboxes; RTcore compacts them into, then consumes, the queue. */
+   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER = 2,
 };
 
 enum vt_rt_shader_layout {
@@ -109,19 +114,22 @@ struct vt_nir_rt_result {
 };
 
 struct vt_nir_rt_global_queue_args {
-   /*
-    * Low 32-bit Ventus global address of a RayQueueHeader followed by
-    * field-major planes.  Vulkan device-address values are normalized to this
-    * target address domain by the driver before reaching NIR.
+   /* Global address of a RayQueueHeader followed by field-major planes.
+    * It remains u64 in the NIR/dispatch ABI; an RV32 execution submission is
+    * accepted only after the driver has checked the complete allocation range.
     */
    nir_def *base_addr;
    nir_def *field_stride_bytes;
 };
 
 struct vt_nir_rt_submission_mailbox_args {
-   /* Low 32-bit global address of this lane's reusable submit mailbox. */
+   /* Global address of this lane's reusable submit mailbox; see the RV32
+    * submission range rule above. */
    nir_def *base_addr;
    nir_def *generation;
+   /* Queue identity is carried in the producer mailbox, not inferred from
+    * PDS or from a physical lane. */
+   nir_def *queue_base_addr;
 };
 
 struct vt_nir_pipeline_scratch_info {
@@ -156,6 +164,17 @@ struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
 struct vt_rt_global_queue_layout
 vt_nir_rt_global_queue_layout(uint32_t capacity_rays);
 
+bool vt_nir_rt_global_queue_capacity(uint32_t width, uint32_t height,
+                                     uint32_t max_ray_recursion_depth,
+                                     uint32_t children_per_ray,
+                                     uint32_t *capacity_rays);
+
+/* Number of global mailbox records for all resident physical worker lanes.
+ * The record kind is PRIMARY, shadow, reflection, or refraction. */
+bool vt_nir_rt_submission_mailbox_capacity(uint32_t resident_workers,
+                                           uint32_t lanes_per_worker,
+                                           uint64_t *mailbox_records);
+
 nir_def *vt_nir_rt_global_queue_field_addr(
    nir_builder *b, const struct vt_nir_rt_global_queue_args *queue,
    enum vt_rt_global_trace_field field, nir_def *ray_ref);
@@ -164,6 +183,13 @@ void vt_nir_rt_store_submission_mailbox(
    nir_builder *b, const struct vt_nir_rt_submission_mailbox_args *mailbox,
    const struct vt_nir_rt_trace_params *params, nir_def *parent_frame,
    nir_def *phase_generation, nir_def *depth);
+
+/* Computes the global staging address owned by this physical worker lane.
+ * worker_id is globally unique across resident SM/warp slots. */
+nir_def *vt_nir_rt_submission_mailbox_addr(
+   nir_builder *b, nir_def *mailbox_pool_addr, nir_def *mailbox_stride_bytes,
+   nir_def *worker_id, nir_def *lane_id,
+   enum vt_rt_submission_mailbox_child_kind kind);
 
 void vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
                                        const struct vt_nir_rt_abi_layout *layout);
@@ -253,6 +279,12 @@ vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_config *config);
 
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
+                                   const struct vt_nir_rt_config *config);
+
+/* PDS-free level-zero producer.  It intentionally supports only terminal
+ * primary traceRayEXT calls; worker callback dispatch and CPS resume require
+ * the RTcore worker ABI and are lowered separately. */
+bool vt_nir_lower_rt_global_raygen(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
 
 bool vt_nir_lower_rt_abi(nir_shader *shader,
@@ -349,7 +381,14 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_BASE = 184,
    VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_STRIDE = 192,
    VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_GENERATION = 196,
-   VT_NIR_RT_DISPATCH_ARG_SIZE = 200,
+   /* Target wavefront ABI.  These remain zero until worker dispatch lands. */
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_QUEUE_BASE = 200,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_QUEUE_CAPACITY = 208,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_QUEUE_GENERATION = 212,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_ARENA_ADDR = 216,
+   VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_FRAME_STRIDE = 224,
+   VT_NIR_RT_DISPATCH_ARG_MAX_RAY_RECURSION_DEPTH = 228,
+   VT_NIR_RT_DISPATCH_ARG_SIZE = 232,
 };
 
 enum vt_nir_rt_descriptor_record {

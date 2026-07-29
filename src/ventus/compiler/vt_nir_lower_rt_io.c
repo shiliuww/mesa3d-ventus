@@ -179,12 +179,13 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
                                nir_imul(b, height, nir_channel(b, id, 2)));
       nir_def *linear = nir_iadd(b, nir_channel(b, id, 0),
                                   nir_imul(b, width, row));
-      nir_def *pool = nir_u2u32(b, load_dispatch_arg(
-         b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_BASE, 64));
+      nir_def *pool = load_dispatch_arg(
+         b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_BASE, 64);
       nir_def *stride = load_dispatch_arg(
          b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_STRIDE, 32);
       struct vt_nir_rt_submission_mailbox_args mailbox = {
-         .base_addr = nir_iadd(b, pool, nir_imul(b, linear, stride)),
+         .base_addr = nir_iadd(b, pool, nir_imul(b, nir_u2u64(b, linear),
+                                                  nir_u2u64(b, stride))),
          .generation = load_dispatch_arg(
             b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_GENERATION, 32),
       };

@@ -5,6 +5,12 @@
 
 #include "vt_nir.h"
 
+static nir_def *
+as_u64(nir_builder *b, nir_def *value)
+{
+   return value->bit_size == 64 ? value : nir_u2u64(b, value);
+}
+
 static void
 store_scalar_mailbox_field(nir_builder *b,
                    const struct vt_nir_rt_submission_mailbox_args *mailbox,
@@ -15,7 +21,7 @@ store_scalar_mailbox_field(nir_builder *b,
       value = nir_imm_int(b, 0);
    nir_def *addr = nir_iadd_imm(b, mailbox->base_addr,
       vt_rt_submission_mailbox_field_offset_bytes(field));
-   nir_store_global(b, value, nir_u2u64(b, addr), .align_mul = 4);
+   nir_store_global(b, value, addr, .align_mul = 4);
 }
 
 static void
@@ -34,11 +40,29 @@ vt_nir_rt_global_queue_field_addr(
    nir_builder *b, const struct vt_nir_rt_global_queue_args *queue,
    enum vt_rt_global_trace_field field, nir_def *ray_ref)
 {
-   nir_def *field_offset = nir_imul_imm(b, queue->field_stride_bytes, field);
-   nir_def *ray_offset = nir_imul_imm(b, ray_ref, 4);
+   nir_def *field_offset = nir_imul_imm(b, as_u64(b, queue->field_stride_bytes),
+                                        field);
+   nir_def *ray_offset = nir_imul_imm(b, as_u64(b, ray_ref), 4);
    nir_def *offset = nir_iadd(b, field_offset, ray_offset);
    offset = nir_iadd_imm(b, offset, VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES);
-   return nir_u2u64(b, nir_iadd(b, queue->base_addr, offset));
+   return nir_iadd(b, as_u64(b, queue->base_addr), offset);
+}
+
+nir_def *
+vt_nir_rt_submission_mailbox_addr(
+   nir_builder *b, nir_def *mailbox_pool_addr, nir_def *mailbox_stride_bytes,
+   nir_def *worker_id, nir_def *lane_id,
+   enum vt_rt_submission_mailbox_child_kind kind)
+{
+   nir_def *worker_lane = nir_iadd(
+      b, nir_imul_imm(b, nir_u2u64(b, worker_id), VT_RT_GLOBAL_WARP_SIZE),
+      nir_u2u64(b, lane_id));
+   nir_def *record_index = nir_iadd_imm(
+      b, nir_imul_imm(b, worker_lane,
+                       VT_RT_SUBMISSION_MAILBOX_RECORD_KINDS), kind);
+   return nir_iadd(b, mailbox_pool_addr,
+                   nir_imul(b, record_index,
+                            nir_u2u64(b, mailbox_stride_bytes)));
 }
 
 void
@@ -48,9 +72,12 @@ vt_nir_rt_store_submission_mailbox(
    nir_def *phase_generation, nir_def *depth)
 {
    /* Prepare all record data before publishing the mailbox valid word. */
-   /* NIR-to-LLVM resolves this descriptor value to the RV32 TLAS address. */
-   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_TLAS_ADDR,
-                              params->accel_struct);
+   nir_def *tlas = params->accel_struct ? nir_u2u64(b, params->accel_struct) :
+      nir_imm_int64(b, 0);
+   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_TLAS_ADDR_LO,
+                              nir_unpack_64_2x32_split_x(b, tlas));
+   store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_TLAS_ADDR_HI,
+                              nir_unpack_64_2x32_split_y(b, tlas));
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_FLAGS,
                       params->flags);
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_CULL_MASK,
@@ -90,11 +117,17 @@ vt_nir_rt_store_submission_mailbox(
    store_scalar_mailbox_field(b, mailbox, VT_RT_GLOBAL_TRACE_DEPTH, depth);
 
    nir_store_global(b, nir_imm_int(b, VT_RT_SUBMISSION_MAILBOX_MAGIC_VALUE),
-      nir_u2u64(b, mailbox->base_addr), .align_mul = 4);
+      mailbox->base_addr, .align_mul = 4);
    nir_store_global(b, nir_imm_int(b, VT_RT_GLOBAL_ABI_VERSION),
-      nir_u2u64(b, nir_iadd_imm(b, mailbox->base_addr, 4)), .align_mul = 4);
+      nir_iadd_imm(b, mailbox->base_addr, 4), .align_mul = 4);
    nir_store_global(b, mailbox->generation,
-      nir_u2u64(b, nir_iadd_imm(b, mailbox->base_addr, 8)), .align_mul = 4);
+      nir_iadd_imm(b, mailbox->base_addr, 8), .align_mul = 4);
+   nir_def *queue_base = mailbox->queue_base_addr ?
+      as_u64(b, mailbox->queue_base_addr) : nir_imm_int64(b, 0);
+   nir_store_global(b, nir_unpack_64_2x32_split_x(b, queue_base),
+      nir_iadd_imm(b, mailbox->base_addr, 16), .align_mul = 4);
+   nir_store_global(b, nir_unpack_64_2x32_split_y(b, queue_base),
+      nir_iadd_imm(b, mailbox->base_addr, 20), .align_mul = 4);
    nir_store_global(b, nir_imm_int(b, 1),
-      nir_u2u64(b, nir_iadd_imm(b, mailbox->base_addr, 12)), .align_mul = 4);
+      nir_iadd_imm(b, mailbox->base_addr, 12), .align_mul = 4);
 }

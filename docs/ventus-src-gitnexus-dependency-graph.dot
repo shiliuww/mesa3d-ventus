@@ -1,0 +1,177 @@
+digraph ventus_src_dependencies {
+  graph [rankdir=LR, bgcolor="white", fontname="Noto Sans", label="GitNexus file-level dependency graph: mesa/src/ventus", labelloc=t, fontsize=24, pad=0.3, nodesep=0.45, ranksep=1.0, splines=polyline];
+  node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#64748b", fontname="Noto Sans", fontsize=10, margin="0.12,0.08"];
+  edge [fontname="Noto Sans", fontsize=8, arrowsize=0.7];
+  subgraph cluster_common {
+    label="common"; color="#cbd5e1"; style="rounded";
+    "common/ventus_kernel_metadata.h" [label="common/ventus_kernel_metadata.h"];
+    "common/ventus_rt_address.h" [label="common/ventus_rt_address.h"];
+    "common/ventus_rt_bvh.h" [label="common/ventus_rt_bvh.h"];
+  }
+  subgraph cluster_compiler {
+    label="compiler"; color="#cbd5e1"; style="rounded";
+    "compiler/meson.build" [label="compiler/meson.build"];
+    "compiler/vt_nir.h" [label="compiler/vt_nir.h"];
+    "compiler/vt_nir_build_traversal.c" [label="compiler/vt_nir_build_traversal.c"];
+    "compiler/vt_nir_canonicalize_rt.c" [label="compiler/vt_nir_canonicalize_rt.c"];
+    "compiler/vt_nir_lower_descriptors.c" [label="compiler/vt_nir_lower_descriptors.c"];
+    "compiler/vt_nir_lower_rt_abi.c" [label="compiler/vt_nir_lower_rt_abi.c"];
+    "compiler/vt_nir_lower_rt_abi_data.c" [label="compiler/vt_nir_lower_rt_abi_data.c"];
+    "compiler/vt_nir_lower_rt_io.c" [label="compiler/vt_nir_lower_rt_io.c"];
+    "compiler/vt_nir_rt_abi_layout.c" [label="compiler/vt_nir_rt_abi_layout.c"];
+    "compiler/vt_nir_rt_cps.c" [label="compiler/vt_nir_rt_cps.c"];
+    "compiler/vt_nir_rt_global_layout.c" [label="compiler/vt_nir_rt_global_layout.c"];
+    "compiler/vt_nir_rt_queue.c" [label="compiler/vt_nir_rt_queue.c"];
+    "compiler/vt_nir_scratch_layout.c" [label="compiler/vt_nir_scratch_layout.c"];
+    "compiler/vt_rt_abi.h" [label="compiler/vt_rt_abi.h"];
+    "compiler/vt_rt_global_abi.h" [label="compiler/vt_rt_global_abi.h"];
+  }
+  subgraph cluster_llvm {
+    label="llvm"; color="#cbd5e1"; style="rounded";
+    "llvm/meson.build" [label="llvm/meson.build"];
+    "llvm/ventus_nir_to_llvm.cpp" [label="llvm/ventus_nir_to_llvm.cpp"];
+    "llvm/ventus_nir_to_llvm.h" [label="llvm/ventus_nir_to_llvm.h"];
+  }
+  subgraph cluster_root {
+    label="root"; color="#cbd5e1"; style="rounded";
+    "README.md" [label="README.md"];
+    "RT_SBT_MEMORY_ABI.md" [label="RT_SBT_MEMORY_ABI.md"];
+    "log.md" [label="log.md"];
+    "meson.build" [label="meson.build"];
+  }
+  subgraph cluster_tests {
+    label="tests"; color="#cbd5e1"; style="rounded";
+    "tests/meson.build" [label="tests/meson.build"];
+    "tests/vt_nir_rt_canonicalize_test.c" [label="tests/vt_nir_rt_canonicalize_test.c"];
+    "tests/vt_rt_flagged_image_smoke_test.c" [label="tests/vt_rt_flagged_image_smoke_test.c"];
+    "tests/vt_rt_flagged_raygen.rgen" [label="tests/vt_rt_flagged_raygen.rgen"];
+    "tests/vt_rt_global_abi_test.c" [label="tests/vt_rt_global_abi_test.c"];
+    "tests/vt_rt_global_queue_nir_test.c" [label="tests/vt_rt_global_queue_nir_test.c"];
+    "tests/vt_rt_image_smoke_test.c" [label="tests/vt_rt_image_smoke_test.c"];
+    "tests/vt_rt_minimal_loop_test.c" [label="tests/vt_rt_minimal_loop_test.c"];
+    "tests/vt_rt_minimal_raygen.rgen" [label="tests/vt_rt_minimal_raygen.rgen"];
+    "tests/vt_rt_test_common.h" [label="tests/vt_rt_test_common.h"];
+  }
+  subgraph cluster_tools {
+    label="tools"; color="#cbd5e1"; style="rounded";
+    "tools/rt_probe/README.md" [label="tools/rt_probe/README.md"];
+    "tools/rt_probe/build_probe.sh" [label="tools/rt_probe/build_probe.sh"];
+    "tools/rt_probe/linker.ld" [label="tools/rt_probe/linker.ld"];
+    "tools/rt_probe/probe_write_pixel.ll" [label="tools/rt_probe/probe_write_pixel.ll"];
+  }
+  subgraph cluster_vulkan {
+    label="vulkan"; color="#cbd5e1"; style="rounded";
+    "vulkan/meson.build" [label="vulkan/meson.build"];
+    "vulkan/vtvk_acceleration_structure.cpp" [label="vulkan/vtvk_acceleration_structure.cpp"];
+    "vulkan/vtvk_cmd_buffer.c" [label="vulkan/vtvk_cmd_buffer.c"];
+    "vulkan/vtvk_descriptors.c" [label="vulkan/vtvk_descriptors.c"];
+    "vulkan/vtvk_device.c" [label="vulkan/vtvk_device.c"];
+    "vulkan/vtvk_driver_bridge.cpp" [label="vulkan/vtvk_driver_bridge.cpp"];
+    "vulkan/vtvk_driver_bridge.h" [label="vulkan/vtvk_driver_bridge.h"];
+    "vulkan/vtvk_instance.c" [label="vulkan/vtvk_instance.c"];
+    "vulkan/vtvk_memory.c" [label="vulkan/vtvk_memory.c"];
+    "vulkan/vtvk_memory.h" [label="vulkan/vtvk_memory.h"];
+    "vulkan/vtvk_objects.c" [label="vulkan/vtvk_objects.c"];
+    "vulkan/vtvk_physical_device.c" [label="vulkan/vtvk_physical_device.c"];
+    "vulkan/vtvk_pipeline.cpp" [label="vulkan/vtvk_pipeline.cpp"];
+    "vulkan/vtvk_pipeline.h" [label="vulkan/vtvk_pipeline.h"];
+    "vulkan/vtvk_pipeline_graphics.cpp" [label="vulkan/vtvk_pipeline_graphics.cpp"];
+    "vulkan/vtvk_pipeline_rt.cpp" [label="vulkan/vtvk_pipeline_rt.cpp"];
+    "vulkan/vtvk_private.h" [label="vulkan/vtvk_private.h"];
+    "vulkan/vtvk_render_compat.c" [label="vulkan/vtvk_render_compat.c"];
+    "vulkan/vtvk_rt_unsupported.cpp" [label="vulkan/vtvk_rt_unsupported.cpp"];
+    "vulkan/vtvk_shader.c" [label="vulkan/vtvk_shader.c"];
+    "vulkan/vtvk_sync.c" [label="vulkan/vtvk_sync.c"];
+    "vulkan/vtvk_trace.cpp" [label="vulkan/vtvk_trace.cpp"];
+  }
+  "compiler/vt_nir_build_traversal.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_build_traversal.c" -> "compiler/vt_nir_rt_abi_layout.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 2"];
+  "compiler/vt_nir_canonicalize_rt.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_lower_descriptors.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_lower_rt_abi.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_lower_rt_abi_data.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_lower_rt_abi_data.c" -> "compiler/vt_nir_build_traversal.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 8"];
+  "compiler/vt_nir_lower_rt_io.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_lower_rt_io.c" -> "compiler/vt_nir_build_traversal.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 5"];
+  "compiler/vt_nir_lower_rt_io.c" -> "compiler/vt_nir_rt_queue.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "compiler/vt_nir_rt_abi_layout.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_rt_cps.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_rt_global_layout.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_rt_queue.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir_scratch_layout.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "llvm/ventus_nir_to_llvm.cpp" -> "llvm/ventus_nir_to_llvm.h" [color="#7c3aed", fontcolor="#7c3aed", label="ACCESSES × 7"];
+  "llvm/ventus_nir_to_llvm.cpp" -> "llvm/ventus_nir_to_llvm.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "llvm/ventus_nir_to_llvm.cpp" -> "vulkan/vtvk_pipeline_rt.cpp" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_nir_rt_canonicalize_test.c" -> "compiler/vt_nir_canonicalize_rt.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_nir_rt_canonicalize_test.c" -> "tests/vt_rt_test_common.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_flagged_image_smoke_test.c" -> "compiler/vt_nir_build_traversal.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_flagged_image_smoke_test.c" -> "compiler/vt_nir_lower_rt_abi.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_flagged_image_smoke_test.c" -> "compiler/vt_nir_lower_rt_io.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_flagged_image_smoke_test.c" -> "compiler/vt_nir_rt_abi_layout.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_flagged_image_smoke_test.c" -> "tests/vt_rt_test_common.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_global_abi_test.c" -> "compiler/vt_nir_rt_global_layout.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 2"];
+  "tests/vt_rt_global_queue_nir_test.c" -> "compiler/vt_nir_rt_queue.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_image_smoke_test.c" -> "compiler/vt_nir_build_traversal.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_image_smoke_test.c" -> "compiler/vt_nir_lower_rt_abi.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_image_smoke_test.c" -> "compiler/vt_nir_lower_rt_io.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_image_smoke_test.c" -> "tests/vt_rt_test_common.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_build_traversal.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_lower_rt_abi.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_lower_rt_abi_data.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_lower_rt_io.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_rt_abi_layout.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_rt_cps.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "compiler/vt_nir_scratch_layout.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "tests/vt_rt_minimal_loop_test.c" -> "tests/vt_rt_test_common.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_acceleration_structure.cpp" -> "vulkan/vtvk_private.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 5"];
+  "vulkan/vtvk_acceleration_structure.cpp" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_cmd_buffer.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_descriptors.c" -> "vulkan/vtvk_memory.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "vulkan/vtvk_descriptors.c" -> "vulkan/vtvk_memory.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_descriptors.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_device.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "compiler/vt_nir.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "vulkan/vtvk_driver_bridge.h" [color="#7c3aed", fontcolor="#7c3aed", label="ACCESSES × 95"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "vulkan/vtvk_driver_bridge.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "vulkan/vtvk_private.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 4"];
+  "vulkan/vtvk_driver_bridge.h" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_instance.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_memory.c" -> "vulkan/vtvk_memory.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_memory.h" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_objects.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_physical_device.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline.cpp" -> "vulkan/vtvk_pipeline.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline.h" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline_graphics.cpp" -> "vulkan/vtvk_pipeline.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "compiler/vt_nir.h" [color="#7c3aed", fontcolor="#7c3aed", label="ACCESSES × 7"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "compiler/vt_nir.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 3"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "vulkan/vtvk_pipeline.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "vulkan/vtvk_pipeline.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_render_compat.c" -> "vulkan/vtvk_memory.c" [color="#d97706", fontcolor="#d97706", label="CALLS × 4"];
+  "vulkan/vtvk_render_compat.c" -> "vulkan/vtvk_memory.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_render_compat.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_rt_unsupported.cpp" -> "vulkan/vtvk_pipeline_rt.cpp" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "vulkan/vtvk_rt_unsupported.cpp" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_shader.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_sync.c" -> "vulkan/vtvk_private.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_trace.cpp" -> "vulkan/vtvk_driver_bridge.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 1"];
+  "vulkan/vtvk_trace.cpp" -> "vulkan/vtvk_driver_bridge.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_trace.cpp" -> "vulkan/vtvk_pipeline.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_trace.cpp" -> "vulkan/vtvk_private.h" [color="#d97706", fontcolor="#d97706", label="CALLS × 7"];
+  "compiler/vt_nir.h" -> "compiler/vt_rt_global_abi.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "compiler/vt_nir.h" -> "compiler/vt_rt_abi.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "llvm/ventus_nir_to_llvm.cpp" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "llvm/ventus_nir_to_llvm.cpp" -> "common/ventus_kernel_metadata.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_global_abi_test.c" -> "common/ventus_rt_address.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_global_abi_test.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_global_queue_nir_test.c" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "tests/vt_rt_test_common.h" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_acceleration_structure.cpp" -> "common/ventus_rt_bvh.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "common/ventus_rt_address.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "common/ventus_rt_bvh.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "common/ventus_kernel_metadata.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_driver_bridge.cpp" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline.h" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "compiler/vt_nir.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+  "vulkan/vtvk_pipeline_rt.cpp" -> "llvm/ventus_nir_to_llvm.h" [color="#2563eb", fontcolor="#2563eb", label="IMPORTS × 1"];
+}

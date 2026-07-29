@@ -18,7 +18,8 @@ vt_nir_lower_rt_cps(nir_shader *shader,
    *info = (struct vt_nir_rt_cps_info) {0};
 
    const nir_lower_shader_calls_options options = {
-      .address_format = nir_address_format_32bit_global,
+      /* CPS frames live in the RV64 global arena, never in PDS scratch. */
+      .address_format = nir_address_format_64bit_global,
       .stack_alignment = 16,
       .localized_loads = true,
    };

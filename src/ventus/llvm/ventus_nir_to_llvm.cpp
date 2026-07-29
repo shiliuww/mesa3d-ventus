@@ -33,15 +33,13 @@
 #include "vulkan/vulkan_core.h"
 
 #include "ventus/compiler/vt_nir.h"
+#include "ventus/common/ventus_kernel_metadata.h"
 
 using namespace llvm;
 
 namespace {
 
-enum {
-   VTVK_KNL_ARG_BASE = 4,
-   VENTUS_KERNEL_CALLING_CONV = 104,
-};
+enum { VENTUS_KERNEL_CALLING_CONV = 104 };
 
 static std::string
 stage_name(mesa_shader_stage stage)
@@ -329,17 +327,17 @@ private:
 
    Value *sharedPtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 3));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 3));
    }
 
    Value *globalPtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 1));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 1));
    }
 
    Value *privatePtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asInt32(addr), PointerType::get(context, 5));
+      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 5));
    }
 
    Value *rtScratchBase()
@@ -381,9 +379,9 @@ private:
 
    Value *loadI32Global(Value *base, uint32_t offset)
    {
-      Value *addr = asInt32(base);
+      Value *addr = asAddress(base);
       if (offset)
-         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+         addr = builder.CreateAdd(addr, ConstantInt::get(addr->getType(), offset));
       LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
       load->setAlignment(Align(4));
       return load;
@@ -391,9 +389,9 @@ private:
 
    Value *loadI32GlobalVolatile(Value *base, uint32_t offset)
    {
-      Value *addr = asInt32(base);
+      Value *addr = asAddress(base);
       if (offset)
-         addr = builder.CreateAdd(addr, ConstantInt::get(i32, offset));
+         addr = builder.CreateAdd(addr, ConstantInt::get(addr->getType(), offset));
       LoadInst *load = builder.CreateLoad(i32, globalPtr(addr));
       load->setAlignment(Align(4));
       load->setVolatile(true);
@@ -403,8 +401,15 @@ private:
    Value *dispatchArgsBase()
    {
       Value *metadataBase =
-         callI32Intrinsic("llvm.riscv.ventus.kernel.metadata");
-      return loadI32Global(metadataBase, VTVK_KNL_ARG_BASE);
+         callAddressIntrinsic("llvm.riscv.ventus.kernel.metadata");
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(metadataBase, ConstantInt::get(i64,
+               VENTUS_KNL64_ARG_BASE))));
+         load->setAlignment(Align(8));
+         return load;
+      }
+      return loadI32Global(metadataBase, VENTUS_KNL32_ARG_BASE);
    }
 
    Value *dispatchArgI32(uint32_t offset)
@@ -427,6 +432,13 @@ private:
       default:
          return callI32Intrinsic("llvm.riscv.ventus.rt.dispatch.id.z");
       }
+   }
+
+   Value *rtWorkerId()
+   {
+      /* The target maps this abstract physical-worker ID to mhartid.  It is
+       * deliberately distinct from Vulkan launch/workitem IDs. */
+      return callI32Intrinsic("llvm.riscv.ventus.rt.worker.id");
    }
 
    Value *raygenLaunchIdComponent(unsigned i)
@@ -508,11 +520,20 @@ private:
 
    Value *descriptorRecordBase(Value *binding)
    {
-      Value *table = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR);
+      Value *table = dispatchArgsBase();
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(table, ConstantInt::get(i64,
+               VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR))));
+         load->setAlignment(Align(8));
+         table = load;
+      } else {
+         table = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_TABLE_ADDR);
+      }
       Value *stride =
          dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE);
       return builder.CreateAdd(
-         table, builder.CreateMul(asInt32(binding), stride));
+         asAddress(table), builder.CreateMul(asAddress(binding), asAddress(stride)));
    }
 
    Value *descriptorRecordI32(Value *binding, uint32_t offset)
@@ -523,6 +544,14 @@ private:
    Value *descriptorAddressForBinding(Value *binding, const nir_def *def)
    {
       (void)def;
+      Value *base = descriptorRecordBase(binding);
+      if (addressBits() == 64) {
+         LoadInst *load = builder.CreateLoad(i64,
+            globalPtr(builder.CreateAdd(base, ConstantInt::get(i64,
+               VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR))));
+         load->setAlignment(Align(8));
+         return load;
+      }
       return descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
    }
 
@@ -533,8 +562,8 @@ private:
 
    Value *descriptorValueForDef(const nir_def *def, Value *addr)
    {
-      if (def->bit_size == 64 && addr->getType()->isIntegerTy(64))
-         return addr;
+      if (def->bit_size == 64)
+         return asInt64(addr);
       Value *addr32 = asInt32(addr);
       if (def->bit_size == 64)
          return builder.CreateZExt(addr32, i64);
@@ -554,17 +583,18 @@ private:
 
    Value *loadGlobalForDef(Value *base, Value *offset, const nir_def *def)
    {
-      Value *addr = builder.CreateAdd(asInt32(base), asInt32(offset));
+      Value *addr = builder.CreateAdd(asAddress(base), asAddress(offset));
       auto loadScalar = [&](unsigned component) -> Value * {
          Value *componentAddr = addr;
          if (component)
             componentAddr =
-               builder.CreateAdd(componentAddr, ConstantInt::get(i32, component * 4));
+               builder.CreateAdd(componentAddr, ConstantInt::get(addr->getType(),
+                                                                  component * 4));
 
          if (def->bit_size == 64) {
             Value *lo = loadI32At(componentAddr);
             Value *hi = loadI32At(builder.CreateAdd(componentAddr,
-                                                    ConstantInt::get(i32, 4)));
+                                                    ConstantInt::get(addr->getType(), 4)));
             return builder.CreateOr(builder.CreateZExt(lo, i64),
                                     builder.CreateShl(builder.CreateZExt(hi, i64),
                                                       ConstantInt::get(i64, 32)));
@@ -636,6 +666,13 @@ private:
    Value *callI32Intrinsic(StringRef name)
    {
       Function *fn = declare(name, i32, {});
+      return builder.CreateCall(fn);
+   }
+
+   Value *callAddressIntrinsic(StringRef name)
+   {
+      Type *addressType = addressBits() == 64 ? i64 : i32;
+      Function *fn = declare(name, addressType, {});
       return builder.CreateCall(fn);
    }
 
@@ -823,6 +860,16 @@ private:
       if (v->getType()->isIntegerTy())
          return builder.CreateZExtOrTrunc(v, i64);
       return builder.CreateZExt(asInt32(v), i64);
+   }
+
+   unsigned addressBits() const
+   {
+      return module.getDataLayout().getPointerSizeInBits(1);
+   }
+
+   Value *asAddress(Value *v)
+   {
+      return addressBits() == 64 ? asInt64(v) : asInt32(v);
    }
 
    Value *asSignedInt64(Value *v)
@@ -1485,6 +1532,9 @@ private:
          return loadGlobalForDef(dispatchArgsBase(), asInt32(value(intrin->src[0])),
                                 &intrin->def);
       }
+      case nir_intrinsic_ventus_rt_worker_id: {
+         return rtWorkerId();
+      }
       case nir_intrinsic_load_ray_launch_size: {
          return rayLaunchSize();
       }
@@ -1501,8 +1551,8 @@ private:
          return descriptorValueForDef(&intrin->def, addr);
       }
       case nir_intrinsic_load_ubo: {
-         Value *base = asInt32(value(intrin->src[0]));
-         Value *offset = asInt32(value(intrin->src[1]));
+         Value *base = asAddress(value(intrin->src[0]));
+         Value *offset = asAddress(value(intrin->src[1]));
          return loadGlobalForDef(base, offset, &intrin->def);
       }
       case nir_intrinsic_load_global: {
@@ -1510,7 +1560,7 @@ private:
                                 &intrin->def);
       }
       case nir_intrinsic_store_global: {
-         Value *addr = asInt32(value(intrin->src[1]));
+         Value *addr = asAddress(value(intrin->src[1]));
          Value *stored = value(intrin->src[0]);
          const unsigned components = nir_src_num_components(intrin->src[0]);
 
@@ -1518,7 +1568,7 @@ private:
             Value *componentAddr = addr;
             if (i)
                componentAddr = builder.CreateAdd(componentAddr,
-                                                  ConstantInt::get(i32, i * 4));
+                                                  ConstantInt::get(addr->getType(), i * 4));
             StoreInst *store = builder.CreateStore(asInt32(component(stored, i)),
                                                     globalPtr(componentAddr));
             store->setAlignment(Align(4));
@@ -1548,7 +1598,7 @@ private:
          }
 
          AtomicRMWInst *atomic = builder.CreateAtomicRMW(
-            binop, globalPtr(asInt32(value(intrin->src[0]))),
+            binop, globalPtr(asAddress(value(intrin->src[0]))),
             asInt32(value(intrin->src[1])), MaybeAlign(4),
             AtomicOrdering::SequentiallyConsistent);
          return atomic;
@@ -1627,6 +1677,16 @@ private:
          if (noopRtIntrinsics)
             return nullptr;
          Function *fn = declare("llvm.riscv.ventus.rt.release.i32",
+                                Type::getVoidTy(context), {i32});
+         builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_enqueue: {
+         if (noopRtIntrinsics)
+            return nullptr;
+         /* The source is the current lane's RV32-checked global mailbox
+          * address.  RTcore consumes the mailbox; it is never a PDS slot. */
+         Function *fn = declare("llvm.riscv.ventus.rt.enqueue.i32",
                                 Type::getVoidTy(context), {i32});
          builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
          return nullptr;

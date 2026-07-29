@@ -19,6 +19,11 @@ vt_nir_lower_rt_abi(nir_shader *shader,
       config = &default_config;
    }
 
+   /* Global workers use a separate global-record ABI.  Falling through here
+    * would silently materialize the legacy PDS slot ABI. */
+   if (config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER)
+      return false;
+
    bool progress = false;
    progress |= vt_nir_lower_rt_payload(shader, config);
    progress |= vt_nir_lower_rt_hit_record(shader, config);

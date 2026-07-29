@@ -59,8 +59,8 @@ main(void)
          }
       }
    }
-   /* Record fields plus mailbox magic/version/generation/valid publication. */
-   CHECK(stores == VT_RT_GLOBAL_TRACE_READY + 4);
+   /* Record fields plus mailbox magic/version/generation/queue-base/valid. */
+   CHECK(stores == VT_RT_GLOBAL_TRACE_READY + 6);
    CHECK(last_store && nir_src_is_const(last_store->src[0]));
    CHECK(nir_src_as_uint(last_store->src[0]) == 1);
    printf("PASS vt_rt_global_queue_nir stores=%u\n", stores);

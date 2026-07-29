@@ -222,6 +222,14 @@ static void
 vtvk_rt_lower_abi_with_probe(nir_shader *shader,
                              const struct vt_nir_rt_config *config)
 {
+   if (config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER) {
+      /* The global producer has its own record ABI.  Calling any individual
+       * legacy lower below would recreate PDS state despite the profile gate
+       * in vt_nir_lower_rt_abi(). */
+      vtvk_rt_log_nir_stats(shader, "skip PDS ABI for global wavefront");
+      return;
+   }
+
    vtvk_rt_log_nir_stats(shader, "before vt_nir_lower_rt_payload");
    NIR_PASS(_, shader, vt_nir_lower_rt_payload, config);
    vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_rt_payload");
@@ -341,6 +349,15 @@ static std::string
 vtvk_llvm_tool_env_prefix(void)
 {
    const char *lib_dir = getenv("VENTUS_VK_LLVM_TOOL_LIB_DIR");
+   std::string install_lib_dir;
+   if (!lib_dir || !lib_dir[0]) {
+      const char *install_prefix = getenv("VENTUS_INSTALL_PREFIX");
+      if (install_prefix && install_prefix[0]) {
+         install_lib_dir = std::string(install_prefix) + "/lib";
+         if (llvm::sys::fs::exists(install_lib_dir))
+            lib_dir = install_lib_dir.c_str();
+      }
+   }
    if (!lib_dir || !lib_dir[0])
       lib_dir = "/home/guanys/ventus-env/llvm/build/lib";
    return "LD_LIBRARY_PATH=" + vtvk_shell_quote(lib_dir) +
@@ -387,7 +404,7 @@ vtvk_dump_rt_llvm_module(struct vtvk_pipeline *pipeline, std::string *ll_path)
 }
 
 static bool
-vtvk_find_crt0(std::string *path)
+vtvk_find_crt0(bool rv64, std::string *path)
 {
    const char *env_path = getenv("VENTUS_VK_CRT0");
    if (env_path && env_path[0]) {
@@ -399,13 +416,31 @@ vtvk_find_crt0(std::string *path)
       return false;
    }
 
-   static const char *candidates[] = {
+   const char *install_prefix = getenv("VENTUS_INSTALL_PREFIX");
+   if (install_prefix && install_prefix[0]) {
+      std::string candidate = std::string(install_prefix) + "/lib/" +
+         (rv64 ? "riscv64/crt0.o" : "crt0.o");
+      if (llvm::sys::fs::exists(candidate)) {
+         *path = candidate;
+         return true;
+      }
+   }
+
+   static const char *rv32_candidates[] = {
       "/home/guanys/ventus-env/llvm/install/lib/crt0.o",
       "/home/guanys/ventus-env/llvm/build-libclc/lib/crt0.o",
       "/home/guanys/ventus-env/llvm/build-libclc/riscv32/lib/CMakeFiles/ctr0_obj.dir/crt0.S.o",
    };
+   static const char *rv64_candidates[] = {
+      "/home/guanys/ventus-env/llvm/build-libclc-rv64/lib/riscv64/crt0.o",
+      "/home/guanys/ventus-env/llvm/build-libclc/riscv64/lib/crt0.o",
+   };
+   const char *const *candidates = rv64 ? rv64_candidates : rv32_candidates;
+   const size_t candidate_count = rv64 ? ARRAY_SIZE(rv64_candidates) :
+                                        ARRAY_SIZE(rv32_candidates);
 
-   for (const char *candidate : candidates) {
+   for (size_t i = 0; i < candidate_count; i++) {
+      const char *candidate = candidates[i];
       if (llvm::sys::fs::exists(candidate)) {
          *path = candidate;
          return true;
@@ -519,7 +554,7 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
 
    if (!vtvk_write_rt_linker_script(ld_path))
       return;
-   if (!vtvk_find_crt0(&crt0_path))
+   if (!vtvk_find_crt0(pipeline->rt_uses_rv64, &crt0_path))
       return;
 
    if (!vtvk_dump_rt_emit_llvm_module(pipeline, ll_path, &emit_ll_path))
@@ -527,9 +562,12 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
 
    std::string tool_env = vtvk_llvm_tool_env_prefix();
    std::string llc_cmd = tool_env + vtvk_shell_quote(llc) +
-                         " -mtriple=riscv32-unknown-elf"
-                         " -mcpu=ventus-gpgpu"
-                         " -target-abi=ilp32"
+                         (pipeline->rt_uses_rv64 ? " -mtriple=riscv64-unknown-elf"
+                                                   : " -mtriple=riscv32-unknown-elf") +
+                         (pipeline->rt_uses_rv64 ? " -mcpu=ventus-gpgpu-rv64"
+                                                    : " -mcpu=ventus-gpgpu")
+                         + (pipeline->rt_uses_rv64 ? " -target-abi=lp64"
+                                                   : " -target-abi=ilp32") +
                          " -mattr=+m,+a,+f,+d,+v,+zfh"
                          " -filetype=obj " +
                          vtvk_shell_quote(emit_ll_path.c_str()) + " -o " +
@@ -1007,6 +1045,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    pipeline->nir_mem_ctx = ralloc_context(nullptr);
    pipeline->shader_count = info->stageCount;
+   pipeline->max_ray_recursion_depth = info->maxPipelineRayRecursionDepth;
+   pipeline->rt_uses_rv64 = vtvk_env_enabled("VENTUS_VK_RT_RV64");
 
    pipeline->shaders =
       (nir_shader **)vk_zalloc2(&device->vk.alloc, pAllocator,
@@ -1041,12 +1081,22 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
 
+   const bool global_wavefront =
+      vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL");
+
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
       struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
       vt_nir_rt_config_apply_abi_layout(&config, &abi);
 
+      if (global_wavefront)
+         config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+
       for (uint32_t s = 0; s < pipeline->shader_count; s++) {
+         /* The global producer does not execute callback stages yet.  Do not
+          * materialize their legacy slot ABI while compiling its raygen. */
+         if (global_wavefront && pipeline->shaders[s] != cb_shaders.raygen)
+            continue;
          vtvk_rt_lower_abi_with_probe(pipeline->shaders[s], &config);
          nir_validate_shader(pipeline->shaders[s], "after Ventus RT lowering");
          if (vtvk_env_enabled("VENTUS_VK_DUMP_NIR"))
@@ -1058,31 +1108,46 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &abi);
-      if (vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
+      if (global_wavefront)
+         rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+      else if (vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE;
-      rt_io_config.enable_monolithic_shader_callbacks = true;
-      rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
-      rt_io_config.emit_closest_hit =
-         cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
-      rt_io_config.emit_any_hit =
-         cb_shaders.any_hit.empty() ? NULL : vtvk_emit_rt_any_hit;
-      rt_io_config.emit_intersection =
-         cb_shaders.intersection.empty() ? NULL : vtvk_emit_rt_intersection;
 
       vtvk_rt_pipeline_callback_data cb_data = {
          .shaders = &cb_shaders,
       };
-      rt_io_config.callback_data = &cb_data;
+      if (global_wavefront) {
+         vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                               "raygen before global wavefront producer");
+         if (!vt_nir_lower_rt_global_raygen(cb_shaders.raygen, &rt_io_config)) {
+            mesa_loge("ventus-vk: global wavefront currently requires one "
+                      "terminal primary traceRayEXT and no callback stage");
+            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+         vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                               "raygen after global wavefront producer");
+      } else {
+         rt_io_config.enable_monolithic_shader_callbacks = true;
+         rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
+         rt_io_config.emit_closest_hit =
+            cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
+         rt_io_config.emit_any_hit =
+            cb_shaders.any_hit.empty() ? NULL : vtvk_emit_rt_any_hit;
+         rt_io_config.emit_intersection =
+            cb_shaders.intersection.empty() ? NULL : vtvk_emit_rt_intersection;
+         rt_io_config.callback_data = &cb_data;
 
-      vtvk_rt_log_nir_stats(cb_shaders.raygen,
-                            "raygen before vt_nir_lower_rt_io_monolithic");
-      NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
-               &rt_io_config);
-      vtvk_rt_log_nir_stats(cb_shaders.raygen,
-                            "raygen after vt_nir_lower_rt_io_monolithic");
+         vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                               "raygen before vt_nir_lower_rt_io_monolithic");
+         NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
+                  &rt_io_config);
+         vtvk_rt_log_nir_stats(cb_shaders.raygen,
+                               "raygen after vt_nir_lower_rt_io_monolithic");
+      }
       NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_descriptors);
       vtvk_rt_log_nir_stats(cb_shaders.raygen,
-                            "raygen after monolithic vt_nir_lower_descriptors");
+                            "raygen after Ventus RT descriptor lowering");
 
       struct vt_nir_rt_canonicalize_error canonicalize_error = {};
       if (vt_nir_canonicalize_rt_for_llvm(cb_shaders.raygen,
@@ -1109,8 +1174,11 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    struct vt_nir_to_llvm_options llvm_options = {
       .module_name = "ventus_rt_pipeline",
-      .target_triple = "riscv32-unknown-elf",
-      .data_layout = "e-m:e-p:32:32-i64:64-n32-S128",
+      .target_triple = pipeline->rt_uses_rv64 ? "riscv64-unknown-elf" :
+                                                "riscv32-unknown-elf",
+      .data_layout = pipeline->rt_uses_rv64 ?
+         "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128-A5-G1" :
+         "e-m:e-p:32:32-i64:64-n32-S128",
       .require_ssa_function_temps = true,
    };
 
@@ -1126,9 +1194,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_fill_group_handles(pipeline, info);
 
    mesa_logi("ventus-vk: RT pipeline compiled via SPIR-V -> NIR -> "
-             "Ventus lowering -> LLVM; stages=%u groups=%u scratch=%u llvm_functions=%zu",
+             "Ventus lowering -> LLVM; stages=%u groups=%u scratch=%u max_depth=%u llvm_functions=%zu",
              info->stageCount, info->groupCount,
              pipeline->per_lane_scratch_size,
+             pipeline->max_ray_recursion_depth,
              pipeline->llvm_module->size());
 
    *out = vk_pipeline_to_handle(&pipeline->vk);

@@ -40,6 +40,8 @@ struct vtvk_pipeline {
 
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
+   uint32_t max_ray_recursion_depth;
+   bool rt_uses_rv64;
    struct vt_nir_pipeline_scratch_info scratch_info;
 
    llvm::Module *llvm_module;

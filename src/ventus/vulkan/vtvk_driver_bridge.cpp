@@ -16,7 +16,9 @@
 #include <vector>
 
 #include "util/log.h"
+#include "ventus/common/ventus_rt_address.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "ventus/common/ventus_kernel_metadata.h"
 #include "ventus/compiler/vt_nir.h"
 
 static_assert(VENTUS_RT_RESIDENT_WARPS > 0,
@@ -35,6 +37,15 @@ static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_arena_addr) ==
 static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_frame_stride) ==
               VT_NIR_RT_DISPATCH_ARG_CONTINUATION_FRAME_STRIDE,
               "RT CPS frame stride argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, continuation_context_count) ==
+              VT_NIR_RT_DISPATCH_ARG_CONTINUATION_CONTEXT_COUNT,
+              "RT CPS context count argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_queue_base) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_QUEUE_BASE,
+              "RT global queue base argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, global_cps_arena_addr) ==
+              VT_NIR_RT_DISPATCH_ARG_GLOBAL_CPS_ARENA_ADDR,
+              "RT global CPS arena argument ABI mismatch");
 static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
               VT_NIR_RT_DISPATCH_ARG_SIZE,
               "RT dispatch argument ABI size mismatch");
@@ -84,22 +95,6 @@ struct vtvk_driver_upload {
    uint64_t size;
 };
 
-enum vtvk_driver_knl_offset {
-   VTVK_KNL_ENTRY = 0,
-   VTVK_KNL_ARG_BASE = 4,
-   VTVK_KNL_WORK_DIM = 8,
-   VTVK_KNL_GL_SIZE_X = 12,
-   VTVK_KNL_GL_SIZE_Y = 16,
-   VTVK_KNL_GL_SIZE_Z = 20,
-   VTVK_KNL_LC_SIZE_X = 24,
-   VTVK_KNL_LC_SIZE_Y = 28,
-   VTVK_KNL_LC_SIZE_Z = 32,
-   VTVK_KNL_GL_OFFSET_X = 36,
-   VTVK_KNL_GL_OFFSET_Y = 40,
-   VTVK_KNL_GL_OFFSET_Z = 44,
-   VTVK_KNL_MAX_METADATA_SIZE = 64,
-};
-
 static bool
 vtvk_bridge_env_enabled(const char *name)
 {
@@ -139,6 +134,27 @@ static uint64_t
 vtvk_bridge_align_u64(uint64_t value, uint64_t alignment)
 {
    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static bool
+vtvk_bridge_require_rv32_range(const char *label, uint64_t addr, uint64_t size)
+{
+   if (ventus_rt_device_range_fits_u32(addr, size))
+      return true;
+
+   mesa_loge("ventus-vk: RV32 execution rejects %s range base=0x%" PRIx64
+             " size=0x%" PRIx64,
+             label, addr, size);
+   return false;
+}
+
+static bool
+vtvk_bridge_checked_u32(const char *label, uint64_t value, uint32_t *out)
+{
+   if (!vtvk_bridge_require_rv32_range(label, value, 1))
+      return false;
+   *out = (uint32_t)value;
+   return true;
 }
 
 static uint32_t
@@ -603,6 +619,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t pds_dev_addr = 0;
    uint64_t continuation_dev_addr = 0;
    uint64_t mailbox_dev_addr = 0;
+   uint64_t global_queue_dev_addr = 0;
+   uint64_t global_cps_dev_addr = 0;
    uint32_t image_width = info->image_extent.width ? info->image_extent.width : info->width;
    uint32_t image_height = info->image_extent.height ? info->image_extent.height : info->height;
    uint32_t image_depth = info->image_extent.depth ? info->image_extent.depth : 1;
@@ -612,23 +630,31 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_rt_dispatch_args args = {};
    std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
    std::vector<uint8_t> pds_image;
-   uint32_t metadata[VTVK_KNL_MAX_METADATA_SIZE / 4] = {};
    uint64_t raygen_wg_x = DIV_ROUND_UP(info->width, 32);
    uint64_t raygen_wg_y = MAX2(info->height, 1u);
    uint64_t raygen_wg_z = MAX2(info->depth, 1u);
    uint64_t pds_resident_lanes =
       vtvk_rt_resident_warps * vtvk_rt_lanes_per_warp;
+   const bool wavefront_mirror = vtvk_bridge_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR");
+   const bool wavefront_global = vtvk_bridge_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL");
+   const bool wavefront_profile = wavefront_mirror || wavefront_global;
    uint64_t pds_size =
+      wavefront_global ? 0 :
       vtvk_bridge_align_u64(MAX2((uint64_t)info->per_lane_scratch_size *
                                     pds_resident_lanes,
                                  (uint64_t)64 * 1024),
                             4096);
-   uint64_t continuation_size =
+   uint64_t continuation_size = wavefront_global ? 0 :
       (uint64_t)info->continuation_frame_size * pds_resident_lanes;
-   const bool wavefront_mirror = vtvk_bridge_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR");
+   const bool rv64 = vtvk_bridge_env_enabled("VENTUS_VK_RT_RV64");
+   std::vector<uint8_t> metadata(rv64 ? (size_t)VENTUS_KNL64_MAX_SIZE :
+                                       (size_t)VENTUS_KNL32_MAX_SIZE, 0);
+   uint64_t kernel_entry = 0;
+   uint32_t work_dim = 0;
    const uint64_t mailbox_stride = 128;
-   const uint64_t mailbox_count =
-      (uint64_t)info->width * info->height * MAX2(info->depth, 1u);
+   uint64_t mailbox_count = 0;
+   uint32_t global_queue_capacity = 0;
+   struct vt_rt_global_queue_layout global_queue_layout = {};
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
@@ -709,11 +735,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_format = info->image_format;
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
-   args.scratch_stride = info->per_lane_scratch_size;
+   args.scratch_stride = wavefront_global ? 0 : info->per_lane_scratch_size;
    args.continuation_frame_stride = info->continuation_frame_size;
-   args.continuation_context_count = pds_resident_lanes;
-   args.submission_mailbox_stride = wavefront_mirror ? mailbox_stride : 0;
-   args.submission_mailbox_generation = wavefront_mirror ? 1 : 0;
+   args.continuation_context_count = wavefront_global ? 0 : pds_resident_lanes;
+   args.submission_mailbox_stride = wavefront_profile ? mailbox_stride : 0;
+   args.submission_mailbox_generation = wavefront_profile ? 1 : 0;
    args.descriptor_table_addr = descriptor_table_dev_addr;
    args.descriptor_count = descriptor_table.size();
    args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
@@ -724,67 +750,217 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       goto out;
    }
 
-   metadata[VTVK_KNL_ENTRY / 4] =
-      info->kernel_entry ? (uint32_t)info->kernel_entry : 0x80000000u;
-   metadata[VTVK_KNL_ARG_BASE / 4] = (uint32_t)args_dev_addr;
-   metadata[VTVK_KNL_WORK_DIM / 4] = info->depth > 1 ? 3 : info->height > 1 ? 2 : 1;
-   metadata[VTVK_KNL_GL_SIZE_X / 4] = info->width;
-   metadata[VTVK_KNL_GL_SIZE_Y / 4] = info->height;
-   metadata[VTVK_KNL_GL_SIZE_Z / 4] = info->depth;
-   metadata[VTVK_KNL_LC_SIZE_X / 4] = 32;
-   metadata[VTVK_KNL_LC_SIZE_Y / 4] = 1;
-   metadata[VTVK_KNL_LC_SIZE_Z / 4] = 1;
-   metadata[VTVK_KNL_GL_OFFSET_X / 4] = 0;
-   metadata[VTVK_KNL_GL_OFFSET_Y / 4] = 0;
-   metadata[VTVK_KNL_GL_OFFSET_Z / 4] = 0;
+   kernel_entry = info->kernel_entry ? info->kernel_entry : 0x80000000ull;
+   work_dim = info->depth > 1 ? 3 : info->height > 1 ? 2 : 1;
+   if (!rv64) {
+      if (!vtvk_bridge_require_rv32_range("TLAS", tlas_dev_addr, 1) ||
+          !vtvk_bridge_require_rv32_range("storage image", image_dev_addr,
+                                          image_bytes) ||
+          !vtvk_bridge_require_rv32_range("camera", camera_dev_addr,
+                                          info->camera_range) ||
+          !vtvk_bridge_require_rv32_range("descriptor table",
+                                          descriptor_table_dev_addr,
+                                          descriptor_table.size() *
+                                             sizeof(descriptor_table[0])) ||
+          !vtvk_bridge_require_rv32_range("dispatch args", args_dev_addr,
+                                          sizeof(args)) ||
+          !vtvk_bridge_require_rv32_range("raygen SBT", args.raygen_sbt.addr,
+                                          args.raygen_sbt.size) ||
+          !vtvk_bridge_require_rv32_range("miss SBT", args.miss_sbt.addr,
+                                          args.miss_sbt.size) ||
+          !vtvk_bridge_require_rv32_range("hit SBT", args.hit_sbt.addr,
+                                          args.hit_sbt.size) ||
+          !vtvk_bridge_require_rv32_range("callable SBT",
+                                          args.callable_sbt.addr,
+                                          args.callable_sbt.size) ||
+          !vtvk_bridge_require_rv32_range("kernel entry", kernel_entry, 1))
+         goto out;
 
-   if (!vtvk_driver_alloc_copy(&driver, metadata, sizeof(metadata),
+      for (uint32_t i = 0; i < descriptor_table.size(); i++) {
+         if (!vtvk_bridge_require_rv32_range("descriptor resource",
+                                             descriptor_table[i].device_addr,
+                                             descriptor_table[i].byte_size))
+            goto out;
+      }
+   }
+   if (rv64) {
+      memcpy(metadata.data() + VENTUS_KNL64_ENTRY, &kernel_entry,
+             sizeof(kernel_entry));
+      memcpy(metadata.data() + VENTUS_KNL64_ARG_BASE, &args_dev_addr,
+             sizeof(args_dev_addr));
+      memcpy(metadata.data() + VENTUS_KNL64_WORK_DIM, &work_dim,
+             sizeof(work_dim));
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_X, &info->width,
+             sizeof(info->width));
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Y, &info->height,
+             sizeof(info->height));
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Z, &info->depth,
+             sizeof(info->depth));
+      const uint32_t local_size_x = 32;
+      memcpy(metadata.data() + VENTUS_KNL64_LC_SIZE_X, &local_size_x,
+             sizeof(local_size_x));
+   } else {
+      uint32_t entry32 = 0;
+      uint32_t args32 = 0;
+      if (!vtvk_bridge_checked_u32("kernel entry", kernel_entry, &entry32) ||
+          !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32))
+         goto out;
+      const uint32_t local_size_x = 32;
+      memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
+      memcpy(metadata.data() + VENTUS_KNL32_ARG_BASE, &args32, sizeof(args32));
+      memcpy(metadata.data() + VENTUS_KNL32_WORK_DIM, &work_dim, sizeof(work_dim));
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_X, &info->width,
+             sizeof(info->width));
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Y, &info->height,
+             sizeof(info->height));
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Z, &info->depth,
+             sizeof(info->depth));
+      memcpy(metadata.data() + VENTUS_KNL32_LC_SIZE_X, &local_size_x,
+             sizeof(local_size_x));
+   }
+
+   if (!vtvk_driver_alloc_copy(&driver, metadata.data(), metadata.size(),
                                &metadata_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to upload kernel metadata");
       goto out;
    }
+   if (!rv64 &&
+       !vtvk_bridge_require_rv32_range("kernel metadata", metadata_dev_addr,
+                                       metadata.size()))
+      goto out;
 
-   if (continuation_size &&
+   if (!wavefront_global && continuation_size &&
        !vtvk_driver_alloc_copy(&driver, NULL, continuation_size,
                                &continuation_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate CPS arena");
       goto out;
    }
    args.continuation_arena_addr = continuation_dev_addr;
+   if (!rv64 &&
+       !vtvk_bridge_require_rv32_range("legacy CPS arena", continuation_dev_addr,
+                                       continuation_size))
+      goto out;
 
-   if (wavefront_mirror && mailbox_count > UINT64_MAX / mailbox_stride) {
+   /* Both the mirror and PDS-free producer use the same global queue ABI.
+    * Only the latter must not allocate a legacy slot/CPS backing store. */
+   if (wavefront_profile) {
+      if (info->depth != 1 ||
+          !vt_nir_rt_global_queue_capacity(info->width, info->height,
+                                            info->max_ray_recursion_depth,
+                                            3, &global_queue_capacity)) {
+         mesa_loge("ventus-vk: unsupported wavefront queue dimensions "
+                   "%ux%ux%u max_depth=%u",
+                   info->width, info->height, info->depth,
+                   info->max_ray_recursion_depth);
+         goto out;
+      }
+      global_queue_layout = vt_nir_rt_global_queue_layout(global_queue_capacity);
+      if (!global_queue_layout.total_size_bytes) {
+         mesa_loge("ventus-vk: wavefront queue layout exceeds the ABI limit");
+         goto out;
+      }
+
+      std::vector<uint8_t> global_queue(global_queue_layout.total_size_bytes, 0);
+      const uint32_t generation = 1;
+      memcpy(global_queue.data() +
+                VT_RT_GLOBAL_QUEUE_CAPACITY_RAYS * sizeof(uint32_t),
+             &global_queue_capacity, sizeof(global_queue_capacity));
+      memcpy(global_queue.data() +
+                VT_RT_GLOBAL_QUEUE_GENERATION * sizeof(uint32_t),
+             &generation, sizeof(generation));
+      if (!vtvk_driver_alloc_copy(&driver, global_queue.data(),
+                                  global_queue.size(),
+                                  &global_queue_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global ray queue");
+         goto out;
+      }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range("global ray queue", global_queue_dev_addr,
+                                          global_queue.size()))
+         goto out;
+
+      const uint64_t global_cps_size =
+         (uint64_t)info->continuation_frame_size * global_queue_capacity;
+      if (global_cps_size &&
+          !vtvk_driver_alloc_copy(&driver, NULL, global_cps_size,
+                                  &global_cps_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global CPS arena");
+         goto out;
+      }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range("global CPS arena", global_cps_dev_addr,
+                                          global_cps_size))
+         goto out;
+      args.global_queue_base = global_queue_dev_addr;
+      args.global_queue_capacity = global_queue_capacity;
+      args.global_queue_generation = generation;
+      args.global_cps_arena_addr = global_cps_dev_addr;
+      args.global_cps_frame_stride = info->continuation_frame_size;
+      args.max_ray_recursion_depth = info->max_ray_recursion_depth;
+
+      if (wavefront_global &&
+          !vt_nir_rt_submission_mailbox_capacity(
+             vtvk_rt_resident_warps, vtvk_rt_lanes_per_warp,
+             &mailbox_count)) {
+         mesa_loge("ventus-vk: wavefront mailbox layout exceeds the ABI limit");
+         goto out;
+      }
+   }
+
+   /* The compatibility mirror publishes dense primary records.  The PDS-free
+    * profile has one reusable PRIMARY/shadow/reflection/refraction mailbox
+    * per resident physical lane. */
+   if (wavefront_mirror)
+      mailbox_count = (uint64_t)info->width * info->height *
+                      MAX2(info->depth, 1u);
+
+   if (wavefront_profile && mailbox_count > UINT64_MAX / mailbox_stride) {
       mesa_loge("ventus-vk: wavefront mailbox allocation size overflow");
       goto out;
    }
-   if (wavefront_mirror &&
+   if (wavefront_profile &&
        !vtvk_driver_alloc_copy(&driver, NULL, mailbox_count * mailbox_stride,
                                &mailbox_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate mailbox pool");
       goto out;
    }
    args.submission_mailbox_base = mailbox_dev_addr;
-
-   pds_image.assign(pds_size, 0);
-   if (continuation_dev_addr) {
-      const uint64_t header_offset = VT_RT_ABI_PDS_BASE_BYTES +
-         VT_RT_ABI_CPS_HEADER_BASE_BYTES +
-         VT_RT_CPS_FRAME_BASE * VT_RT_ABI_WORD_BYTES;
-      const uint64_t aligned = header_offset & ~3ull;
-      for (uint64_t context = 0; context < pds_resident_lanes; context++) {
-         const uint64_t byte_offset = aligned * pds_resident_lanes + context * 4;
-         if (byte_offset + 4 > pds_image.size()) {
-            mesa_loge("ventus-vk: CPS frame pointer exceeds PDS allocation");
-            goto out;
-         }
-         const uint32_t frame_base = (uint32_t)(continuation_dev_addr +
-            context * info->continuation_frame_size);
-         memcpy(pds_image.data() + byte_offset, &frame_base, sizeof(frame_base));
-      }
-   }
-   if (!vtvk_driver_alloc_copy(&driver, pds_image.data(), pds_image.size(),
-                               &pds_dev_addr)) {
-      mesa_loge("ventus-vk: driver bridge failed to allocate PDS");
+   if (!rv64 &&
+       !vtvk_bridge_require_rv32_range("submission mailbox pool", mailbox_dev_addr,
+                                       wavefront_profile ?
+                                          mailbox_count * mailbox_stride : 0))
       goto out;
+
+   if (!wavefront_global) {
+      pds_image.assign(pds_size, 0);
+      if (continuation_dev_addr) {
+         const uint64_t header_offset = VT_RT_ABI_PDS_BASE_BYTES +
+            VT_RT_ABI_CPS_HEADER_BASE_BYTES +
+            VT_RT_CPS_FRAME_BASE * VT_RT_ABI_WORD_BYTES;
+         const uint64_t aligned = header_offset & ~3ull;
+         for (uint64_t context = 0; context < pds_resident_lanes; context++) {
+            const uint64_t byte_offset = aligned * pds_resident_lanes + context * 4;
+            if (byte_offset + 4 > pds_image.size()) {
+               mesa_loge("ventus-vk: CPS frame pointer exceeds PDS allocation");
+               goto out;
+            }
+            uint32_t frame_base = 0;
+            if (!vtvk_bridge_checked_u32("legacy CPS frame",
+                                        continuation_dev_addr +
+                                           context * info->continuation_frame_size,
+                                        &frame_base))
+               goto out;
+            memcpy(pds_image.data() + byte_offset, &frame_base, sizeof(frame_base));
+         }
+      }
+      if (!vtvk_driver_alloc_copy(&driver, pds_image.data(), pds_image.size(),
+                                  &pds_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate PDS");
+         goto out;
+      }
+      if (!rv64 && !vtvk_bridge_require_rv32_range("legacy PDS", pds_dev_addr,
+                                                    pds_image.size()))
+         goto out;
    }
    if (driver.vt_copy_to_dev(driver.device, args_dev_addr, &args, sizeof(args),
                              0, 0) != 0) {
@@ -818,7 +994,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.wg_size = 1;
    kernel.metaDataBaseAddr = metadata_dev_addr;
    kernel.ldsSize = 0;
-   kernel.pdsSize = info->per_lane_scratch_size;
+   kernel.pdsSize = wavefront_global ? 0 : info->per_lane_scratch_size;
    kernel.pdsBaseAddr = pds_dev_addr;
    kernel.num_thread_global[0] = info->width;
    kernel.num_thread_global[1] = info->height;

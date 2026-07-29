@@ -3,6 +3,7 @@ libventus_nir_files = files(
   'vt_nir_canonicalize_rt.c',
   'vt_nir_lower_descriptors.c',
   'vt_nir_lower_rt_abi_data.c',
+  'vt_nir_lower_rt_global.c',
   'vt_nir_lower_rt_io.c',
   'vt_nir_rt_global_layout.c',
   'vt_nir_rt_queue.c',

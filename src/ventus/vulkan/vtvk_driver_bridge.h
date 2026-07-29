@@ -43,6 +43,12 @@ struct vtvk_rt_dispatch_args {
    uint64_t submission_mailbox_base;
    uint32_t submission_mailbox_stride;
    uint32_t submission_mailbox_generation;
+   uint64_t global_queue_base;
+   uint32_t global_queue_capacity;
+   uint32_t global_queue_generation;
+   uint64_t global_cps_arena_addr;
+   uint32_t global_cps_frame_stride;
+   uint32_t max_ray_recursion_depth;
 };
 
 struct vtvk_rt_descriptor_record {
@@ -83,6 +89,7 @@ struct vtvk_driver_trace_rays_info {
    uint32_t depth;
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
+   uint32_t max_ray_recursion_depth;
    const char *kernel_path;
    uint64_t kernel_entry;
    const struct vtvk_rt_descriptor_source *descriptors;

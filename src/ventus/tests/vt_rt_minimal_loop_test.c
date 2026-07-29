@@ -145,6 +145,24 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
    return count;
 }
 
+static unsigned
+count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -158,6 +176,7 @@ main(int argc, char **argv)
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *global_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *miss =
       vt_rt_build_empty_shader(MESA_SHADER_MISS, &options, "vt_rt_minimal_miss");
    nir_shader *closest_hit = build_abi_probe_closest_hit(&options);
@@ -218,6 +237,26 @@ main(int argc, char **argv)
    struct vt_rt_intrinsic_counts cps_after;
    vt_rt_count_intrinsics(cps_raygen, &cps_after);
    VT_RT_CHECK(cps_after.trace_ray == 0);
+
+   struct vt_nir_rt_config global_config = vt_nir_rt_default_config();
+   global_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
+   /* The profile gate must not accidentally invoke any PDS ABI lower. */
+   VT_RT_CHECK(!vt_nir_lower_rt_abi(global_raygen, &global_config));
+   VT_RT_CHECK(vt_nir_lower_rt_global_raygen(global_raygen, &global_config));
+   nir_validate_shader(global_raygen, "after Ventus global RT raygen lowering");
+   struct vt_rt_intrinsic_counts global_after;
+   vt_rt_count_intrinsics(global_raygen, &global_after);
+   VT_RT_CHECK(global_after.trace_ray == 0);
+   VT_RT_CHECK(global_after.ventus_rt_enqueue == 1);
+   VT_RT_CHECK(global_after.ventus_rt_traverse == 0);
+   VT_RT_CHECK(global_after.ventus_rt_release == 0);
+   VT_RT_CHECK(global_after.ventus_rt_load_slot == 0);
+   VT_RT_CHECK(global_after.ventus_rt_store_slot == 0);
+   VT_RT_CHECK(global_after.load_shared == 0);
+   VT_RT_CHECK(global_after.store_shared == 0);
+   VT_RT_CHECK(count_intrinsic(global_raygen,
+                               nir_intrinsic_ventus_rt_worker_id) == 1);
+   VT_RT_CHECK(global_raygen->scratch_size == 0);
 
    bool progress = vt_nir_lower_rt_io_monolithic(raygen, &config);
    VT_RT_CHECK(progress);
@@ -404,6 +443,7 @@ main(int argc, char **argv)
 
    ralloc_free(raygen);
    ralloc_free(cps_mem_ctx);
+   ralloc_free(global_raygen);
    ralloc_free(miss);
    ralloc_free(closest_hit);
    ralloc_free(any_hit);
