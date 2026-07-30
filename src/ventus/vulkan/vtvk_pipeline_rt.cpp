@@ -74,6 +74,7 @@ vtvk_env_enabled(const char *name)
 
 struct vtvk_rt_nir_stats {
    unsigned trace_ray;
+   unsigned execute_callable;
    unsigned load_vulkan_descriptor;
    unsigned vulkan_resource_index;
    unsigned vulkan_resource_reindex;
@@ -111,6 +112,9 @@ vtvk_rt_count_intrinsic(nir_intrinsic_instr *intrin, vtvk_rt_nir_stats *stats)
    switch (intrin->intrinsic) {
    case nir_intrinsic_trace_ray:
       stats->trace_ray++;
+      break;
+   case nir_intrinsic_execute_callable:
+      stats->execute_callable++;
       break;
    case nir_intrinsic_load_vulkan_descriptor:
       stats->load_vulkan_descriptor++;
@@ -185,13 +189,15 @@ vtvk_rt_log_nir_stats(nir_shader *shader, const char *checkpoint)
       }
    }
 
-   mesa_logi("ventus-vk: NIR %s stage=%s trace_ray=%u desc_load=%u "
+   mesa_logi("ventus-vk: NIR %s stage=%s trace_ray=%u execute_callable=%u "
+             "desc_load=%u "
              "res_index=%u res_reindex=%u load_deref=%u store_deref=%u "
              "ubo=%u ssbo=%u image_store=%u ray_world=(%u,%u) "
              "ray_object=(%u,%u) ray_t=(%u,%u) primitive_id=%u "
              "vars={func:%u call:%u hitattr:%u} scratch=%u",
              checkpoint, _mesa_shader_stage_to_string(shader->info.stage),
-             stats.trace_ray, stats.load_vulkan_descriptor,
+             stats.trace_ray, stats.execute_callable,
+             stats.load_vulkan_descriptor,
              stats.vulkan_resource_index, stats.vulkan_resource_reindex,
              stats.load_deref, stats.store_deref, stats.load_ubo,
              stats.load_ssbo, stats.image_store,
@@ -746,6 +752,7 @@ struct vtvk_rt_callback_shaders {
    std::vector<vtvk_rt_callback_shader_entry> closest_hit;
    std::vector<vtvk_rt_callback_shader_entry> any_hit;
    std::vector<vtvk_rt_callback_shader_entry> intersection;
+   std::vector<vtvk_rt_callback_shader_entry> callable;
 };
 
 struct vtvk_rt_pipeline_callback_data {
@@ -994,6 +1001,292 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
       nir_pop_if(b, NULL);
 }
 
+static bool
+vtvk_rt_shader_has_intrinsic(nir_shader *shader, nir_intrinsic_op op)
+{
+   if (!shader)
+      return false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+static nir_def *
+vtvk_load_rt_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
+{
+   nir_intrinsic_instr *intrin =
+      nir_intrinsic_instr_create(b->shader,
+                                 nir_intrinsic_ventus_rt_dispatch_arg);
+   intrin->src[0] = nir_src_for_ssa(nir_imm_int(b, offset));
+   nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
+   nir_builder_instr_insert(b, &intrin->instr);
+   return &intrin->def;
+}
+
+struct vtvk_rt_callable_payload_binding {
+   nir_variable *variable;
+   int location;
+};
+
+struct vtvk_rt_execute_callable_lower_data {
+   const std::vector<vtvk_rt_callback_shader_entry> *callables;
+   std::vector<vtvk_rt_callable_payload_binding> payload_bindings;
+   bool failed;
+};
+
+static bool
+vtvk_rt_variable_is_entrypoint_local(nir_shader *shader, nir_variable *var,
+                                     nir_function_impl *entrypoint)
+{
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type == nir_deref_type_var &&
+                deref->var == var && impl != entrypoint)
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+static bool
+vtvk_rt_prepare_callable_payload(
+   nir_shader *shader, nir_variable *var,
+   std::vector<vtvk_rt_callable_payload_binding> *bindings,
+   int *location_out)
+{
+   for (const vtvk_rt_callable_payload_binding &binding : *bindings) {
+      if (binding.variable == var) {
+         *location_out = binding.location;
+         return true;
+      }
+   }
+
+   if (!shader || !var || var->data.mode != nir_var_shader_temp ||
+       !var->data.explicit_location || var->data.location < 0 ||
+       var->data.location >= 32)
+      return false;
+
+   nir_function_impl *entrypoint = nir_shader_get_entrypoint(shader);
+   if (!entrypoint ||
+       !vtvk_rt_variable_is_entrypoint_local(shader, var, entrypoint))
+      return false;
+
+   const int location = var->data.location;
+   exec_node_remove(&var->node);
+   var->data.mode = nir_var_function_temp;
+   var->data.explicit_location = false;
+   var->data.location = -1;
+   var->data.driver_location = 0;
+   exec_list_push_tail(&entrypoint->locals, &var->node);
+   nir_fixup_deref_modes(shader);
+
+   bindings->push_back({var, location});
+   *location_out = location;
+   return true;
+}
+
+static bool
+vtvk_rt_callable_types_match(const nir_variable *caller,
+                             const nir_variable *callee)
+{
+   unsigned caller_size = 0;
+   unsigned caller_align = 0;
+   unsigned callee_size = 0;
+   unsigned callee_align = 0;
+   glsl_get_natural_size_align_bytes(caller->type, &caller_size, &caller_align);
+   glsl_get_natural_size_align_bytes(callee->type, &callee_size, &callee_align);
+   return caller_size == callee_size && caller_align == callee_align;
+}
+
+static bool
+vtvk_inline_rt_callable_shader(nir_builder *b, nir_shader *shader,
+                               nir_variable *payload, int payload_location)
+{
+   if (!b || !shader || !payload)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return false;
+
+   nir_opt_dead_cf(shader);
+   nir_lower_returns(shader);
+   nir_opt_dce(shader);
+
+   struct hash_table *var_remap = _mesa_pointer_hash_table_create(b->shader);
+   if (!var_remap)
+      return false;
+
+   unsigned incoming_payload_count = 0;
+   bool valid = true;
+   nir_foreach_variable_in_shader(var, shader) {
+      if (var->data.mode == nir_var_function_temp)
+         continue;
+
+      if (var->data.mode == nir_var_shader_call_data) {
+         incoming_payload_count++;
+         if (!var->data.explicit_location ||
+             var->data.location != payload_location ||
+             !vtvk_rt_callable_types_match(payload, var)) {
+            valid = false;
+            break;
+         }
+         _mesa_hash_table_insert(var_remap, var, payload);
+         continue;
+      }
+
+      nir_variable *clone = nir_variable_clone(var, b->shader);
+      if (!clone) {
+         valid = false;
+         break;
+      }
+      nir_shader_add_variable(b->shader, clone);
+      _mesa_hash_table_insert(var_remap, var, clone);
+   }
+
+   if (incoming_payload_count > 1)
+      valid = false;
+
+   if (valid) {
+      b->shader->scratch_size =
+         MAX2(b->shader->scratch_size, shader->scratch_size);
+      nir_inline_function_impl(b, impl, NULL, var_remap);
+   }
+   _mesa_hash_table_destroy(var_remap, NULL);
+   return valid;
+}
+
+static bool
+vtvk_lower_rt_execute_callable(nir_builder *b,
+                               nir_intrinsic_instr *intrin, void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_execute_callable)
+      return false;
+
+   vtvk_rt_execute_callable_lower_data *state =
+      static_cast<vtvk_rt_execute_callable_lower_data *>(data);
+   if (!state || !state->callables || state->callables->empty() ||
+       !nir_src_is_deref(intrin->src[1])) {
+      if (state)
+         state->failed = true;
+      return false;
+   }
+
+   nir_deref_instr *payload_deref = nir_src_as_deref(intrin->src[1]);
+   if (payload_deref->deref_type != nir_deref_type_var) {
+      state->failed = true;
+      return false;
+   }
+
+   nir_variable *payload = payload_deref->var;
+   int payload_location = -1;
+   if (!vtvk_rt_prepare_callable_payload(
+          b->shader, payload, &state->payload_bindings,
+          &payload_location)) {
+      state->failed = true;
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *base = vtvk_load_rt_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_ADDR, 64);
+   nir_def *size = vtvk_load_rt_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_SIZE, 64);
+   nir_def *stride = vtvk_load_rt_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_STRIDE, 64);
+   nir_def *offset =
+      nir_imul(b, nir_u2u64(b, intrin->src[0].ssa), stride);
+   nir_def *record_end = nir_iadd_imm(b, offset, 32);
+   nir_def *valid_record = nir_iand(
+      b, nir_ine_imm(b, base, 0),
+      nir_iand(b, nir_uge(b, stride, nir_imm_int64(b, 32)),
+               nir_uge(b, size, record_end)));
+
+   nir_push_if(b, valid_record);
+   nir_def *record = nir_iadd(b, base, offset);
+   nir_def *group_index =
+      nir_load_global(b, 1, 32, nir_iadd_imm(b, record, 4));
+   for (const vtvk_rt_callback_shader_entry &entry : *state->callables) {
+      nir_push_if(b, nir_ieq_imm(b, group_index, entry.group_index));
+      if (!vtvk_inline_rt_callable_shader(
+             b, entry.shader, payload, payload_location))
+         state->failed = true;
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
+vtvk_lower_rt_callable_invocations(
+   nir_shader **shaders, uint32_t shader_count,
+   const std::vector<vtvk_rt_callback_shader_entry> &callables)
+{
+   for (const vtvk_rt_callback_shader_entry &entry : callables) {
+      if (vtvk_rt_shader_has_intrinsic(
+             entry.shader, nir_intrinsic_execute_callable)) {
+         mesa_loge("ventus-vk: nested callable shader invocation is not "
+                   "supported");
+         return false;
+      }
+      if (vtvk_rt_shader_has_intrinsic(
+             entry.shader, nir_intrinsic_load_shader_record_ptr)) {
+         mesa_loge("ventus-vk: callable shader record data requires a "
+                   "selected-record carrier");
+         return false;
+      }
+   }
+
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader || shader->info.stage == MESA_SHADER_CALLABLE)
+         continue;
+
+      vtvk_rt_execute_callable_lower_data state = {
+         .callables = &callables,
+         .failed = false,
+      };
+      const bool progress = nir_shader_intrinsics_pass(
+         shader, vtvk_lower_rt_execute_callable, nir_metadata_none, &state);
+      if (state.failed ||
+          vtvk_rt_shader_has_intrinsic(
+             shader, nir_intrinsic_execute_callable))
+         return false;
+
+      if (progress) {
+         nir_fixup_deref_modes(shader);
+         nir_opt_dead_cf(shader);
+         nir_opt_dce(shader);
+         nir_remove_dead_derefs(shader);
+         nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+         nir_index_blocks(impl);
+         nir_index_ssa_defs(impl);
+         nir_validate_shader(shader,
+                             "after Ventus executeCallableEXT lowering");
+      }
+   }
+
+   return true;
+}
+
 /* A procedural report stays inside one compact intersection callback.  The
  * matching any-hit code is inlined at the report site, so locals and control
  * flow naturally continue to a later reportIntersectionEXT in the same
@@ -1218,7 +1511,8 @@ vtvk_rt_stage_supported(mesa_shader_stage stage)
           stage == MESA_SHADER_MISS ||
           stage == MESA_SHADER_CLOSEST_HIT ||
           stage == MESA_SHADER_ANY_HIT ||
-          stage == MESA_SHADER_INTERSECTION;
+          stage == MESA_SHADER_INTERSECTION ||
+          stage == MESA_SHADER_CALLABLE;
 }
 
 static VkResult
@@ -1293,6 +1587,7 @@ vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
    out->closest_hit.clear();
    out->any_hit.clear();
    out->intersection.clear();
+   out->callable.clear();
 
    auto add_shader = [&](uint32_t shader_index, uint32_t group_index,
                          mesa_shader_stage required_stage,
@@ -1321,6 +1616,9 @@ vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
             else if (stage == MESA_SHADER_MISS)
                add_shader(group->generalShader, group_index, MESA_SHADER_MISS,
                           &out->miss);
+            else if (stage == MESA_SHADER_CALLABLE)
+               add_shader(group->generalShader, group_index,
+                          MESA_SHADER_CALLABLE, &out->callable);
          }
       } else if (group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR ||
                  group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR) {
@@ -1486,6 +1784,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
+   if (!vtvk_lower_rt_callable_invocations(
+          pipeline->shaders, pipeline->shader_count, cb_shaders.callable)) {
+      mesa_loge("ventus-vk: executeCallableEXT lowering failed");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    const bool global_wavefront =
       pipeline->rt_execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;

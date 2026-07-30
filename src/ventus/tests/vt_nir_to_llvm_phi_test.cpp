@@ -82,6 +82,21 @@ build_loop_exit_phi_shader(const nir_shader_compiler_options *options)
 }
 
 static nir_shader *
+build_float_mod_shader(const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_RAYGEN, options,
+                                                   "vt_float_mod");
+   nir_def *launch_id = nir_load_ray_launch_id(&b);
+   nir_def *dividend =
+      nir_u2f32(&b, nir_channel(&b, launch_id, 0));
+   nir_def *divisor =
+      nir_fadd_imm(&b, nir_u2f32(&b, nir_channel(&b, launch_id, 1)), 2.0f);
+   nir_def *result = nir_fmod(&b, dividend, divisor);
+   nir_ventus_rt_store_slot(&b, result, nir_imm_int(&b, 0));
+   return b.shader;
+}
+
+static nir_shader *
 build_storage_image_shader(const nir_shader_compiler_options *options,
                            uint32_t descriptor_set, uint32_t binding)
 {
@@ -149,6 +164,50 @@ main()
 
    VT_RT_CHECK(found_phi);
    VT_RT_CHECK(found_float_bits);
+
+   delete module;
+   ralloc_free(shader);
+
+   shader = build_float_mod_shader(&nir_options);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
+
+   bool found_fdiv = false;
+   bool found_fptosi = false;
+   bool found_sitofp = false;
+   bool found_select = false;
+   bool found_fsub = false;
+   for (llvm::Function &function : *module) {
+      for (llvm::BasicBlock &block : function) {
+         for (llvm::Instruction &instruction : block) {
+            found_fdiv |= instruction.getOpcode() == llvm::Instruction::FDiv;
+            found_fptosi |=
+               instruction.getOpcode() == llvm::Instruction::FPToSI;
+            found_sitofp |=
+               instruction.getOpcode() == llvm::Instruction::SIToFP;
+            found_select |=
+               instruction.getOpcode() == llvm::Instruction::Select;
+            found_fsub |= instruction.getOpcode() == llvm::Instruction::FSub;
+            const bool fmod_operation =
+               instruction.getOpcode() == llvm::Instruction::FDiv ||
+               instruction.getOpcode() == llvm::Instruction::FPToSI ||
+               instruction.getOpcode() == llvm::Instruction::SIToFP ||
+               instruction.getOpcode() == llvm::Instruction::Select ||
+               instruction.getOpcode() == llvm::Instruction::FSub;
+            if (fmod_operation) {
+               for (llvm::Use &operand : instruction.operands())
+                  VT_RT_CHECK(!llvm::isa<llvm::UndefValue>(operand.get()));
+            }
+         }
+      }
+   }
+   VT_RT_CHECK(found_fdiv);
+   VT_RT_CHECK(found_fptosi);
+   VT_RT_CHECK(found_sitofp);
+   VT_RT_CHECK(found_select);
+   VT_RT_CHECK(found_fsub);
 
    delete module;
    ralloc_free(shader);

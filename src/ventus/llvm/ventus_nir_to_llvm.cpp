@@ -1542,6 +1542,20 @@ private:
          return floatBin([&](Value *a, Value *b) { return builder.CreateFMul(a, b); });
       case nir_op_fdiv:
          return floatBin([&](Value *a, Value *b) { return builder.CreateFDiv(a, b); });
+      case nir_op_fmod:
+         /* NIR fmod follows GLSL mod semantics: x - y * floor(x / y).
+          * Materialize floor with native conversions so RV32 does not require
+          * an unavailable floorf/fmodf runtime helper. */
+         return floatBin([&](Value *a, Value *b) {
+            Value *quotient = builder.CreateFDiv(a, b);
+            Value *truncated_int = builder.CreateFPToSI(quotient, i32);
+            Value *truncated = builder.CreateSIToFP(truncated_int, f32);
+            Value *floored = builder.CreateSelect(
+               builder.CreateFCmpOLT(quotient, truncated),
+               builder.CreateFSub(truncated, ConstantFP::get(f32, 1.0)),
+               truncated);
+            return builder.CreateFSub(a, builder.CreateFMul(b, floored));
+         });
       case nir_op_fneg:
          return floatResult(&alu->def, [&](unsigned i) {
             return builder.CreateFNeg(asFloat(src(0, i)));
