@@ -204,6 +204,7 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->rayTracingPipeline = true;
    f->rayTracingPipelineTraceRaysIndirect = true;
    f->rayTraversalPrimitiveCulling = true;
+   f->rayTracingPositionFetch = true;
    f->rayTracingMaintenance1 = false;
    f->rayTracingPipelineTraceRaysIndirect2 = true;
    f->descriptorBindingAccelerationStructureUpdateAfterBind = false;
@@ -220,6 +221,7 @@ vtvk_init_extensions(struct vtvk_physical_device *pdev)
    e->KHR_pipeline_library = true;
    e->KHR_ray_tracing_maintenance1 = true;
    e->KHR_ray_tracing_pipeline = true;
+   e->KHR_ray_tracing_position_fetch = true;
    e->KHR_shader_float_controls = true;
    e->KHR_spirv_1_4 = true;
    e->KHR_swapchain = true;

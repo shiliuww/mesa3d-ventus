@@ -1884,6 +1884,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                float values[8];
                memcpy(values, bits, sizeof(values));
                uint32_t primitive_id = 0;
+               uint64_t primitive_address = 0;
                float hit_t = -1.0f;
                uint64_t hit_attribute_address = 0;
                uint64_t hit_shader_record_address = 0;
@@ -1896,6 +1897,10 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                         VT_RT_HIT_RECORD_HIT_T,
                      VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
                         VT_RT_HIT_RECORD_PRIMITIVE_ID,
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_PRIMITIVE_ADDR_LO,
+                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+                        VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_HI,
                      VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
@@ -1903,7 +1908,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                      VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
                         VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
                   };
-                  uint32_t hit_words[6] = {};
+                  uint32_t hit_words[8] = {};
                   for (uint32_t field = 0; field < ARRAY_SIZE(fields); ++field) {
                      const uint64_t address = global_completion_dev_addr +
                         VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
@@ -1925,10 +1930,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                "ray_ref=%u", request.ray_ref);
                   memcpy(&hit_t, &hit_words[0], sizeof(hit_t));
                   primitive_id = hit_words[1];
-                  hit_attribute_address = (uint64_t)hit_words[2] |
-                                          ((uint64_t)hit_words[3] << 32);
-                  hit_shader_record_address = (uint64_t)hit_words[4] |
-                                              ((uint64_t)hit_words[5] << 32);
+                  primitive_address = (uint64_t)hit_words[2] |
+                                      ((uint64_t)hit_words[3] << 32);
+                  hit_attribute_address = (uint64_t)hit_words[4] |
+                                          ((uint64_t)hit_words[5] << 32);
+                  hit_shader_record_address = (uint64_t)hit_words[6] |
+                                              ((uint64_t)hit_words[7] << 32);
                   if (hit_shader_record_address &&
                       driver.vt_copy_from_dev(driver.device,
                                               hit_shader_record_address - 28,
@@ -1964,10 +1971,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                          request.launch_id_z);
                if (request.completed_stage == 1)
                   mesa_logi("ventus-vk: global RT committed hit ray_ref=%u "
-                          "primitive=%u t=%.6f attr_addr=%" PRIx64
+                            "primitive=%u primitive_addr=%" PRIx64
+                            " t=%.6f attr_addr=%" PRIx64
                             " attr=(%.6f,%.6f) shader_record=%" PRIx64
                             " group=%u completion_status=%u", request.ray_ref,
-                            primitive_id, hit_t, hit_attribute_address,
+                            primitive_id, primitive_address, hit_t,
+                            hit_attribute_address,
                             hit_attributes[0], hit_attributes[1],
                             hit_shader_record_address, hit_shader_record_group,
                             completion_status);

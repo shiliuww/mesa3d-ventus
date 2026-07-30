@@ -442,6 +442,15 @@ load_active_instance_addr(nir_builder *b,
                                      VT_RT_HIT_RECORD_INSTANCE_ADDR_LO);
 }
 
+static nir_def *
+load_active_primitive_addr(nir_builder *b,
+                           const struct vt_nir_rt_config *config,
+                           enum vt_rt_shader_layout layout)
+{
+   return load_active_hit_record_u64(b, config, layout,
+                                     VT_RT_HIT_RECORD_PRIMITIVE_ADDR_LO);
+}
+
 static void
 load_instance_matrix_rows(nir_builder *b, nir_def *instance_addr,
                           uint32_t matrix_offset, nir_def *rows[3])
@@ -538,6 +547,13 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       replacement = load_instance_matrix_column(
          b, load_active_instance_addr(b, config, layout),
          VENTUS_INSTANCE_WORLD_TO_OBJECT, nir_intrinsic_column(intrin));
+      break;
+   case nir_intrinsic_load_ray_triangle_vertex_positions:
+      replacement = nir_load_global(
+         b, 3, 32,
+         nir_iadd_imm(b, load_active_primitive_addr(b, config, layout),
+                      VENTUS_TRIANGLE_V0 +
+                         nir_intrinsic_column(intrin) * 3 * sizeof(float)));
       break;
    case nir_intrinsic_load_ray_t_max:
       replacement = load_active_hit_record_word(b, config, layout,
