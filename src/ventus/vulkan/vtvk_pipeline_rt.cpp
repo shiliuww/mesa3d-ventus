@@ -744,6 +744,7 @@ struct vtvk_rt_callback_shader_entry {
    uint32_t group_index;
    mesa_shader_stage stage;
    nir_shader *shader;
+   nir_variable *callable_shader_record_ptr;
 };
 
 struct vtvk_rt_callback_shaders {
@@ -1115,8 +1116,58 @@ vtvk_rt_callable_types_match(const nir_variable *caller,
 }
 
 static bool
+vtvk_lower_rt_callable_shader_record_ptr(nir_builder *b,
+                                         nir_intrinsic_instr *intrin,
+                                         void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_shader_record_ptr)
+      return false;
+
+   nir_variable *shader_record_ptr = static_cast<nir_variable *>(data);
+   if (!shader_record_ptr)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *selected_record_ptr = nir_load_var(b, shader_record_ptr);
+   nir_def_rewrite_uses(&intrin->def, selected_record_ptr);
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
+vtvk_prepare_rt_callable_shader_record_ptr(
+   nir_shader *shader, nir_variable **shader_record_ptr_out)
+{
+   *shader_record_ptr_out = nullptr;
+   if (!vtvk_rt_shader_has_intrinsic(
+          shader, nir_intrinsic_load_shader_record_ptr))
+      return true;
+
+   nir_variable *shader_record_ptr =
+      nir_variable_create(shader, nir_var_shader_temp, glsl_uint64_t_type(),
+                          "ventus_callable_shader_record_ptr");
+   if (!shader_record_ptr)
+      return false;
+
+   const bool progress = nir_shader_intrinsics_pass(
+      shader, vtvk_lower_rt_callable_shader_record_ptr, nir_metadata_none,
+      shader_record_ptr);
+   if (!progress ||
+       vtvk_rt_shader_has_intrinsic(
+          shader, nir_intrinsic_load_shader_record_ptr))
+      return false;
+
+   nir_fixup_deref_modes(shader);
+   nir_opt_dce(shader);
+   *shader_record_ptr_out = shader_record_ptr;
+   return true;
+}
+
+static bool
 vtvk_inline_rt_callable_shader(nir_builder *b, nir_shader *shader,
-                               nir_variable *payload, int payload_location)
+                               nir_variable *payload, int payload_location,
+                               nir_variable *callable_shader_record_ptr,
+                               nir_variable *selected_record_ptr)
 {
    if (!b || !shader || !payload)
       return false;
@@ -1148,6 +1199,15 @@ vtvk_inline_rt_callable_shader(nir_builder *b, nir_shader *shader,
             break;
          }
          _mesa_hash_table_insert(var_remap, var, payload);
+         continue;
+      }
+
+      if (var == callable_shader_record_ptr) {
+         if (!selected_record_ptr) {
+            valid = false;
+            break;
+         }
+         _mesa_hash_table_insert(var_remap, var, selected_record_ptr);
          continue;
       }
 
@@ -1220,12 +1280,22 @@ vtvk_lower_rt_execute_callable(nir_builder *b,
 
    nir_push_if(b, valid_record);
    nir_def *record = nir_iadd(b, base, offset);
+   nir_variable *selected_record_ptr =
+      nir_variable_create(b->shader, nir_var_shader_temp, glsl_uint64_t_type(),
+                          "ventus_selected_callable_record_ptr");
+   if (!selected_record_ptr) {
+      state->failed = true;
+      nir_pop_if(b, NULL);
+      return false;
+   }
+   nir_store_var(b, selected_record_ptr, nir_iadd_imm(b, record, 32), 0x1);
    nir_def *group_index =
       nir_load_global(b, 1, 32, nir_iadd_imm(b, record, 4));
    for (const vtvk_rt_callback_shader_entry &entry : *state->callables) {
       nir_push_if(b, nir_ieq_imm(b, group_index, entry.group_index));
       if (!vtvk_inline_rt_callable_shader(
-             b, entry.shader, payload, payload_location))
+             b, entry.shader, payload, payload_location,
+             entry.callable_shader_record_ptr, selected_record_ptr))
          state->failed = true;
       nir_pop_if(b, NULL);
    }
@@ -1238,9 +1308,10 @@ vtvk_lower_rt_execute_callable(nir_builder *b,
 static bool
 vtvk_lower_rt_callable_invocations(
    nir_shader **shaders, uint32_t shader_count,
-   const std::vector<vtvk_rt_callback_shader_entry> &callables)
+   std::vector<vtvk_rt_callback_shader_entry> &callables)
 {
-   for (const vtvk_rt_callback_shader_entry &entry : callables) {
+   for (size_t i = 0; i < callables.size(); i++) {
+      vtvk_rt_callback_shader_entry &entry = callables[i];
       if (vtvk_rt_shader_has_intrinsic(
              entry.shader, nir_intrinsic_execute_callable)) {
          mesa_loge("ventus-vk: nested callable shader invocation is not "
@@ -1248,9 +1319,26 @@ vtvk_lower_rt_callable_invocations(
          return false;
       }
       if (vtvk_rt_shader_has_intrinsic(
-             entry.shader, nir_intrinsic_load_shader_record_ptr)) {
-         mesa_loge("ventus-vk: callable shader record data requires a "
-                   "selected-record carrier");
+             entry.shader, nir_intrinsic_trace_ray)) {
+         mesa_loge("ventus-vk: callable-originated traceRayEXT is not "
+                   "supported");
+         return false;
+      }
+
+      entry.callable_shader_record_ptr = nullptr;
+      for (size_t j = 0; j < i; j++) {
+         if (callables[j].shader == entry.shader) {
+            entry.callable_shader_record_ptr =
+               callables[j].callable_shader_record_ptr;
+            break;
+         }
+      }
+      if (entry.callable_shader_record_ptr)
+         continue;
+
+      if (!vtvk_prepare_rt_callable_shader_record_ptr(
+             entry.shader, &entry.callable_shader_record_ptr)) {
+         mesa_loge("ventus-vk: failed to bind callable shader record data");
          return false;
       }
    }
@@ -1599,7 +1687,8 @@ vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
       mesa_shader_stage shader_stage =
          vk_to_mesa_shader_stage(info->pStages[shader_index].stage);
       if (shader_stage == required_stage) {
-         dst->push_back({group_index, required_stage, shaders[shader_index]});
+         dst->push_back(
+            {group_index, required_stage, shaders[shader_index], nullptr});
       }
    };
 
