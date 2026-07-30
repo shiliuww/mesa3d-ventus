@@ -35,6 +35,12 @@ struct vt_rt_intrinsic_counts {
    unsigned load_deref;
    unsigned store_deref;
    unsigned load_shader_record_ptr;
+   unsigned load_ray_world_origin;
+   unsigned load_ray_world_direction;
+   unsigned load_ray_object_origin;
+   unsigned load_ray_object_direction;
+   unsigned load_ray_object_to_world;
+   unsigned load_ray_world_to_object;
    unsigned load_ray_t_max;
    unsigned load_primitive_id;
    unsigned load_instance_id;
@@ -188,6 +194,24 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_load_shader_record_ptr:
                counts->load_shader_record_ptr++;
+               break;
+            case nir_intrinsic_load_ray_world_origin:
+               counts->load_ray_world_origin++;
+               break;
+            case nir_intrinsic_load_ray_world_direction:
+               counts->load_ray_world_direction++;
+               break;
+            case nir_intrinsic_load_ray_object_origin:
+               counts->load_ray_object_origin++;
+               break;
+            case nir_intrinsic_load_ray_object_direction:
+               counts->load_ray_object_direction++;
+               break;
+            case nir_intrinsic_load_ray_object_to_world:
+               counts->load_ray_object_to_world++;
+               break;
+            case nir_intrinsic_load_ray_world_to_object:
+               counts->load_ray_world_to_object++;
                break;
             case nir_intrinsic_load_ray_t_max:
                counts->load_ray_t_max++;

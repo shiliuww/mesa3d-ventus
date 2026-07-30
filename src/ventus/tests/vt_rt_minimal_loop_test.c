@@ -23,6 +23,18 @@ build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
    nir_def *primitive_id = nir_load_primitive_id(&b);
    nir_def *instance_id = nir_load_instance_id(&b);
    nir_def *instance_custom_index = nir_load_ray_instance_custom_index(&b);
+   nir_def *world_origin = nir_load_ray_world_origin(&b);
+   nir_def *world_direction = nir_load_ray_world_direction(&b);
+   nir_def *object_origin = nir_load_ray_object_origin(&b);
+   nir_def *object_direction = nir_load_ray_object_direction(&b);
+   nir_def *object_to_world_0 =
+      nir_load_ray_object_to_world(&b, .column = 0);
+   nir_def *object_to_world_3 =
+      nir_load_ray_object_to_world(&b, .column = 3);
+   nir_def *world_to_object_0 =
+      nir_load_ray_world_to_object(&b, .column = 0);
+   nir_def *world_to_object_3 =
+      nir_load_ray_world_to_object(&b, .column = 3);
    nir_def *geometry_id = nir_load_ray_geometry_index(&b);
    nir_def *hit_kind = nir_load_ray_hit_kind(&b);
 
@@ -38,6 +50,18 @@ build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
                  nir_vec4(&b, nir_unpack_64_2x32_split_y(&b, record_ptr),
                           hit_t, instance_custom_index, instance_id),
                  0xf);
+   nir_store_var(&b, sink,
+                 nir_vec4(&b, nir_channel(&b, world_origin, 0),
+                          nir_channel(&b, world_direction, 0),
+                          nir_channel(&b, object_origin, 0),
+                          nir_channel(&b, object_direction, 0)),
+                 0xf);
+   nir_store_var(&b, sink,
+                 nir_vec4(&b, nir_channel(&b, object_to_world_0, 0),
+                          nir_channel(&b, object_to_world_3, 0),
+                          nir_channel(&b, world_to_object_0, 0),
+                          nir_channel(&b, world_to_object_3, 0)),
+                 0xf);
 
    return b.shader;
 }
@@ -52,13 +76,19 @@ build_abi_probe_any_hit(const nir_shader_compiler_options *options)
    nir_def *front_face = nir_load_front_face(&b, 1);
    nir_def *hit_kind = nir_load_ray_hit_kind(&b);
    nir_def *instance_custom_index = nir_load_ray_instance_custom_index(&b);
+   nir_def *object_origin = nir_load_ray_object_origin(&b);
+   nir_def *world_to_object_3 =
+      nir_load_ray_world_to_object(&b, .column = 3);
 
    nir_variable *sink =
       nir_variable_create(b.shader, nir_var_shader_temp,
                           glsl_uint_type(), "any_hit_sink");
    nir_store_var(&b, sink,
                  nir_iadd(&b, nir_iadd(&b, nir_b2i32(&b, front_face), hit_kind),
-                          instance_custom_index),
+                          nir_iadd(&b, instance_custom_index,
+                                   nir_f2u32(&b, nir_fadd(
+                                      &b, nir_channel(&b, object_origin, 0),
+                                      nir_channel(&b, world_to_object_3, 0))))),
                  0x1);
    nir_ignore_ray_intersection(&b);
 
@@ -393,6 +423,12 @@ main(int argc, char **argv)
    VT_RT_CHECK(closest_before.load_primitive_id == 1);
    VT_RT_CHECK(closest_before.load_instance_id == 1);
    VT_RT_CHECK(closest_before.load_ray_instance_custom_index == 1);
+   VT_RT_CHECK(closest_before.load_ray_world_origin == 1);
+   VT_RT_CHECK(closest_before.load_ray_world_direction == 1);
+   VT_RT_CHECK(closest_before.load_ray_object_origin == 1);
+   VT_RT_CHECK(closest_before.load_ray_object_direction == 1);
+   VT_RT_CHECK(closest_before.load_ray_object_to_world == 2);
+   VT_RT_CHECK(closest_before.load_ray_world_to_object == 2);
    VT_RT_CHECK(closest_before.load_ray_geometry_index == 1);
    VT_RT_CHECK(closest_before.load_ray_hit_kind == 1);
 
@@ -407,6 +443,12 @@ main(int argc, char **argv)
    VT_RT_CHECK(closest_after.load_primitive_id == 0);
    VT_RT_CHECK(closest_after.load_instance_id == 0);
    VT_RT_CHECK(closest_after.load_ray_instance_custom_index == 0);
+   VT_RT_CHECK(closest_after.load_ray_world_origin == 0);
+   VT_RT_CHECK(closest_after.load_ray_world_direction == 0);
+   VT_RT_CHECK(closest_after.load_ray_object_origin == 0);
+   VT_RT_CHECK(closest_after.load_ray_object_direction == 0);
+   VT_RT_CHECK(closest_after.load_ray_object_to_world == 0);
+   VT_RT_CHECK(closest_after.load_ray_world_to_object == 0);
    VT_RT_CHECK(closest_after.load_ray_geometry_index == 0);
    VT_RT_CHECK(closest_after.load_ray_hit_kind == 0);
    VT_RT_CHECK(closest_after.ventus_rt_load_slot >
@@ -416,11 +458,11 @@ main(int argc, char **argv)
    VT_RT_CHECK(count_load_slot_from_const_addr(
                   closest_hit,
                   VT_RT_ABI_PDS_BASE_BYTES + abi.hit_record_base_bytes +
-                     VT_RT_HIT_RECORD_INSTANCE_ADDR_LO * 4) == 1);
+                     VT_RT_HIT_RECORD_INSTANCE_ADDR_LO * 4) > 0);
    VT_RT_CHECK(count_load_slot_from_const_addr(
                   closest_hit,
                   VT_RT_ABI_PDS_BASE_BYTES + abi.hit_record_base_bytes +
-                     VT_RT_HIT_RECORD_INSTANCE_ADDR_HI * 4) == 1);
+                     VT_RT_HIT_RECORD_INSTANCE_ADDR_HI * 4) > 0);
    VT_RT_CHECK(closest_after.ventus_rt_store_slot >
                closest_before.ventus_rt_store_slot);
    VT_RT_CHECK(count_variables(closest_hit, nir_var_shader_call_data) == 0);
@@ -451,6 +493,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(any_before.load_front_face == 1);
    VT_RT_CHECK(any_before.load_ray_hit_kind == 1);
    VT_RT_CHECK(any_before.load_ray_instance_custom_index == 1);
+   VT_RT_CHECK(any_before.load_ray_object_origin == 1);
+   VT_RT_CHECK(any_before.load_ray_world_to_object == 1);
    VT_RT_CHECK(any_before.ignore_ray_intersection == 1);
 
    progress = vt_nir_lower_rt_abi(any_hit, &config);
@@ -462,6 +506,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(any_after.load_front_face == 0);
    VT_RT_CHECK(any_after.load_ray_hit_kind == 0);
    VT_RT_CHECK(any_after.load_ray_instance_custom_index == 0);
+   VT_RT_CHECK(any_after.load_ray_object_origin == 0);
+   VT_RT_CHECK(any_after.load_ray_world_to_object == 0);
    VT_RT_CHECK(any_after.ignore_ray_intersection == 0);
    VT_RT_CHECK(any_after.ventus_rt_load_slot > any_before.ventus_rt_load_slot);
    VT_RT_CHECK(any_after.ventus_rt_store_slot > any_before.ventus_rt_store_slot);
@@ -470,12 +516,12 @@ main(int argc, char **argv)
                   any_hit,
                   VT_RT_ABI_PDS_BASE_BYTES +
                      abi.candidate_hit_record_base_bytes +
-                     VT_RT_HIT_RECORD_INSTANCE_ADDR_LO * 4) == 1);
+                     VT_RT_HIT_RECORD_INSTANCE_ADDR_LO * 4) > 0);
    VT_RT_CHECK(count_load_slot_from_const_addr(
                   any_hit,
                   VT_RT_ABI_PDS_BASE_BYTES +
                      abi.candidate_hit_record_base_bytes +
-                     VT_RT_HIT_RECORD_INSTANCE_ADDR_HI * 4) == 1);
+                     VT_RT_HIT_RECORD_INSTANCE_ADDR_HI * 4) > 0);
 
    struct vt_rt_intrinsic_counts terminating_any_before;
    vt_rt_count_intrinsics(terminating_any_hit, &terminating_any_before);

@@ -433,6 +433,60 @@ load_active_hit_record_u64(nir_builder *b,
       load_active_hit_record_word(b, config, layout, lo_word + 1, 32));
 }
 
+static nir_def *
+load_active_instance_addr(nir_builder *b,
+                          const struct vt_nir_rt_config *config,
+                          enum vt_rt_shader_layout layout)
+{
+   return load_active_hit_record_u64(b, config, layout,
+                                     VT_RT_HIT_RECORD_INSTANCE_ADDR_LO);
+}
+
+static void
+load_instance_matrix_rows(nir_builder *b, nir_def *instance_addr,
+                          uint32_t matrix_offset, nir_def *rows[3])
+{
+   for (unsigned row = 0; row < 3; ++row) {
+      rows[row] = nir_load_global(
+         b, 4, 32,
+         nir_iadd_imm(b, instance_addr, matrix_offset + row * 16));
+   }
+}
+
+static nir_def *
+transform_ray_vec3(nir_builder *b, nir_def *vec, nir_def *matrix_rows[3],
+                   bool translation)
+{
+   nir_def *result[3] = {
+      nir_channel(b, matrix_rows[0], 3),
+      nir_channel(b, matrix_rows[1], 3),
+      nir_channel(b, matrix_rows[2], 3),
+   };
+
+   for (unsigned row = 0; row < 3; ++row) {
+      for (unsigned column = 0; column < 3; ++column) {
+         nir_def *term =
+            nir_fmul(b, nir_channel(b, vec, column),
+                     nir_channel(b, matrix_rows[row], column));
+         result[row] = (translation || column > 0) ?
+            nir_fadd(b, result[row], term) : term;
+      }
+   }
+
+   return nir_vec3(b, result[0], result[1], result[2]);
+}
+
+static nir_def *
+load_instance_matrix_column(nir_builder *b, nir_def *instance_addr,
+                            uint32_t matrix_offset, unsigned column)
+{
+   nir_def *rows[3];
+   load_instance_matrix_rows(b, instance_addr, matrix_offset, rows);
+   return nir_vec3(b, nir_channel(b, rows[0], column),
+                   nir_channel(b, rows[1], column),
+                   nir_channel(b, rows[2], column));
+}
+
 static bool
 lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
@@ -445,13 +499,45 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_ray_world_origin:
-   case nir_intrinsic_load_ray_object_origin:
       replacement = load_ray_state_vec3(b, config, layout, VT_RT_SLOT_ORIGIN_X);
       break;
+   case nir_intrinsic_load_ray_object_origin: {
+      nir_def *rows[3];
+      load_instance_matrix_rows(
+         b, load_active_instance_addr(b, config, layout),
+         VENTUS_INSTANCE_WORLD_TO_OBJECT, rows);
+      replacement =
+         transform_ray_vec3(b,
+                            load_ray_state_vec3(b, config, layout,
+                                                VT_RT_SLOT_ORIGIN_X),
+                            rows, true);
+      break;
+   }
    case nir_intrinsic_load_ray_world_direction:
-   case nir_intrinsic_load_ray_object_direction:
       replacement = load_ray_state_vec3(b, config, layout,
                                         VT_RT_SLOT_DIRECTION_X);
+      break;
+   case nir_intrinsic_load_ray_object_direction: {
+      nir_def *rows[3];
+      load_instance_matrix_rows(
+         b, load_active_instance_addr(b, config, layout),
+         VENTUS_INSTANCE_WORLD_TO_OBJECT, rows);
+      replacement =
+         transform_ray_vec3(b,
+                            load_ray_state_vec3(b, config, layout,
+                                                VT_RT_SLOT_DIRECTION_X),
+                            rows, false);
+      break;
+   }
+   case nir_intrinsic_load_ray_object_to_world:
+      replacement = load_instance_matrix_column(
+         b, load_active_instance_addr(b, config, layout),
+         VENTUS_INSTANCE_OBJECT_TO_WORLD, nir_intrinsic_column(intrin));
+      break;
+   case nir_intrinsic_load_ray_world_to_object:
+      replacement = load_instance_matrix_column(
+         b, load_active_instance_addr(b, config, layout),
+         VENTUS_INSTANCE_WORLD_TO_OBJECT, nir_intrinsic_column(intrin));
       break;
    case nir_intrinsic_load_ray_t_max:
       replacement = load_active_hit_record_word(b, config, layout,
@@ -475,9 +561,7 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                                 VT_RT_HIT_RECORD_INSTANCE_ID, 32);
       break;
    case nir_intrinsic_load_ray_instance_custom_index: {
-      nir_def *instance_addr =
-         load_active_hit_record_u64(b, config, layout,
-                                    VT_RT_HIT_RECORD_INSTANCE_ADDR_LO);
+      nir_def *instance_addr = load_active_instance_addr(b, config, layout);
       replacement = nir_load_global(
          b, 1, 32,
          nir_iadd_imm(b, instance_addr, VENTUS_INSTANCE_CUSTOM_INDEX));
