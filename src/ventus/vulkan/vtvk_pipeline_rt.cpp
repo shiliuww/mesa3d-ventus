@@ -936,6 +936,25 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
 }
 
 static void
+vtvk_localize_rt_callback_halts(nir_shader *shader)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_jump)
+            continue;
+
+         nir_jump_instr *jump = nir_instr_as_jump(instr);
+         if (jump->type == nir_jump_halt)
+            jump->type = nir_jump_return;
+      }
+   }
+}
+
+static void
 vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
 {
    if (!b || !shader)
@@ -945,6 +964,10 @@ vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
    if (!impl)
       return;
 
+   /* OpIgnoreIntersectionKHR and OpTerminateRayKHR end the current any-hit
+    * invocation.  Their NIR halt must become a callback-local return before
+    * this shader is inlined, otherwise it terminates the enclosing raygen. */
+   vtvk_localize_rt_callback_halts(shader);
    nir_opt_dead_cf(shader);
    nir_lower_returns(shader);
    nir_opt_dce(shader);
