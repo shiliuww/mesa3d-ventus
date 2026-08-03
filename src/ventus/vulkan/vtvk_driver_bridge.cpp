@@ -1080,11 +1080,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t raygen_wg_z = MAX2(info->depth, 1u);
    uint64_t pds_resident_lanes =
       vtvk_rt_resident_warps * vtvk_rt_lanes_per_warp;
-   const bool wavefront_mirror =
-      info->execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_MIRROR;
    const bool wavefront_global =
       info->execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
-   const bool wavefront_profile = wavefront_mirror || wavefront_global;
    struct vtvk_driver_kernel_launch_resources resource_envelope = {};
    uint64_t pds_size = 0;
    uint64_t kernel_lds_size = 0;
@@ -1283,8 +1280,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.abi_tag = wavefront_global ? 0 : VT_RT_ABI_TAG;
    args.continuation_frame_stride = info->continuation_frame_size;
    args.continuation_context_count = wavefront_global ? 0 : pds_resident_lanes;
-   args.submission_mailbox_stride = wavefront_profile ? mailbox_stride : 0;
-   args.submission_mailbox_generation = wavefront_profile ? 1 : 0;
+   args.submission_mailbox_stride = wavefront_global ? mailbox_stride : 0;
+   args.submission_mailbox_generation = wavefront_global ? 1 : 0;
    args.descriptor_table_addr = descriptor_table_dev_addr;
    args.descriptor_count = descriptor_table.size();
    args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
@@ -1416,9 +1413,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                        continuation_size))
       goto out;
 
-   /* Both the mirror and PDS-free producer use the same global queue ABI.
-    * Only the latter must not allocate a legacy slot/CPS backing store. */
-   if (wavefront_profile) {
+   if (wavefront_global) {
       if (!vt_nir_rt_global_queue_capacity(info->width, info->height,
                                             info->depth,
                                             info->max_ray_recursion_depth,
@@ -1524,27 +1519,24 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       args.global_completion_field_stride =
          (uint32_t)global_completion_layout.field_stride_bytes;
 
-      if (wavefront_global) {
-         if (__builtin_mul_overflow((uint64_t)global_queue_capacity,
-                                    sizeof(uint32_t),
-                                    &global_ray_ref_list_size) ||
-             !vtvk_driver_alloc_copy(&driver, NULL, global_ray_ref_list_size,
-                                     &global_ray_ref_list_dev_addr)) {
-            mesa_loge("ventus-vk: driver bridge failed to allocate global "
-                      "ray-ref scratch");
-            goto out;
-         }
-         if (!rv64 &&
-             !vtvk_bridge_require_rv32_range(
-                "global ray-ref scratch", global_ray_ref_list_dev_addr,
-                global_ray_ref_list_size))
-            goto out;
-         args.global_ray_ref_list_base = global_ray_ref_list_dev_addr;
-         args.global_ray_ref_generation = generation;
+      if (__builtin_mul_overflow((uint64_t)global_queue_capacity,
+                                 sizeof(uint32_t),
+                                 &global_ray_ref_list_size) ||
+          !vtvk_driver_alloc_copy(&driver, NULL, global_ray_ref_list_size,
+                                  &global_ray_ref_list_dev_addr)) {
+         mesa_loge("ventus-vk: driver bridge failed to allocate global "
+                   "ray-ref scratch");
+         goto out;
       }
+      if (!rv64 &&
+          !vtvk_bridge_require_rv32_range(
+             "global ray-ref scratch", global_ray_ref_list_dev_addr,
+             global_ray_ref_list_size))
+         goto out;
+      args.global_ray_ref_list_base = global_ray_ref_list_dev_addr;
+      args.global_ray_ref_generation = generation;
 
-      if (wavefront_global &&
-          !vt_nir_rt_submission_mailbox_capacity(
+      if (!vt_nir_rt_submission_mailbox_capacity(
              vtvk_rt_resident_warps, vtvk_rt_lanes_per_warp,
              &mailbox_count)) {
          mesa_loge("ventus-vk: wavefront mailbox layout exceeds the ABI limit");
@@ -1552,18 +1544,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       }
    }
 
-   /* The compatibility mirror publishes dense primary records.  The PDS-free
-    * profile has one reusable PRIMARY/shadow/reflection/refraction mailbox
-    * per resident physical lane. */
-   if (wavefront_mirror)
-      mailbox_count = (uint64_t)info->width * info->height *
-                      MAX2(info->depth, 1u);
-
-   if (wavefront_profile && mailbox_count > UINT64_MAX / mailbox_stride) {
+   if (wavefront_global && mailbox_count > UINT64_MAX / mailbox_stride) {
       mesa_loge("ventus-vk: wavefront mailbox allocation size overflow");
       goto out;
    }
-   if (wavefront_profile &&
+   if (wavefront_global &&
        !vtvk_driver_alloc_copy(&driver, NULL, mailbox_count * mailbox_stride,
                                &mailbox_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate mailbox pool");
@@ -1572,7 +1557,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.submission_mailbox_base = mailbox_dev_addr;
    if (!rv64 &&
        !vtvk_bridge_require_rv32_range("submission mailbox pool", mailbox_dev_addr,
-                                       wavefront_profile ?
+                                       wavefront_global ?
                                           mailbox_count * mailbox_stride : 0))
       goto out;
 

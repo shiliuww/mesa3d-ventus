@@ -22,8 +22,6 @@ vtvk_rt_execution_profile_resolve(const char *selector,
    if (selector && selector[0]) {
       if (strcmp(selector, "compat") == 0)
          *profile = VTVK_RT_EXECUTION_COMPAT;
-      else if (strcmp(selector, "mirror") == 0)
-         *profile = VTVK_RT_EXECUTION_WAVEFRONT_MIRROR;
       else if (strcmp(selector, "global") == 0)
          *profile = VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
       else
@@ -31,13 +29,11 @@ vtvk_rt_execution_profile_resolve(const char *selector,
       return true;
    }
 
+   if (vtvk_profile_value_enabled(legacy_mirror))
+      return false;
    if (legacy_global) {
       *profile = vtvk_profile_value_enabled(legacy_global) ?
          VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL : VTVK_RT_EXECUTION_COMPAT;
-      return true;
-   }
-   if (vtvk_profile_value_enabled(legacy_mirror)) {
-      *profile = VTVK_RT_EXECUTION_WAVEFRONT_MIRROR;
       return true;
    }
 

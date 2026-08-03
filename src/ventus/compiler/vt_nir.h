@@ -21,14 +21,11 @@ extern "C" {
 
 enum vt_rt_execution_model {
    VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP = 0,
-   /* Compatibility mirror: it publishes a global mailbox but still executes
-    * the legacy PDS traversal loop. */
-   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE = 1,
    /* PDS-free profile.  Raygen publishes level-zero requests in global
     * mailboxes; RTcore compacts them into, then consumes, the queue. */
-   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER = 2,
+   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER = 1,
    /* Terminal miss/closest-hit execution over a compact global ray_ref list. */
-   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK = 3,
+   VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK = 2,
 };
 
 enum vt_rt_shader_layout {

@@ -1909,9 +1909,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &abi);
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
-      } else if (pipeline->rt_execution_profile ==
-                 VTVK_RT_EXECUTION_WAVEFRONT_MIRROR)
-         rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE;
+      }
 
       vtvk_rt_pipeline_callback_data cb_data = {
          .shaders = &cb_shaders,

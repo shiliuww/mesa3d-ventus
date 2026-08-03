@@ -9,7 +9,6 @@ extern "C" {
 
 enum vtvk_rt_execution_profile {
    VTVK_RT_EXECUTION_COMPAT = 0,
-   VTVK_RT_EXECUTION_WAVEFRONT_MIRROR,
    VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL,
 };
 

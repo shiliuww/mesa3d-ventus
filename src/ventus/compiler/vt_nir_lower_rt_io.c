@@ -141,8 +141,7 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    struct lower_rt_io_state *state = data;
    const struct vt_nir_rt_config *config = state->config;
-   if (config->execution_model != VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP &&
-       config->execution_model != VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE)
+   if (config->execution_model != VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP)
       return false;
 
    b->cursor = nir_after_instr(&intrin->instr);
@@ -170,38 +169,6 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
-
-   /*
-    * Transitional wavefront profile: publish the exact trace input through
-    * the new global mailbox, then retain the proven synchronous traversal
-    * loop until the dequeue worker and CPS resume entry are available.
-    */
-   if (config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE) {
-      /* Raygen is not a compute shader: use the Vulkan RT launch id. */
-      nir_def *id = nir_load_ray_launch_id(b);
-      nir_def *width = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_WIDTH, 32);
-      nir_def *height = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HEIGHT, 32);
-      nir_def *row = nir_iadd(b, nir_channel(b, id, 1),
-                               nir_imul(b, height, nir_channel(b, id, 2)));
-      nir_def *linear = nir_iadd(b, nir_channel(b, id, 0),
-                                  nir_imul(b, width, row));
-      nir_def *pool = load_dispatch_arg(
-         b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_BASE, 64);
-      nir_def *stride = load_dispatch_arg(
-         b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_STRIDE, 32);
-      struct vt_nir_rt_submission_mailbox_args mailbox = {
-         .base_addr = nir_iadd(b, pool, nir_imul(b, nir_u2u64(b, linear),
-                                                  nir_u2u64(b, stride))),
-         .generation = load_dispatch_arg(
-            b, VT_NIR_RT_DISPATCH_ARG_SUBMISSION_MAILBOX_GENERATION, 32),
-      };
-      vt_nir_rt_store_submission_mailbox(b, &mailbox, &params,
-                                         nir_imm_int(b, 0),
-                                         nir_imm_int(b, 0),
-                                         nir_imm_int(b, 0),
-                                         nir_imm_int(b, 0), id,
-                                         mailbox.generation, nir_imm_int(b, 0));
-   }
 
    nir_loop *loop = nir_push_loop(b);
    {

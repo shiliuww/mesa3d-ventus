@@ -247,7 +247,7 @@ vtvk_enumerate_physical_devices(struct vk_instance *vk_instance)
           getenv("VENTUS_VK_RT_WAVEFRONT_MIRROR"),
           &pdev->rt_execution_profile)) {
       mesa_loge("ventus-vk: invalid RT execution profile '%s'; "
-                "expected compat, global, or mirror",
+                "expected compat or global; mirror has been removed",
                 profile_selector ? profile_selector : "");
       vk_free(&instance->vk.alloc, pdev);
       return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
