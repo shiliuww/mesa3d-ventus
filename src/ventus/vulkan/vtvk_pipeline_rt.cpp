@@ -72,6 +72,104 @@ vtvk_env_enabled(const char *name)
           strcmp(value, "OFF") != 0;
 }
 
+struct vtvk_rt_execution_profile_config {
+   VkVentusRtExecutionProfile profile;
+   VkVentusRtStageRole stage_role;
+   uint32_t state_descriptor_set;
+   uint32_t state_descriptor_binding;
+};
+
+static bool
+vtvk_rt_stage_role_is_staged_dispatch(VkVentusRtStageRole role)
+{
+   switch (role) {
+   case VK_VENTUS_RT_STAGE_ROLE_PRIMARY:
+   case VK_VENTUS_RT_STAGE_ROLE_DIRECT_SHADOW:
+   case VK_VENTUS_RT_STAGE_ROLE_REFLECTION_0:
+   case VK_VENTUS_RT_STAGE_ROLE_REFLECTION_1:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Execution profiles are deliberately a private pipeline-create pNext.  A
+ * shader-side branch cannot establish this contract: the selected lowering
+ * changes ABI and dispatch ownership before shader compilation starts. */
+static VkResult
+vtvk_parse_rt_execution_profile(
+   const VkRayTracingPipelineCreateInfoKHR *info,
+   struct vtvk_rt_execution_profile_config *out)
+{
+   *out = {
+      .profile = VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL,
+      .stage_role = VK_VENTUS_RT_STAGE_ROLE_NONE,
+      .state_descriptor_set = 0,
+      .state_descriptor_binding = 0,
+   };
+
+   const VkVentusRtExecutionProfileInfo *profile_info = NULL;
+   for (const VkBaseInStructure *node =
+           (const VkBaseInStructure *)info->pNext;
+        node; node = node->pNext) {
+      if (node->sType != VK_STRUCTURE_TYPE_VENTUS_RT_EXECUTION_PROFILE_INFO)
+         continue;
+
+      if (profile_info) {
+         mesa_loge("ventus-vk: duplicate RT execution-profile pNext");
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      profile_info = (const VkVentusRtExecutionProfileInfo *)node;
+   }
+
+   if (!profile_info)
+      return VK_SUCCESS;
+
+   if (profile_info->version != VK_VENTUS_RT_EXECUTION_PROFILE_VERSION_1) {
+      mesa_loge("ventus-vk: unsupported RT execution-profile version %u",
+                profile_info->version);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   switch (profile_info->profile) {
+   case VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL:
+      if (profile_info->stageRole != VK_VENTUS_RT_STAGE_ROLE_NONE ||
+          profile_info->stateDescriptorSet != 0 ||
+          profile_info->stateDescriptorBinding != 0) {
+         mesa_loge("ventus-vk: megakernel profile must not provide staged "
+                   "role or path-state descriptor");
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      break;
+   case VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH:
+      if (!vtvk_rt_stage_role_is_staged_dispatch(profile_info->stageRole)) {
+         mesa_loge("ventus-vk: staged-dispatch profile requires a fixed stage role");
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      if (profile_info->stateDescriptorSet >= VTVK_MAX_BOUND_DESCRIPTOR_SETS ||
+          profile_info->stateDescriptorBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS) {
+         mesa_loge("ventus-vk: staged-dispatch path-state descriptor set=%u binding=%u "
+                   "exceeds %u sets x %u bindings",
+                   profile_info->stateDescriptorSet,
+                   profile_info->stateDescriptorBinding,
+                   VTVK_MAX_BOUND_DESCRIPTOR_SETS,
+                   VTVK_MAX_DESCRIPTOR_BINDINGS);
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      break;
+   default:
+      mesa_loge("ventus-vk: unsupported RT execution profile %u",
+                (unsigned)profile_info->profile);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   out->profile = profile_info->profile;
+   out->stage_role = profile_info->stageRole;
+   out->state_descriptor_set = profile_info->stateDescriptorSet;
+   out->state_descriptor_binding = profile_info->stateDescriptorBinding;
+   return VK_SUCCESS;
+}
+
 struct vtvk_rt_nir_stats {
    unsigned trace_ray;
    unsigned load_vulkan_descriptor;
@@ -963,8 +1061,8 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
 /* A procedural report stays inside one compact intersection callback.  The
  * matching any-hit code is inlined at the report site, so locals and control
  * flow naturally continue to a later reportIntersectionEXT in the same
- * shader.  DONE records that at least one report was accepted; the committed
- * record retains the nearest accepted report even if a later one is ignored. */
+ * shader.  The callback decision is overwritten by each report; the
+ * committed record retains the latest accepted report. */
 struct vtvk_rt_intersection_report_lower_data {
    const struct vt_nir_rt_config *config;
    nir_shader *any_hit;
@@ -992,7 +1090,8 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
       b, config, layout, VT_RT_SLOT_TMIN);
    nir_def *terminated = nir_ine_imm(
       b, vt_nir_load_control_word(
-            b, config, layout, VT_RT_CONTROL_TERMINATE_RAY, 32), 0);
+            b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32),
+      VT_RT_CALLBACK_TERMINATE);
    nir_def *ray_ref = vt_nir_rt_global_callback_ray_ref(b);
    nir_def *candidate_attributes = vt_nir_rt_global_load_completion_addr(
       b, ray_ref, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
@@ -1007,8 +1106,8 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
     * the record says otherwise. */
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_STATUS,
-      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_STATUS_HIT),
-                nir_imm_int(b, VT_RT_STATUS_IDLE)));
+      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
+                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID)));
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, hit_t);
    vt_nir_store_candidate_hit_record_word(
@@ -1016,12 +1115,11 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_FRONT_FACE,
       nir_ieq_imm(b, hit_kind, 0xfe));
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
-                               eligible);
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
-                               nir_inot(b, eligible));
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
-                               terminated);
+   vt_nir_store_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
+      nir_bcsel(b, terminated, nir_imm_int(b, VT_RT_CALLBACK_TERMINATE),
+                nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                          nir_imm_int(b, VT_RT_CALLBACK_IGNORE))));
 
    nir_def *flags = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_FLAGS);
@@ -1040,17 +1138,10 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_pop_if(b, NULL);
    }
 
-   nir_def *accepted = nir_iand(
-      b, nir_ine_imm(
-            b, vt_nir_load_control_word(
-                  b, config, layout, VT_RT_CONTROL_ACCEPT_HIT, 32), 0),
-      nir_inot(b, nir_ine_imm(
-                       b, vt_nir_load_control_word(
-                             b, config, layout, VT_RT_CONTROL_IGNORE_HIT, 32), 0)));
-   nir_def *was_accepted = nir_ine_imm(
-      b, vt_nir_load_control_word(b, config, layout, VT_RT_CONTROL_DONE, 32), 0);
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_DONE,
-                               nir_ior(b, was_accepted, accepted));
+   nir_def *accepted = nir_ieq_imm(
+      b, vt_nir_load_control_word(
+            b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32),
+      VT_RT_CALLBACK_ACCEPT);
 
    nir_push_if(b, accepted);
    for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
@@ -1323,8 +1414,11 @@ vtvk_emit_rt_global_candidate_kernels(
       callbacks.size(), sizeof(*pipeline->callback_kernel_groups));
    pipeline->callback_kernel_stages = (uint32_t *)calloc(
       callbacks.size(), sizeof(*pipeline->callback_kernel_stages));
+   pipeline->callback_kernel_lds_sizes = (uint32_t *)calloc(
+      callbacks.size(), sizeof(*pipeline->callback_kernel_lds_sizes));
    if (!pipeline->callback_kernel_paths || !pipeline->callback_kernel_entries ||
-       !pipeline->callback_kernel_groups || !pipeline->callback_kernel_stages)
+       !pipeline->callback_kernel_groups || !pipeline->callback_kernel_stages ||
+       !pipeline->callback_kernel_lds_sizes)
       return false;
    pipeline->callback_kernel_count = callbacks.size();
 
@@ -1350,7 +1444,9 @@ vtvk_emit_rt_global_candidate_kernels(
          }
          vtvk_lower_rt_intersection_reports(shader, &config, matching_any_hit);
       }
-      if (!vt_nir_lower_rt_global_callback(shader, &config)) {
+      uint32_t callback_lds_size = 0;
+      if (!vt_nir_lower_rt_global_callback(shader, &config,
+                                           &callback_lds_size)) {
          mesa_loge("ventus-vk: global candidate callback lowering failed stage=%u group=%u",
                    callbacks[i].stage, callbacks[i].group_index);
          return false;
@@ -1380,6 +1476,7 @@ vtvk_emit_rt_global_candidate_kernels(
       pipeline->callback_kernel_entries[i] = entry;
       pipeline->callback_kernel_groups[i] = callbacks[i].group_index;
       pipeline->callback_kernel_stages[i] = callbacks[i].stage;
+      pipeline->callback_kernel_lds_sizes[i] = callback_lds_size;
    }
    mesa_logi("ventus-vk: prepared %u global RT candidate callback kernel%s",
              pipeline->callback_kernel_count,
@@ -1396,6 +1493,11 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
 
+   struct vtvk_rt_execution_profile_config profile_config;
+   VkResult profile_result = vtvk_parse_rt_execution_profile(info, &profile_config);
+   if (profile_result != VK_SUCCESS)
+      return vk_error(device, profile_result);
+
    struct vtvk_pipeline *pipeline =
       (struct vtvk_pipeline *)vk_pipeline_zalloc(
          &device->vk, &vtvk_pipeline_ops, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -1406,6 +1508,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->nir_mem_ctx = ralloc_context(nullptr);
    pipeline->shader_count = info->stageCount;
    pipeline->max_ray_recursion_depth = info->maxPipelineRayRecursionDepth;
+   pipeline->rt_execution_profile = profile_config.profile;
+   pipeline->rt_stage_role = profile_config.stage_role;
+   pipeline->rt_state_descriptor_set = profile_config.state_descriptor_set;
+   pipeline->rt_state_descriptor_binding = profile_config.state_descriptor_binding;
    pipeline->rt_uses_rv64 = vtvk_env_enabled("VENTUS_VK_RT_RV64");
 
    pipeline->shaders =
@@ -1441,16 +1547,37 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
 
-   const bool global_wavefront =
-      vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL");
+   struct vt_nir_rt_abi_layout rt_abi = vt_nir_rt_default_abi_layout();
+   uint32_t rt_payload_size = 0;
+   if (!vt_nir_rt_compute_pipeline_payload_size(pipeline->shaders,
+                                                pipeline->shader_count,
+                                                &rt_payload_size) ||
+       !vt_nir_rt_abi_layout_set_payload_size(&rt_abi, rt_payload_size)) {
+      mesa_loge("ventus-vk: RT payload layout exceeds the v3 private ABI");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
+   const bool staged_dispatch =
+      pipeline->rt_execution_profile ==
+      VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
+   /* The profile, rather than an ambient environment variable, selects the
+    * ABI-changing lower path.  Staged dispatch is the isolated legacy ray-ref queue
+    * implementation; a normal pipeline is always the synchronous
+    * megakernel path. */
+   const bool global_wavefront = staged_dispatch;
+   if (vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL") ||
+       vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR")) {
+      mesa_logw("ventus-vk: legacy wavefront environment selection is ignored; "
+                "use the staged-dispatch execution-profile pNext to select it");
+   }
 
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
-      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-      vt_nir_rt_config_apply_abi_layout(&config, &abi);
+      vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
 
       if (global_wavefront) {
-         vt_nir_rt_config_apply_global_cps_layout(&config, &abi);
+         vt_nir_rt_config_apply_global_cps_layout(&config, &rt_abi);
          config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
          config.defer_intersection_reports = true;
       }
@@ -1465,14 +1592,11 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
-      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-      vt_nir_rt_config_apply_abi_layout(&rt_io_config, &abi);
+      vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
       if (global_wavefront) {
-         vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &abi);
+         vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &rt_abi);
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
-      } else if (vtvk_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR"))
-         rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_QUEUE;
-
+      }
       vtvk_rt_pipeline_callback_data cb_data = {
          .shaders = &cb_shaders,
       };
@@ -1595,6 +1719,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          "e-m:e-p:32:32-i64:64-n32-S128",
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
+      /* Megakernel private state follows the fixed RT header and the
+       * pipeline-specific payload.  The staged/global legacy path keeps its
+       * own CPS storage and must not inherit this PDS prefix. */
+      .private_base_bytes = global_wavefront ? 0 : rt_abi.private_base_bytes,
    };
 
    pipeline->llvm_module =

@@ -7,6 +7,7 @@
 #define VENTUS_NIR_TO_LLVM_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "nir/nir.h"
 
@@ -31,6 +32,10 @@ struct vt_nir_to_llvm_options {
     * logical launch ID from the completion plane.  It needs a ray-ref-count
     * guard, not the root raygen image-extent guard. */
    bool global_rt_compact_resume;
+   /* Megakernel PDS layout: ordinary private allocas are placed after the
+    * fixed RT header and linked pipeline payload.  Zero preserves the legacy
+    * LLVM alloca layout (used by callback/global profiles). */
+   uint32_t private_base_bytes;
 };
 
 llvm::Module *vt_nir_to_llvm_translate(nir_shader **shaders,

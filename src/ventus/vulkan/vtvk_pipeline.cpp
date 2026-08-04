@@ -33,6 +33,7 @@ vtvk_pipeline_destroy(struct vk_device *device,
    free(pipeline->callback_kernel_entries);
    free(pipeline->callback_kernel_groups);
    free(pipeline->callback_kernel_stages);
+   free(pipeline->callback_kernel_lds_sizes);
    ralloc_free(pipeline->nir_mem_ctx);
    vk_free2(&device->alloc, pAllocator, pipeline->shaders);
    vk_free2(&device->alloc, pAllocator, pipeline->group_handles);

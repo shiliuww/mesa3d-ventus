@@ -35,34 +35,34 @@ trace_ray_has_const_flag(nir_intrinsic_instr *intrin, uint32_t flag)
           (nir_src_as_uint(intrin->src[1]) & flag) != 0;
 }
 
-static void
-store_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
-                     enum vt_rt_control_word word, nir_def *value)
+static nir_def *
+load_raygen_callback_decision(nir_builder *b,
+                              const struct vt_nir_rt_config *config)
 {
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, value);
+   return vt_nir_load_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                   VT_RT_CONTROL_CALLBACK_DECISION, 32);
 }
 
-static nir_def *
-load_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
-                    enum vt_rt_control_word word)
+static void
+store_raygen_callback_decision(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_callback_decision decision)
 {
-   return vt_nir_load_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, 32);
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_CALLBACK_DECISION,
+                             nir_imm_int(b, decision));
 }
 
 static void
 accept_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
 {
-   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_true(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_ACCEPT);
 }
 
 static void
 ignore_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
 {
-   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_false(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_true(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_IGNORE);
 }
 
 static void
@@ -118,7 +118,8 @@ emit_trace_callbacks(nir_builder *b,
       config->emit_intersection(b, params, result, config->callback_data);
    if (config->emit_any_hit) {
       nir_def *reported =
-         nir_i2b(b, load_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT));
+         nir_ieq_imm(b, load_raygen_callback_decision(b, config),
+                     VT_RT_CALLBACK_ACCEPT);
       nir_push_if(b, reported);
       /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
       accept_candidate_hit(b, config);
@@ -381,6 +382,8 @@ insert_raygen_release_before_returns(nir_shader *shader,
          nir_def *slot_base =
             vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
                                    raygen->ray_state_base_bytes);
+         nir_ventus_rt_store_slot(
+            &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
          nir_ventus_rt_release(&b, slot_base);
          progress = true;
       }

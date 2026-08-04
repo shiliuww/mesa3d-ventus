@@ -37,6 +37,24 @@ static nir_def *global_callback_slot_addr(
    nir_def *ray_ref);
 static bool constant_def_u32(nir_def *def, uint32_t *value);
 
+/* Candidate callbacks are separate launches, so only state consumed entirely
+ * within one callback may live in LDS.  Keep one fixed lane slice: it is
+ * intentionally small (144 B) and stays below the Vulkan-advertised 32 KiB
+ * workgroup limit for the 32-lane compact dispatch. */
+#define VT_RT_CALLBACK_LDS_LANE_STRIDE 144u
+#define VT_RT_CALLBACK_LDS_CANDIDATE_BASE 0u
+#define VT_RT_CALLBACK_LDS_HIT_ATTRIB_BASE 96u
+#define VT_RT_CALLBACK_LDS_MAX_LANES VT_RT_GLOBAL_WARP_SIZE
+#define VT_RT_CALLBACK_LDS_SIZE_BYTES \
+   (VT_RT_CALLBACK_LDS_LANE_STRIDE * VT_RT_CALLBACK_LDS_MAX_LANES)
+
+struct callback_lds_state {
+   const struct vt_nir_rt_config *config;
+   bool candidate_word[VT_RT_HIT_RECORD_WORD_COUNT];
+   bool hit_attrib_word[VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES / 4];
+   uint32_t lds_size_bytes;
+};
+
 static bool
 lower_global_push_constants(nir_builder *b, nir_intrinsic_instr *intrin,
                             void *data)
@@ -587,6 +605,176 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
    return NULL;
 }
 
+/* Returns a lane-private byte offset in the callback LDS slice.  Candidate
+ * records and hit attributes are read-only in an any-hit shader, therefore
+ * no epilogue writeback is required.  Control words deliberately remain in
+ * global completion: RTcore consumes them after this compact launch ends. */
+static bool
+callback_lds_slot_offset(const struct callback_lds_state *state,
+                         uint32_t slot, uint32_t *offset)
+{
+   if (!state || !state->lds_size_bytes || !offset)
+      return false;
+
+   const struct vt_nir_scratchpad_layout *sp =
+      &state->config->scratchpad[VT_RT_LAYOUT_ANY_HIT];
+   if (slot < sp->base_bytes)
+      return false;
+   const uint32_t relative = slot - sp->base_bytes;
+
+   if (relative >= sp->candidate_hit_record_base_bytes &&
+       relative < sp->candidate_hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_WORD_COUNT * 4u) {
+      const uint32_t word =
+         (relative - sp->candidate_hit_record_base_bytes) / 4u;
+      if (!state->candidate_word[word])
+         return false;
+      *offset = VT_RT_CALLBACK_LDS_CANDIDATE_BASE + word * 4u;
+      return true;
+   }
+
+   if (relative >= sp->hit_attrib_base_bytes &&
+       relative < sp->hit_attrib_base_bytes + sp->hit_attrib_size_bytes) {
+      const uint32_t word = (relative - sp->hit_attrib_base_bytes) / 4u;
+      if (word >= ARRAY_SIZE(state->hit_attrib_word) ||
+          !state->hit_attrib_word[word])
+         return false;
+      *offset = VT_RT_CALLBACK_LDS_HIT_ATTRIB_BASE + word * 4u;
+      return true;
+   }
+
+   return false;
+}
+
+static nir_def *
+callback_lds_addr(nir_builder *b, uint32_t offset)
+{
+   nir_intrinsic_instr *index = nir_intrinsic_instr_create(
+      b->shader, nir_intrinsic_ventus_rt_dispatch_index);
+   nir_def_init(&index->instr, &index->def, 1, 32);
+   nir_builder_instr_insert(b, &index->instr);
+   /* Compact callbacks always use 32 lanes per workgroup.  The physical
+    * dispatch index is global, so reduce it to the workgroup-local lane. */
+   nir_def *lane = nir_iand_imm(b, &index->def,
+                                VT_RT_GLOBAL_WARP_SIZE - 1u);
+   return nir_iadd_imm(b, nir_imul_imm(b, lane,
+                                       VT_RT_CALLBACK_LDS_LANE_STRIDE),
+                       offset);
+}
+
+static bool
+callback_lds_slot_index(const struct vt_nir_rt_config *config, uint32_t slot,
+                        uint32_t *index)
+{
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_ANY_HIT];
+   if (slot < sp->base_bytes)
+      return false;
+   const uint32_t relative = slot - sp->base_bytes;
+   if (relative >= sp->candidate_hit_record_base_bytes &&
+       relative < sp->candidate_hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_WORD_COUNT * 4u) {
+      *index = (relative - sp->candidate_hit_record_base_bytes) / 4u;
+      return true;
+   }
+   if (relative >= sp->hit_attrib_base_bytes &&
+       relative < sp->hit_attrib_base_bytes + sp->hit_attrib_size_bytes) {
+      *index = VT_RT_HIT_RECORD_WORD_COUNT +
+         (relative - sp->hit_attrib_base_bytes) / 4u;
+      return true;
+   }
+   return false;
+}
+
+/* Cache only repeated, read-only accesses.  This avoids turning a one-shot
+ * global load into a global-to-LDS copy and leaves all mutable ABI state in
+ * its cross-launch global owner. */
+static void
+prepare_callback_lds(nir_shader *shader, struct callback_lds_state *state)
+{
+   uint8_t loads[VT_RT_HIT_RECORD_WORD_COUNT +
+                 VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES / 4] = {};
+   bool writes[ARRAY_SIZE(loads)] = {};
+
+   if (shader->info.stage != MESA_SHADER_ANY_HIT)
+      return;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            const bool load = intrin->intrinsic ==
+               nir_intrinsic_ventus_rt_load_slot;
+            const bool store = intrin->intrinsic ==
+               nir_intrinsic_ventus_rt_store_slot;
+            if (!load && !store)
+               continue;
+            uint32_t slot = 0, index = 0;
+            if (!constant_def_u32(intrin->src[load ? 0 : 1].ssa, &slot) ||
+                !callback_lds_slot_index(state->config, slot, &index))
+               continue;
+            if (load && loads[index] != UINT8_MAX)
+               loads[index]++;
+            if (store)
+               writes[index] = true;
+         }
+      }
+   }
+
+   for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++)
+      state->candidate_word[word] = loads[word] > 1 && !writes[word];
+   for (uint32_t word = 0; word < ARRAY_SIZE(state->hit_attrib_word); word++)
+      state->hit_attrib_word[word] =
+         loads[VT_RT_HIT_RECORD_WORD_COUNT + word] > 1 &&
+         !writes[VT_RT_HIT_RECORD_WORD_COUNT + word];
+
+   for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++)
+      state->lds_size_bytes |= state->candidate_word[word];
+   for (uint32_t word = 0; word < ARRAY_SIZE(state->hit_attrib_word); word++)
+      state->lds_size_bytes |= state->hit_attrib_word[word];
+   if (state->lds_size_bytes)
+      state->lds_size_bytes = VT_RT_CALLBACK_LDS_SIZE_BYTES;
+}
+
+static void
+emit_callback_lds_prologue(nir_shader *shader,
+                           const struct callback_lds_state *state)
+{
+   if (!state->lds_size_bytes)
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *ray_ref = callback_ray_ref(&b);
+   for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
+      if (!state->candidate_word[word])
+         continue;
+      nir_def *addr = completion_field_addr(
+         &b, ray_ref, (enum vt_rt_global_completion_field)(
+            VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE + word));
+      nir_store_shared(&b, nir_load_global(&b, 1, 32, addr),
+                       callback_lds_addr(&b,
+                          VT_RT_CALLBACK_LDS_CANDIDATE_BASE + word * 4u),
+                       .align_mul = 4);
+   }
+
+   nir_def *attribute_base = load_completion_addr(
+      &b, ray_ref,
+      VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
+   for (uint32_t word = 0; word < ARRAY_SIZE(state->hit_attrib_word); word++) {
+      if (!state->hit_attrib_word[word])
+         continue;
+      nir_store_shared(&b,
+                       nir_load_global(&b, 1, 32,
+                                       nir_iadd_imm(&b, attribute_base, word * 4u)),
+                       callback_lds_addr(&b,
+                          VT_RT_CALLBACK_LDS_HIT_ATTRIB_BASE + word * 4u),
+                       .align_mul = 4);
+   }
+}
+
 static bool
 lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
@@ -602,9 +790,20 @@ lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
+   const struct callback_lds_state *state = data;
+   uint32_t lds_offset = 0;
+   if (load && callback_lds_slot_offset(state, slot, &lds_offset)) {
+      nir_def_rewrite_uses(&intrin->def,
+                           nir_load_shared(b, intrin->def.num_components,
+                                           intrin->def.bit_size,
+                                           callback_lds_addr(b, lds_offset),
+                                           .align_mul = 4));
+      nir_instr_remove(&intrin->instr);
+      return true;
+   }
+
    nir_def *ray_ref = callback_ray_ref(b);
-   nir_def *addr = global_callback_slot_addr(
-      b, (const struct vt_nir_rt_config *)data, slot, ray_ref);
+   nir_def *addr = global_callback_slot_addr(b, state->config, slot, ray_ref);
    if (!addr)
       return false;
    if (load)
@@ -637,8 +836,11 @@ lower_global_callback_launch_id(nir_builder *b, nir_intrinsic_instr *intrin,
 
 bool
 vt_nir_lower_rt_global_callback(nir_shader *shader,
-                                const struct vt_nir_rt_config *config)
+                                const struct vt_nir_rt_config *config,
+                                uint32_t *lds_size_bytes)
 {
+   if (lds_size_bytes)
+      *lds_size_bytes = 0;
    if (!shader || !config ||
        config->execution_model != VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK ||
        (shader->info.stage != MESA_SHADER_MISS &&
@@ -648,16 +850,23 @@ vt_nir_lower_rt_global_callback(nir_shader *shader,
       return false;
 
    NIR_PASS(_, shader, nir_opt_constant_folding);
+   struct callback_lds_state lds = {
+      .config = config,
+   };
+   prepare_callback_lds(shader, &lds);
+   emit_callback_lds_prologue(shader, &lds);
    bool progress = false;
    progress |= nir_shader_intrinsics_pass(shader, lower_global_push_constants,
                                           nir_metadata_none, NULL);
    progress |= nir_shader_intrinsics_pass(shader, lower_global_callback_slot,
-                                          nir_metadata_none, (void *)config);
+                                          nir_metadata_none, &lds);
    progress |= nir_shader_intrinsics_pass(shader, lower_global_callback_launch_id,
                                           nir_metadata_none, NULL);
    if (progress) {
       nir_opt_dead_cf(shader);
       nir_shader_gather_info(shader, nir_shader_get_entrypoint(shader));
    }
+   if (lds_size_bytes)
+      *lds_size_bytes = lds.lds_size_bytes;
    return progress;
 }

@@ -14,16 +14,9 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 2
+#define VT_RT_ABI_VERSION 4
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
-/*
- * The RTcore-visible state lives in per-lane PDS, but the current LLVM backend
- * also uses low private-memory offsets for lowered local variables. Keep the
- * hardware ABI region at a fixed logical base so RT slots cannot overlap the
- * compiler private stack.
- */
-#define VT_RT_ABI_PDS_BASE_BYTES 4096
 
 enum vt_rt_slot_word {
    VT_RT_SLOT_STATUS = 0,
@@ -52,12 +45,11 @@ enum vt_rt_slot_word {
    VT_RT_SLOT_WORD_COUNT = 23,
 };
 
-enum vt_rt_status {
-   VT_RT_STATUS_IDLE = 0,
-   VT_RT_STATUS_TRACE_REQUEST = 1,
-   VT_RT_STATUS_HIT = 2,
-   VT_RT_STATUS_MISS = 3,
-   VT_RT_STATUS_DONE = 4,
+/* Slot status is a lifecycle handshake, not a traversal result. */
+enum vt_rt_slot_status {
+   VT_RT_SLOT_STATUS_IDLE = 0,
+   VT_RT_SLOT_STATUS_TRACE_REQUEST = 1,
+   VT_RT_SLOT_STATUS_TERMINATED = 2,
 };
 
 enum vt_rt_traversal_status {
@@ -95,14 +87,22 @@ enum vt_rt_hit_record_word {
    VT_RT_HIT_RECORD_WORD_COUNT = 19,
 };
 
+enum vt_rt_hit_record_status {
+   VT_RT_HIT_RECORD_STATUS_INVALID = 0,
+   VT_RT_HIT_RECORD_STATUS_VALID = 1,
+};
+
 enum vt_rt_control_word {
-   VT_RT_CONTROL_DONE = 0,
-   VT_RT_CONTROL_INCOMPLETE = 1,
-   VT_RT_CONTROL_ACCEPT_HIT = 2,
-   VT_RT_CONTROL_IGNORE_HIT = 3,
-   VT_RT_CONTROL_TERMINATE_RAY = 4,
-   VT_RT_CONTROL_SKIP_CLOSEST_HIT = 5,
-   VT_RT_CONTROL_WORD_COUNT = 6,
+   /* The callback writes one final decision before traverse resumes. */
+   VT_RT_CONTROL_CALLBACK_DECISION = 0,
+   VT_RT_CONTROL_WORD_COUNT = 1,
+};
+
+enum vt_rt_callback_decision {
+   VT_RT_CALLBACK_PENDING = 0,
+   VT_RT_CALLBACK_ACCEPT = 1,
+   VT_RT_CALLBACK_IGNORE = 2,
+   VT_RT_CALLBACK_TERMINATE = 3,
 };
 
 #define VT_RT_ABI_RAY_STATE_BASE_BYTES 0
@@ -124,21 +124,21 @@ enum vt_rt_cps_header_word {
 #define VT_RT_ABI_CONTROL_SIZE_BYTES \
    (VT_RT_CONTROL_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 
-#define VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES 144
+#define VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES 116
 #define VT_RT_ABI_CANDIDATE_HIT_RECORD_SIZE_BYTES 72
 
-#define VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES 224
+#define VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES 196
 #define VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES 72
 
-#define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 304
+#define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 276
 #define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 32
 
-#define VT_RT_ABI_SHADER_REGION_BASE_BYTES 336
+#define VT_RT_ABI_SHADER_REGION_BASE_BYTES 308
 #define VT_RT_ABI_PAYLOAD_BASE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
-#define VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES (3 * VT_RT_ABI_ALIGNMENT_BYTES)
-
-#define VT_RT_ABI_REGION_SIZE_BYTES 384
-#define VT_RT_ABI_TOTAL_SIZE_BYTES \
-   (VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES)
+/* The linked RT pipeline determines P before lowering:
+ * ALIGN16(max(location * 16 + natural_size)). */
+#define VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES 0
+#define VT_RT_ABI_REGION_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
+#define VT_RT_ABI_FIXED_HEADER_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
 
 #endif

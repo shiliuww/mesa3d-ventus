@@ -63,6 +63,9 @@ struct vt_nir_scratchpad_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
+   /* First byte available to compiler-owned private objects.  The RT header
+    * and linked pipeline payload occupy [base_bytes, private_base_bytes). */
+   uint32_t private_base_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -79,8 +82,11 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   /* PDS-free static RT state: ray, hit records, attributes, and payload. */
+   /* Fixed RT header plus the linked pipeline payload.  Megakernel PDS starts
+    * at logical offset zero; ordinary LLVM private state starts after total. */
    uint32_t region_size_bytes;
+   /* First byte after the fixed header and this pipeline's payload. */
+   uint32_t private_base_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -168,6 +174,14 @@ struct vt_nir_rt_config {
 struct vt_nir_rt_config vt_nir_rt_default_config(void);
 
 struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
+
+/* Compute P shared by every linked RT stage using the existing Vulkan
+ * location*16 payload-slot convention. */
+bool vt_nir_rt_compute_pipeline_payload_size(nir_shader **shaders,
+                                             unsigned shader_count,
+                                             uint32_t *payload_size_bytes);
+bool vt_nir_rt_abi_layout_set_payload_size(struct vt_nir_rt_abi_layout *layout,
+                                           uint32_t payload_size_bytes);
 
 /* Rebind the common RT regions into a PDS-free global CPS frame. */
 void vt_nir_rt_config_apply_global_cps_layout(
@@ -323,7 +337,8 @@ bool vt_nir_lower_rt_global_resume(nir_shader *shader,
 /* Rewrites a terminal miss/closest-hit shader's legacy RT slot accesses to
  * the global queue/completion planes selected by the compact dispatch list. */
 bool vt_nir_lower_rt_global_callback(nir_shader *shader,
-                                     const struct vt_nir_rt_config *config);
+                                     const struct vt_nir_rt_config *config,
+                                     uint32_t *lds_size_bytes);
 
 /* Compact callback helpers for driver-side report-site lowering. */
 nir_def *vt_nir_rt_global_callback_ray_ref(nir_builder *b);
@@ -445,6 +460,13 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE = 280,
    VT_NIR_RT_DISPATCH_ARG_SIZE = 288,
 };
+
+/* Vulkan descriptor indices are flattened by the Ventus RT dispatch ABI.
+ * Keep this in sync with the command-buffer limits in vtvk_private.h. */
+#define VT_NIR_RT_DESCRIPTOR_SET_COUNT 4u
+#define VT_NIR_RT_DESCRIPTOR_BINDING_COUNT 32u
+#define VT_NIR_RT_DESCRIPTOR_SLOT(set, binding) \
+   ((set) * VT_NIR_RT_DESCRIPTOR_BINDING_COUNT + (binding))
 
 enum vt_nir_rt_descriptor_record {
    VT_NIR_RT_DESCRIPTOR_RECORD_TYPE = 0,

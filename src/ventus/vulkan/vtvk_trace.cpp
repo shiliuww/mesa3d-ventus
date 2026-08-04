@@ -138,6 +138,10 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.per_lane_scratch_size = pipeline->per_lane_scratch_size;
    trace.continuation_frame_size = pipeline->continuation_frame_size;
    trace.max_ray_recursion_depth = pipeline->max_ray_recursion_depth;
+   trace.execution_profile = pipeline->rt_execution_profile;
+   trace.stage_role = pipeline->rt_stage_role;
+   trace.state_descriptor_set = pipeline->rt_state_descriptor_set;
+   trace.state_descriptor_binding = pipeline->rt_state_descriptor_binding;
    trace.kernel_path = pipeline->generated_kernel_path;
    trace.kernel_entry = pipeline->generated_kernel_entry;
    trace.resume_kernel_paths = pipeline->resume_kernel_paths;
@@ -147,6 +151,7 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.callback_kernel_entries = pipeline->callback_kernel_entries;
    trace.callback_kernel_groups = pipeline->callback_kernel_groups;
    trace.callback_kernel_stages = pipeline->callback_kernel_stages;
+   trace.callback_kernel_lds_sizes = pipeline->callback_kernel_lds_sizes;
    trace.callback_kernel_count = pipeline->callback_kernel_count;
    trace.descriptors = descriptors.data();
    trace.descriptor_count = descriptors.size();

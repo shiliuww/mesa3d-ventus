@@ -8,6 +8,8 @@
 #include "compiler/glsl_types.h"
 #include "nir/nir_deref.h"
 
+#include <limits.h>
+
 #define VT_RT_MAX_PAYLOAD_LOCATIONS 32
 
 struct vt_payload_location {
@@ -194,6 +196,42 @@ build_payload_location_map(nir_shader *shader, nir_variable_mode modes)
 
    assign_payload_location_offsets(&map);
    return map;
+}
+
+bool
+vt_nir_rt_compute_pipeline_payload_size(nir_shader **shaders,
+                                        unsigned shader_count,
+                                        uint32_t *payload_size_bytes)
+{
+   if (!payload_size_bytes)
+      return false;
+
+   uint64_t end = 0;
+   for (unsigned s = 0; s < shader_count; ++s) {
+      nir_shader *shader = shaders[s];
+      if (!shader)
+         continue;
+
+      const nir_variable_mode payload_modes =
+         nir_var_function_temp | nir_var_shader_call_data | nir_var_shader_temp;
+      struct vt_payload_location_map map =
+         build_payload_location_map(shader, payload_modes);
+      for (uint32_t i = 0; i < map.count; ++i) {
+         const struct vt_payload_location *entry = &map.entries[i];
+         const uint64_t location_offset =
+            (uint64_t)entry->location * VT_RT_ABI_ALIGNMENT_BYTES;
+         const uint64_t entry_end = location_offset + entry->size;
+         if (entry_end > UINT32_MAX)
+            return false;
+         end = MAX2(end, entry_end);
+      }
+   }
+
+   if (end > UINT32_MAX - (VT_RT_ABI_ALIGNMENT_BYTES - 1))
+      return false;
+   *payload_size_bytes = ALIGN_POT((uint32_t)end,
+                                   VT_RT_ABI_ALIGNMENT_BYTES);
+   return true;
 }
 
 static uint32_t
@@ -516,21 +554,15 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_ignore_ray_intersection:
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
-                                nir_imm_false(b));
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
-                                nir_imm_true(b));
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
-                                nir_imm_false(b));
+      vt_nir_store_control_word(b, config, layout,
+                                VT_RT_CONTROL_CALLBACK_DECISION,
+                                nir_imm_int(b, VT_RT_CALLBACK_IGNORE));
       nir_instr_remove(&intrin->instr);
       return true;
    case nir_intrinsic_terminate_ray:
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
-                                nir_imm_true(b));
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
-                                nir_imm_false(b));
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
-                                nir_imm_true(b));
+      vt_nir_store_control_word(b, config, layout,
+                                VT_RT_CONTROL_CALLBACK_DECISION,
+                                nir_imm_int(b, VT_RT_CALLBACK_TERMINATE));
       nir_instr_remove(&intrin->instr);
       return true;
    case nir_intrinsic_report_ray_intersection: {
@@ -547,15 +579,16 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          nir_iand(b, nir_flt(b, hit_t, current_tmax),
                   nir_fge(b, hit_t, tmin));
 
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
-                                accepted);
-      vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
-                                nir_inot(b, accepted));
+      vt_nir_store_control_word(b, config, layout,
+                                VT_RT_CONTROL_CALLBACK_DECISION,
+                                nir_bcsel(b, accepted,
+                                          nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                                          nir_imm_int(b, VT_RT_CALLBACK_IGNORE)));
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_STATUS,
                                              nir_bcsel(b, accepted,
-                                                       nir_imm_int(b, VT_RT_STATUS_HIT),
-                                                       nir_imm_int(b, VT_RT_STATUS_IDLE)));
+                                                       nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
+                                                       nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID)));
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_HIT_T, hit_t);
       vt_nir_store_candidate_hit_record_word(b, config, layout,

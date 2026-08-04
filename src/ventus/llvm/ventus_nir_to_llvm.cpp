@@ -115,6 +115,7 @@ public:
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")),
         globalRtWavefront(options && options->global_rt_wavefront),
         globalRtCompactResume(options && options->global_rt_compact_resume),
+        privateBaseBytes(options ? options->private_base_bytes : 0),
         entryPointName(options && options->entry_point_name ?
                        options->entry_point_name : ""),
         entryPointIsKernel(options && options->entry_point_is_kernel) {}
@@ -198,6 +199,7 @@ private:
    bool debugLowering;
    bool globalRtWavefront;
    bool globalRtCompactResume;
+   uint32_t privateBaseBytes;
    std::string entryPointName;
    bool entryPointIsKernel;
    bool translationFailed = false;
@@ -213,6 +215,8 @@ private:
    std::vector<BasicBlock *> continueTargets;
    BasicBlock *returnTarget = nullptr;
    Value *raygenLaunchId[3] = {nullptr, nullptr, nullptr};
+   AllocaInst *privateFrame = nullptr;
+   unsigned privateFrameNextWord = 0;
 
    static bool envEnabled(const char *name)
    {
@@ -236,6 +240,8 @@ private:
       raygenLaunchId[1] = nullptr;
       raygenLaunchId[2] = nullptr;
       translationFailed = false;
+      privateFrame = nullptr;
+      privateFrameNextWord = 0;
    }
 
    bool instructionUsesUnsupportedDef(nir_instr *instr) const
@@ -371,8 +377,7 @@ private:
    Value *rtSlotOffset(enum vt_rt_slot_word word)
    {
       return ConstantInt::get(i32,
-                              VT_RT_ABI_PDS_BASE_BYTES +
-                                 word * VT_RT_ABI_WORD_BYTES);
+                              word * VT_RT_ABI_WORD_BYTES);
    }
 
    Value *loadI32PrivateSlot(enum vt_rt_slot_word word)
@@ -499,9 +504,25 @@ private:
       if (noopRtIntrinsics || shader->info.stage != MESA_SHADER_RAYGEN)
          return;
 
-      for (unsigned i = 0; i < 3; ++i) {
-         raygenLaunchId[i] = primaryDispatchPixelComponent(i);
-      }
+      /* The bridge dispatches raygen as one packed physical X dimension so a
+       * warp may cross logical image-row boundaries.  Recover Vulkan's
+       * LaunchIDEXT here, without changing the standard OpenCL interpretation
+       * of physical x/y/z IDs elsewhere in the compiler. */
+      Value *linear = primaryDispatchPixelComponent(0);
+      Value *width = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH);
+      Value *height = dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT);
+      /* Zero-sized Vulkan launches are guarded out below.  Keep the entry
+       * block defined while constructing that guard. */
+      Value *safeWidth = builder.CreateSelect(
+         builder.CreateICmpEQ(width, ConstantInt::get(i32, 0)),
+         ConstantInt::get(i32, 1), width);
+      Value *safeHeight = builder.CreateSelect(
+         builder.CreateICmpEQ(height, ConstantInt::get(i32, 0)),
+         ConstantInt::get(i32, 1), height);
+      Value *row = builder.CreateUDiv(linear, safeWidth);
+      raygenLaunchId[0] = builder.CreateURem(linear, safeWidth);
+      raygenLaunchId[1] = builder.CreateURem(row, safeHeight);
+      raygenLaunchId[2] = builder.CreateUDiv(row, safeHeight);
 
       if (!globalRtWavefront) {
          storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
@@ -719,20 +740,54 @@ private:
          return std::max(4u, (bytes + 3u) / 4u);
       };
 
+      std::vector<nir_variable *> vars;
+      auto collectVar = [&](nir_variable *var) {
+         if (!var || variables.count(var))
+            return;
+         vars.push_back(var);
+      };
+      nir_foreach_variable_in_shader(var, shader)
+         collectVar(var);
+      foreach_list_typed(nir_variable, var, node, &impl->locals)
+         collectVar(var);
+
+      /* For Megakernel, reserve the fixed RT header and linked payload in the
+       * same private frame before LLVM's stack-frame lowering sees allocas.
+       * A single backing alloca gives deterministic offsets; independent
+       * allocas cannot guarantee that a padding alloca stays at offset zero. */
+      if (privateBaseBytes) {
+         uint64_t words = (uint64_t(privateBaseBytes) + 3u) / 4u;
+         for (nir_variable *var : vars)
+            words += storageWords(var->type);
+         if (words > UINT32_MAX)
+            words = UINT32_MAX;
+         privateFrame = entryAlloca(ArrayType::get(i32, (unsigned)words),
+                                    "ventus.private.frame", Align(16));
+         privateFrameNextWord = (privateBaseBytes + 3u) / 4u;
+      }
+
       auto allocVar = [&](nir_variable *var) {
          if (!var || variables.count(var))
             return;
-         AllocaInst *alloca =
-            builder.CreateAlloca(ArrayType::get(i32, storageWords(var->type)), nullptr,
-                                 var->name ? var->name : "nir.var");
-         alloca->setAlignment(Align(16));
-         variables[var] = alloca;
+         const unsigned words = storageWords(var->type);
+         if (privateFrame) {
+            Value *indices[] = {ConstantInt::get(i32, 0),
+                                ConstantInt::get(i32, privateFrameNextWord)};
+            Value *ptr = builder.CreateInBoundsGEP(
+               privateFrame->getAllocatedType(), privateFrame, indices,
+               var->name ? var->name : "nir.var");
+            privateFrameNextWord += words;
+            variables[var] = ptr;
+         } else {
+            AllocaInst *alloca =
+               builder.CreateAlloca(ArrayType::get(i32, words), nullptr,
+                                    var->name ? var->name : "nir.var");
+            alloca->setAlignment(Align(16));
+            variables[var] = alloca;
+         }
       };
 
-      nir_foreach_variable_in_shader(var, shader)
-         allocVar(var);
-
-      foreach_list_typed(nir_variable, var, node, &impl->locals)
+      for (nir_variable *var : vars)
          allocVar(var);
    }
 
@@ -1269,8 +1324,11 @@ private:
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
          coord && texture_var && sampler_var &&
-         texture_var->data.descriptor_set == 0 &&
-         sampler_var->data.descriptor_set == 0 &&
+         texture_var->data.descriptor_set < VT_NIR_RT_DESCRIPTOR_SET_COUNT &&
+         sampler_var->data.descriptor_set < VT_NIR_RT_DESCRIPTOR_SET_COUNT &&
+         texture_var->data.binding < VT_NIR_RT_DESCRIPTOR_BINDING_COUNT &&
+         sampler_var->data.binding < VT_NIR_RT_DESCRIPTOR_BINDING_COUNT &&
+         texture_var->data.descriptor_set == sampler_var->data.descriptor_set &&
          texture_var->data.binding == sampler_var->data.binding;
       if (!supported) {
          if (debugLowering)
@@ -1285,7 +1343,9 @@ private:
        * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
        * sampler derefs resolve through one software descriptor record, just
        * as RADV first resolves them to its hardware descriptor pair. */
-      Value *binding = ConstantInt::get(i32, texture_var->data.binding);
+      Value *binding = ConstantInt::get(
+         i32, VT_NIR_RT_DESCRIPTOR_SLOT(texture_var->data.descriptor_set,
+                                         texture_var->data.binding));
       Value *base = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
       Value *format = descriptorRecordI32(
@@ -1779,7 +1839,9 @@ private:
          return rayLaunchSize();
       }
       case nir_intrinsic_vulkan_resource_index: {
-         return ConstantInt::get(i32, nir_intrinsic_binding(intrin));
+         return ConstantInt::get(
+            i32, VT_NIR_RT_DESCRIPTOR_SLOT(nir_intrinsic_desc_set(intrin),
+                                            nir_intrinsic_binding(intrin)));
       }
       case nir_intrinsic_vulkan_resource_reindex: {
          return builder.CreateAdd(asInt32(value(intrin->src[0])),

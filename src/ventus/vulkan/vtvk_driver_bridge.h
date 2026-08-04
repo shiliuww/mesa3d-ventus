@@ -7,6 +7,7 @@
 #define VTVK_DRIVER_BRIDGE_H
 
 #include "vtvk_private.h"
+#include <ventus/vulkan/ventus_rt_profile.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,6 +109,10 @@ struct vtvk_driver_trace_rays_info {
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
    uint32_t max_ray_recursion_depth;
+   VkVentusRtExecutionProfile execution_profile;
+   VkVentusRtStageRole stage_role;
+   uint32_t state_descriptor_set;
+   uint32_t state_descriptor_binding;
    const char *kernel_path;
    uint64_t kernel_entry;
    const char *const *resume_kernel_paths;
@@ -117,6 +122,7 @@ struct vtvk_driver_trace_rays_info {
    const uint64_t *callback_kernel_entries;
    const uint32_t *callback_kernel_groups;
    const uint32_t *callback_kernel_stages;
+   const uint32_t *callback_kernel_lds_sizes;
    uint32_t callback_kernel_count;
    const struct vtvk_rt_descriptor_source *descriptors;
    uint32_t descriptor_count;

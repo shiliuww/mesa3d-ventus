@@ -8,9 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <elf.h>
 #include <inttypes.h>
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,10 +25,39 @@
 
 static_assert(VENTUS_RT_RESIDENT_WARPS > 0,
               "Ventus RT requires at least one resident warp");
+static_assert(VTVK_MAX_BOUND_DESCRIPTOR_SETS ==
+                 VT_NIR_RT_DESCRIPTOR_SET_COUNT &&
+              VTVK_MAX_DESCRIPTOR_BINDINGS ==
+                 VT_NIR_RT_DESCRIPTOR_BINDING_COUNT,
+              "Vulkan command-buffer and RT descriptor ABI limits differ");
 
 static constexpr uint64_t vtvk_rt_resident_warps =
    VENTUS_RT_RESIDENT_WARPS;
 static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
+static constexpr uint64_t vtvk_ventus_resource_alignment = 128;
+static constexpr uint32_t vtvk_ventus_kernel_resource_version = 3;
+
+/* This is the wire format emitted by the Ventus LLVM backend in
+ * .ventus.resource.<entry>.  Do not infer the private frame from NIR alone:
+ * register allocation can create extra addrspace(5) spill slots after NIR has
+ * been lowered. */
+struct vtvk_ventus_kernel_resource_v3 {
+   uint32_t version;
+   uint32_t flags;
+   uint64_t vgpr_used;
+   uint64_t sgpr_used;
+   uint64_t lds_static_bytes;
+   uint64_t pds_static_bytes;
+   uint64_t lds_stack_peak_bytes;
+   uint64_t pds_stack_peak_bytes;
+};
+
+static_assert(sizeof(struct vtvk_ventus_kernel_resource_v3) == 56,
+              "Ventus LLVM resource ABI mismatch");
+
+enum vtvk_ventus_kernel_resource_flags : uint32_t {
+   VTVK_VENTUS_RESOURCE_STACK_PEAK_UNAVAILABLE = 1u << 4,
+};
 
 static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
               VT_NIR_RT_DESCRIPTOR_RECORD_SIZE,
@@ -232,6 +263,184 @@ vtvk_bridge_checked_u32(const char *label, uint64_t value, uint32_t *out)
    if (!vtvk_bridge_require_rv32_range(label, value, 1))
       return false;
    *out = (uint32_t)value;
+   return true;
+}
+
+static bool
+vtvk_bridge_range_in_file(size_t file_size, uint64_t offset, uint64_t size)
+{
+   return offset <= file_size && size <= file_size - offset;
+}
+
+static bool
+vtvk_bridge_read_file(const char *path, std::vector<uint8_t> *bytes,
+                      std::string *error)
+{
+   FILE *file = fopen(path, "rb");
+   if (!file) {
+      *error = "cannot open ELF";
+      return false;
+   }
+
+   bool ok = false;
+   long end = -1;
+   if (fseek(file, 0, SEEK_END) == 0)
+      end = ftell(file);
+   if (end >= 0 && (uintmax_t)end <= SIZE_MAX &&
+       fseek(file, 0, SEEK_SET) == 0) {
+      bytes->resize((size_t)end);
+      ok = bytes->empty() ||
+           fread(bytes->data(), 1, bytes->size(), file) == bytes->size();
+   }
+   if (fclose(file) != 0)
+      ok = false;
+   if (!ok)
+      *error = "cannot read ELF";
+   return ok;
+}
+
+static bool
+vtvk_bridge_section_name_matches(const std::vector<uint8_t> &bytes,
+                                 uint64_t names_offset,
+                                 uint64_t names_size,
+                                 uint32_t name_offset,
+                                 const char *wanted)
+{
+   if (name_offset >= names_size ||
+       !vtvk_bridge_range_in_file(bytes.size(), names_offset, names_size))
+      return false;
+
+   const char *name = (const char *)bytes.data() + names_offset + name_offset;
+   const size_t available = (size_t)(names_size - name_offset);
+   return memchr(name, '\0', available) && strcmp(name, wanted) == 0;
+}
+
+template <typename ElfEhdr, typename ElfShdr>
+static bool
+vtvk_bridge_extract_elf_section(const std::vector<uint8_t> &bytes,
+                                const char *section_name,
+                                const uint8_t **section_data,
+                                size_t *section_size,
+                                std::string *error)
+{
+   ElfEhdr header = {};
+   if (bytes.size() < sizeof(header)) {
+      *error = "ELF header is truncated";
+      return false;
+   }
+   memcpy(&header, bytes.data(), sizeof(header));
+   if (!header.e_shnum || header.e_shentsize < sizeof(ElfShdr) ||
+       header.e_shstrndx >= header.e_shnum ||
+       !vtvk_bridge_range_in_file(bytes.size(), header.e_shoff,
+                                  (uint64_t)header.e_shentsize * header.e_shnum)) {
+      *error = "ELF section table is invalid";
+      return false;
+   }
+
+   ElfShdr string_table = {};
+   const uint64_t string_header_offset = header.e_shoff +
+      (uint64_t)header.e_shentsize * header.e_shstrndx;
+   memcpy(&string_table, bytes.data() + string_header_offset,
+          sizeof(string_table));
+   if (!vtvk_bridge_range_in_file(bytes.size(), string_table.sh_offset,
+                                  string_table.sh_size)) {
+      *error = "ELF section-name table is invalid";
+      return false;
+   }
+
+   for (uint32_t i = 0; i < header.e_shnum; ++i) {
+      ElfShdr section = {};
+      const uint64_t section_header_offset = header.e_shoff +
+         (uint64_t)header.e_shentsize * i;
+      memcpy(&section, bytes.data() + section_header_offset, sizeof(section));
+      if (!vtvk_bridge_section_name_matches(bytes, string_table.sh_offset,
+                                            string_table.sh_size,
+                                            section.sh_name, section_name))
+         continue;
+      if (!vtvk_bridge_range_in_file(bytes.size(), section.sh_offset,
+                                     section.sh_size)) {
+         *error = "ELF resource section is truncated";
+         return false;
+      }
+      *section_data = bytes.data() + section.sh_offset;
+      *section_size = (size_t)section.sh_size;
+      return true;
+   }
+
+   *error = std::string("missing ELF section '") + section_name + "'";
+   return false;
+}
+
+static bool
+vtvk_bridge_read_kernel_resource(const char *kernel_path,
+                                 uint64_t *pds_frame_bytes,
+                                 std::string *error)
+{
+   std::vector<uint8_t> bytes;
+   if (!kernel_path || !kernel_path[0] || !pds_frame_bytes || !error) {
+      if (error)
+         *error = "invalid resource parse input";
+      return false;
+   }
+   if (!vtvk_bridge_read_file(kernel_path, &bytes, error))
+      return false;
+   if (bytes.size() < EI_NIDENT || memcmp(bytes.data(), ELFMAG, SELFMAG) != 0 ||
+       bytes[EI_DATA] != ELFDATA2LSB) {
+      *error = "not a little-endian ELF";
+      return false;
+   }
+
+   const uint8_t *resource_data = NULL;
+   size_t resource_size = 0;
+   const char *resource_section = ".ventus.resource.main";
+   bool found = false;
+   switch (bytes[EI_CLASS]) {
+   case ELFCLASS32:
+      found = vtvk_bridge_extract_elf_section<Elf32_Ehdr, Elf32_Shdr>(
+         bytes, resource_section, &resource_data, &resource_size, error);
+      break;
+   case ELFCLASS64:
+      found = vtvk_bridge_extract_elf_section<Elf64_Ehdr, Elf64_Shdr>(
+         bytes, resource_section, &resource_data, &resource_size, error);
+      break;
+   default:
+      *error = "unsupported ELF class";
+      return false;
+   }
+   if (!found)
+      return false;
+   if (resource_size != sizeof(struct vtvk_ventus_kernel_resource_v3)) {
+      *error = "Ventus resource section has unexpected size";
+      return false;
+   }
+
+   struct vtvk_ventus_kernel_resource_v3 resource = {};
+   memcpy(&resource, resource_data, sizeof(resource));
+   if (resource.version != vtvk_ventus_kernel_resource_version) {
+      *error = "unsupported Ventus resource version";
+      return false;
+   }
+   if ((resource.flags & VTVK_VENTUS_RESOURCE_STACK_PEAK_UNAVAILABLE) ||
+       resource.pds_stack_peak_bytes == UINT64_MAX) {
+      *error = "Ventus PDS stack peak is unavailable";
+      return false;
+   }
+
+   const uint64_t alignment = vtvk_ventus_resource_alignment;
+   if (resource.pds_static_bytes > UINT64_MAX - (alignment - 1) ||
+       resource.pds_stack_peak_bytes > UINT64_MAX - (alignment - 1)) {
+      *error = "Ventus PDS resource alignment overflows";
+      return false;
+   }
+   const uint64_t static_bytes =
+      vtvk_bridge_align_u64(resource.pds_static_bytes, alignment);
+   const uint64_t stack_bytes =
+      vtvk_bridge_align_u64(resource.pds_stack_peak_bytes, alignment);
+   if (static_bytes > UINT64_MAX - stack_bytes) {
+      *error = "Ventus PDS frame size overflows";
+      return false;
+   }
+   *pds_frame_bytes = static_bytes + stack_bytes;
    return true;
 }
 
@@ -626,10 +835,11 @@ vtvk_driver_upload_sbt_region(struct vtvk_driver_api *api,
 static uint32_t
 vtvk_driver_descriptor_table_slots(const struct vtvk_driver_trace_rays_info *info)
 {
-   uint32_t slots = 5;
-   for (uint32_t i = 0; i < info->descriptor_count; i++)
-      slots = std::max(slots, info->descriptors[i].binding + 1);
-   return slots;
+   (void)info;
+   /* NIR resource indices use a fixed set*binding flattening.  Upload the
+    * complete table so a valid set-1 staged-dispatch path-state descriptor has the
+    * same slot number in LLVM and the bridge. */
+   return VTVK_RT_DESCRIPTOR_SLOT_COUNT;
 }
 
 static bool
@@ -799,22 +1009,37 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_rt_dispatch_args args = {};
    std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
    std::vector<uint8_t> pds_image;
-   uint64_t raygen_wg_x = DIV_ROUND_UP(info->width, 32);
-   uint64_t raygen_wg_y = MAX2(info->height, 1u);
-   uint64_t raygen_wg_z = MAX2(info->depth, 1u);
+   /* Vulkan raygen is a logical 3-D launch, but the RT execution ABI packs
+    * those logical invocations into a 1-D sequence of physical lanes.  This
+    * is deliberately distinct from an OpenCL workgroup launch: lane 16 of a
+    * 32-lane warp for a 16-wide image is the first pixel of the next row,
+    * rather than an inactive tail lane.  LLVM reconstructs the Vulkan launch
+    * ID from this physical linear index for raygen shaders. */
+   const uint64_t raygen_invocation_count = (uint64_t)info->width *
+                                             info->height * info->depth;
+   uint32_t raygen_global_x = 0;
+   if (!vtvk_bridge_checked_u32("packed raygen invocation count",
+                                raygen_invocation_count, &raygen_global_x)) {
+      vtvk_driver_close(&driver);
+      bridge_failed = true;
+      return false;
+   }
+   uint64_t raygen_wg_x = DIV_ROUND_UP(raygen_invocation_count, 32);
+   const uint64_t raygen_wg_y = 1;
+   const uint64_t raygen_wg_z = 1;
    uint64_t pds_resident_lanes =
       vtvk_rt_resident_warps * vtvk_rt_lanes_per_warp;
-   const bool wavefront_mirror = vtvk_bridge_env_enabled("VENTUS_VK_RT_WAVEFRONT_MIRROR");
-   const bool wavefront_global = vtvk_bridge_env_enabled("VENTUS_VK_RT_WAVEFRONT_GLOBAL");
-   const bool wavefront_profile = wavefront_mirror || wavefront_global;
-   uint64_t pds_size =
-      wavefront_global ? 0 :
-      vtvk_bridge_align_u64(MAX2((uint64_t)info->per_lane_scratch_size *
-                                    pds_resident_lanes,
-                                 (uint64_t)64 * 1024),
-                            4096);
-   uint64_t continuation_size = wavefront_global ? 0 :
-      (uint64_t)info->continuation_frame_size * pds_resident_lanes;
+   const bool staged_dispatch_profile =
+      info->execution_profile == VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
+   /* The pipeline profile is the lower-path selector.  The ray-ref queue and
+    * CPS worker protocol are strictly Q2 legacy; ordinary megakernels do not
+    * allocate or interpret any of their state. */
+   const bool wavefront_global = staged_dispatch_profile;
+   const bool legacy_wavefront = staged_dispatch_profile;
+   const bool legacy_cps_mirror = false;
+   uint64_t pds_size = 0;
+   uint64_t pds_per_lane = 0;
+   uint64_t continuation_size = 0;
    const bool rv64 = vtvk_bridge_env_enabled("VENTUS_VK_RT_RV64");
    std::vector<uint8_t> metadata(rv64 ? (size_t)VENTUS_KNL64_MAX_SIZE :
                                        (size_t)VENTUS_KNL32_MAX_SIZE, 0);
@@ -835,6 +1060,63 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
+   if (!wavefront_global) {
+      std::string resource_error;
+      uint64_t llvm_private_frame = 0;
+      if (kernel_path && kernel_path[0]) {
+         if (!vtvk_bridge_read_kernel_resource(kernel_path,
+                                                &llvm_private_frame,
+                                                &resource_error)) {
+            /* Older delivered ELFs contain the object-local .ventus.resobj
+             * section rather than LLD's final .ventus.resource.main summary.
+             * Keep those kernels runnable with the pre-existing NIR ABI
+             * frame, but make the missing post-RA spill bound unambiguous. */
+            mesa_logw("ventus-vk: RT private frame metadata unavailable for "
+                      "%s: %s; using unverified NIR ABI frame=%u",
+                      kernel_path, resource_error.c_str(),
+                      info->per_lane_scratch_size);
+            llvm_private_frame = 0;
+         } else {
+            /* Megakernel v3 places the fixed RT header at PDS offset zero and
+             * reserves the linked pipeline payload before LLVM's private
+             * frame.  The resource metadata already describes the complete
+             * post-RA private frame, so there is no legacy 4096-byte prefix
+             * restriction here. */
+         }
+      } else {
+         /* No launch follows this path, but retain staging-only diagnostics
+          * for users that inspect bridge uploads without an emitted ELF. */
+         mesa_logw("ventus-vk: no raygen ELF; PDS frame is unverified and the "
+                   "bridge will not execute a kernel");
+      }
+
+      pds_per_lane = std::max<uint64_t>(llvm_private_frame,
+                                        info->per_lane_scratch_size);
+      if (!pds_per_lane || pds_per_lane > UINT32_MAX ||
+          (pds_per_lane > UINT64_MAX / pds_resident_lanes)) {
+         mesa_loge("ventus-vk: invalid per-lane PDS frame=%" PRIu64,
+                   pds_per_lane);
+         goto out;
+      }
+      const uint64_t pds_pool_bytes = pds_per_lane * pds_resident_lanes;
+      const uint64_t pds_minimum = 64 * 1024;
+      const uint64_t pds_requested = std::max(pds_pool_bytes, pds_minimum);
+      if (pds_requested > UINT64_MAX - 4095) {
+         mesa_loge("ventus-vk: PDS allocation size overflows");
+         goto out;
+      }
+      pds_size = vtvk_bridge_align_u64(pds_requested, 4096);
+   }
+
+   if (legacy_cps_mirror) {
+      if (info->continuation_frame_size > UINT64_MAX / pds_resident_lanes) {
+         mesa_loge("ventus-vk: legacy CPS allocation size overflows");
+         goto out;
+      }
+      continuation_size =
+         (uint64_t)info->continuation_frame_size * pds_resident_lanes;
+   }
+
    if (wavefront_global &&
        (!vtvk_driver_resolve(driver.lib, "vt_rt_consume_global",
                              (void **)&driver.vt_rt_consume_global) ||
@@ -848,31 +1130,49 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
 
    if (info->descriptor_count) {
       uint32_t slots = vtvk_driver_descriptor_table_slots(info);
+      bool staged_state_buffer_found = !staged_dispatch_profile;
       descriptor_table.resize(slots);
-      for (uint32_t binding = 0; binding < slots; binding++) {
-         descriptor_table[binding].set = 0;
-         descriptor_table[binding].binding = binding;
+      for (uint32_t set = 0; set < VTVK_MAX_BOUND_DESCRIPTOR_SETS; ++set) {
+         for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
+              ++binding) {
+            const uint32_t slot = VT_NIR_RT_DESCRIPTOR_SLOT(set, binding);
+            descriptor_table[slot].set = set;
+            descriptor_table[slot].binding = binding;
+         }
       }
 
       for (uint32_t i = 0; i < info->descriptor_count; i++) {
          const struct vtvk_rt_descriptor_source *src = &info->descriptors[i];
-         if (src->set != 0 || src->binding >= slots) {
+         if (src->set >= VTVK_MAX_BOUND_DESCRIPTOR_SETS ||
+             src->binding >= VTVK_MAX_DESCRIPTOR_BINDINGS) {
             mesa_loge("ventus-vk: unsupported RT descriptor set=%u binding=%u",
                       src->set, src->binding);
             goto out;
          }
+         const uint32_t slot = VT_NIR_RT_DESCRIPTOR_SLOT(src->set,
+                                                           src->binding);
+         if (staged_dispatch_profile &&
+             src->set == info->state_descriptor_set &&
+             src->binding == info->state_descriptor_binding &&
+             src->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            staged_state_buffer_found = true;
          if (!vtvk_driver_upload_descriptor(&driver, src,
-                                            &descriptor_table[src->binding],
+                                            &descriptor_table[slot],
                                             &uploads))
             goto out;
       }
 
-      if (slots > 0)
-         tlas_dev_addr = descriptor_table[0].device_addr;
-      if (slots > 1)
-         image_dev_addr = descriptor_table[1].device_addr;
-      if (slots > 2)
-         camera_dev_addr = descriptor_table[2].device_addr;
+      if (!staged_state_buffer_found) {
+         mesa_loge("ventus-vk: staged-dispatch requires path-state storage buffer "
+                   "at set=%u binding=%u",
+                   info->state_descriptor_set,
+                   info->state_descriptor_binding);
+         goto out;
+      }
+
+      tlas_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 0)].device_addr;
+      image_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 1)].device_addr;
+      camera_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 2)].device_addr;
 
       if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
                                   descriptor_table.size() *
@@ -882,6 +1182,10 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          goto out;
       }
    } else {
+      if (staged_dispatch_profile) {
+         mesa_loge("ventus-vk: staged-dispatch requires a bound path-state storage buffer");
+         goto out;
+      }
       if (!vtvk_driver_upload_as(&driver, info->tlas, &uploads)) {
          mesa_loge("ventus-vk: driver bridge failed to upload TLAS");
          goto out;
@@ -939,11 +1243,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.image_format = info->image_format;
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;
-   args.scratch_stride = wavefront_global ? 0 : info->per_lane_scratch_size;
-   args.continuation_frame_stride = info->continuation_frame_size;
-   args.continuation_context_count = wavefront_global ? 0 : pds_resident_lanes;
-   args.submission_mailbox_stride = wavefront_profile ? mailbox_stride : 0;
-   args.submission_mailbox_generation = wavefront_profile ? 1 : 0;
+   args.scratch_stride = wavefront_global ? 0 : pds_per_lane;
+   args.continuation_frame_stride = legacy_cps_mirror ?
+      info->continuation_frame_size : 0;
+   args.continuation_context_count = legacy_cps_mirror ? pds_resident_lanes : 0;
+   args.submission_mailbox_stride = legacy_wavefront ? mailbox_stride : 0;
+   args.submission_mailbox_generation = legacy_wavefront ? 1 : 0;
    args.descriptor_table_addr = descriptor_table_dev_addr;
    args.descriptor_count = descriptor_table.size();
    args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
@@ -957,7 +1262,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    }
 
    kernel_entry = info->kernel_entry ? info->kernel_entry : 0x80000000ull;
-   work_dim = info->depth > 1 ? 3 : info->height > 1 ? 2 : 1;
+   /* The hardware launch is packed in X; the original Vulkan dimensions are
+    * carried in dispatch args and restored by the raygen LLVM lowering. */
+   work_dim = 1;
    if (!rv64) {
       if (!vtvk_bridge_require_rv32_range("TLAS", tlas_dev_addr, 1) ||
           !vtvk_bridge_require_rv32_range("storage image", image_dev_addr,
@@ -998,12 +1305,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
              sizeof(args_dev_addr));
       memcpy(metadata.data() + VENTUS_KNL64_WORK_DIM, &work_dim,
              sizeof(work_dim));
-      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_X, &info->width,
-             sizeof(info->width));
-      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Y, &info->height,
-             sizeof(info->height));
-      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Z, &info->depth,
-             sizeof(info->depth));
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_X, &raygen_global_x,
+             sizeof(raygen_global_x));
+      const uint32_t one = 1;
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Y, &one, sizeof(one));
+      memcpy(metadata.data() + VENTUS_KNL64_GL_SIZE_Z, &one, sizeof(one));
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL64_LC_SIZE_X, &local_size_x,
              sizeof(local_size_x));
@@ -1017,12 +1323,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
       memcpy(metadata.data() + VENTUS_KNL32_ARG_BASE, &args32, sizeof(args32));
       memcpy(metadata.data() + VENTUS_KNL32_WORK_DIM, &work_dim, sizeof(work_dim));
-      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_X, &info->width,
-             sizeof(info->width));
-      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Y, &info->height,
-             sizeof(info->height));
-      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Z, &info->depth,
-             sizeof(info->depth));
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_X, &raygen_global_x,
+             sizeof(raygen_global_x));
+      const uint32_t one = 1;
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Y, &one, sizeof(one));
+      memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Z, &one, sizeof(one));
       memcpy(metadata.data() + VENTUS_KNL32_LC_SIZE_X, &local_size_x,
              sizeof(local_size_x));
    }
@@ -1037,7 +1342,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                        metadata.size()))
       goto out;
 
-   if (!wavefront_global && continuation_size &&
+   if (legacy_cps_mirror && continuation_size &&
        !vtvk_driver_alloc_copy(&driver, NULL, continuation_size,
                                &continuation_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate CPS arena");
@@ -1049,9 +1354,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                        continuation_size))
       goto out;
 
-   /* Both the mirror and PDS-free producer use the same global queue ABI.
-    * Only the latter must not allocate a legacy slot/CPS backing store. */
-   if (wavefront_profile) {
+   /* Both retained legacy modes use the same global ray-ref queue ABI.  The
+    * profile-selected megakernel/staged paths never enter this block. */
+   if (legacy_wavefront) {
       if (info->depth != 1 ||
           !vt_nir_rt_global_queue_capacity(info->width, info->height,
                                             info->max_ray_recursion_depth,
@@ -1165,18 +1470,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       }
    }
 
-   /* The compatibility mirror publishes dense primary records.  The PDS-free
-    * profile has one reusable PRIMARY/shadow/reflection/refraction mailbox
-    * per resident physical lane. */
-   if (wavefront_mirror)
-      mailbox_count = (uint64_t)info->width * info->height *
-                      MAX2(info->depth, 1u);
-
-   if (wavefront_profile && mailbox_count > UINT64_MAX / mailbox_stride) {
+   if (legacy_wavefront && mailbox_count > UINT64_MAX / mailbox_stride) {
       mesa_loge("ventus-vk: wavefront mailbox allocation size overflow");
       goto out;
    }
-   if (wavefront_profile &&
+   if (legacy_wavefront &&
        !vtvk_driver_alloc_copy(&driver, NULL, mailbox_count * mailbox_stride,
                                &mailbox_dev_addr)) {
       mesa_loge("ventus-vk: driver bridge failed to allocate mailbox pool");
@@ -1185,14 +1483,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.submission_mailbox_base = mailbox_dev_addr;
    if (!rv64 &&
        !vtvk_bridge_require_rv32_range("submission mailbox pool", mailbox_dev_addr,
-                                       wavefront_profile ?
+                                       legacy_wavefront ?
                                           mailbox_count * mailbox_stride : 0))
       goto out;
 
    if (!wavefront_global) {
       pds_image.assign(pds_size, 0);
       if (continuation_dev_addr) {
-         const uint64_t header_offset = VT_RT_ABI_PDS_BASE_BYTES +
+         const uint64_t header_offset = VT_RT_ABI_RAY_STATE_BASE_BYTES +
             VT_RT_ABI_CPS_HEADER_BASE_BYTES +
             VT_RT_CPS_FRAME_BASE * VT_RT_ABI_WORD_BYTES;
          const uint64_t aligned = header_offset & ~3ull;
@@ -1252,11 +1550,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.wg_size = 1;
    kernel.metaDataBaseAddr = metadata_dev_addr;
    kernel.ldsSize = 0;
-   kernel.pdsSize = wavefront_global ? 0 : info->per_lane_scratch_size;
+   kernel.pdsSize = wavefront_global ? 0 : pds_per_lane;
    kernel.pdsBaseAddr = pds_dev_addr;
-   kernel.num_thread_global[0] = info->width;
-   kernel.num_thread_global[1] = info->height;
-   kernel.num_thread_global[2] = info->depth;
+   kernel.num_thread_global[0] = raygen_global_x;
+   kernel.num_thread_global[1] = 1;
+   kernel.num_thread_global[2] = 1;
    kernel.num_thread_local[0] = vtvk_rt_lanes_per_warp;
    kernel.num_thread_local[1] = 1;
    kernel.num_thread_local[2] = 1;
@@ -1303,7 +1601,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       auto dispatch_compact = [&](const char *path, uint64_t entry,
                                   const std::vector<uint32_t> &ray_refs,
                                   const char *name,
-                                  uint32_t dispatch_generation) -> bool {
+                                  uint32_t dispatch_generation,
+                                  uint32_t lds_size) -> bool {
          if (ray_refs.empty())
             return true;
 
@@ -1354,6 +1653,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          kernel.num_thread_global[0] = args.global_ray_ref_count;
          kernel.num_thread_global[1] = 1;
          kernel.num_thread_global[2] = 1;
+         kernel.ldsSize = lds_size;
          kernel.kernel_name = name;
          return driver.vt_start(driver.device, &kernel, 0) == 0 &&
                 driver.vt_ready_wait(driver.device, 60 * 60 * 1000) == 0;
@@ -1649,7 +1949,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                   continue;
                if (!dispatch_compact(info->callback_kernel_paths[callback],
                                      info->callback_kernel_entries[callback], refs,
-                                     "ventus_vk_intersection", phase + 1)) {
+                                     "ventus_vk_intersection", phase + 1,
+                                     info->callback_kernel_lds_sizes ?
+                                        info->callback_kernel_lds_sizes[callback] : 0)) {
                   mesa_loge("ventus-vk: global RT intersection callback dispatch failed group=%u",
                             info->callback_kernel_groups[callback]);
                   goto out;
@@ -1680,7 +1982,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                   continue;
                if (!dispatch_compact(info->callback_kernel_paths[callback],
                                      info->callback_kernel_entries[callback], refs,
-                                     "ventus_vk_any_hit", phase + 1)) {
+                                     "ventus_vk_any_hit", phase + 1,
+                                     info->callback_kernel_lds_sizes ?
+                                        info->callback_kernel_lds_sizes[callback] : 0)) {
                   mesa_loge("ventus-vk: global RT any-hit callback dispatch failed group=%u",
                             info->callback_kernel_groups[callback]);
                   goto out;
@@ -1773,7 +2077,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             if (!dispatch_compact(info->resume_kernel_paths[continuation],
                                   info->resume_kernel_entries[continuation],
                                   miss_resume_refs[continuation],
-                                  "ventus_vk_resume_miss", phase + 1)) {
+                                  "ventus_vk_resume_miss", phase + 1, 0)) {
                mesa_loge("ventus-vk: global RT miss resume %u dispatch failed",
                          continuation);
                goto out;
@@ -1785,7 +2089,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                   info->resume_kernel_entries[continuation],
                                   hit_resume_refs[continuation],
                                   "ventus_vk_resume_hit",
-                                  phase + 1)) {
+                                  phase + 1, 0)) {
                mesa_loge("ventus-vk: global RT hit resume %u dispatch failed",
                          continuation);
                goto out;

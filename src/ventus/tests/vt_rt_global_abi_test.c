@@ -28,7 +28,7 @@ main(void)
 
    vt_nir_rt_config_apply_global_cps_layout(&global_config, &abi);
    CHECK(legacy_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes ==
-         VT_RT_ABI_PDS_BASE_BYTES);
+         VT_RT_ABI_RAY_STATE_BASE_BYTES);
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes == 0);
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes ==
          VT_RT_ABI_PAYLOAD_BASE_BYTES);
@@ -106,7 +106,7 @@ main(void)
    CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT == 256);
    CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_GENERATION == 260);
    CHECK(VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE == 264);
-   CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 272);
+   CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 288);
    CHECK(ventus_rt_device_range_fits_u32(0, 1));
    CHECK(ventus_rt_device_range_fits_u32(0xfffffff0ull, 16));
    CHECK(!ventus_rt_device_range_fits_u32(0xfffffff0ull, 17));

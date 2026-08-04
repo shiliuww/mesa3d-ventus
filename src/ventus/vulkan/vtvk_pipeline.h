@@ -2,6 +2,7 @@
 #define VTVK_PIPELINE_H
 
 #include "vtvk_private.h"
+#include <ventus/vulkan/ventus_rt_profile.h>
 
 #include "vk_pipeline.h"
 #include "ventus/compiler/vt_nir.h"
@@ -49,6 +50,9 @@ struct vtvk_pipeline {
    uint64_t *callback_kernel_entries;
    uint32_t *callback_kernel_groups;
    uint32_t *callback_kernel_stages;
+   /* Per-callback workgroup LDS reservation.  This is phase-local scratch,
+    * never a replacement for the global completion/CPS ABI. */
+   uint32_t *callback_kernel_lds_sizes;
    uint32_t callback_kernel_count;
 
    uint8_t *group_handles;
@@ -57,6 +61,10 @@ struct vtvk_pipeline {
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
    uint32_t max_ray_recursion_depth;
+   VkVentusRtExecutionProfile rt_execution_profile;
+   VkVentusRtStageRole rt_stage_role;
+   uint32_t rt_state_descriptor_set;
+   uint32_t rt_state_descriptor_binding;
    bool rt_uses_rv64;
    struct vt_nir_pipeline_scratch_info scratch_info;
 

@@ -325,7 +325,6 @@ vt_nir_build_traversal(nir_builder *b,
       vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
                              raygen->ray_state_base_bytes);
 
-   store_word(b, base, VT_RT_SLOT_STATUS, nir_imm_int(b, VT_RT_STATUS_TRACE_REQUEST));
    store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
    store_word(b, base, VT_RT_SLOT_FLAGS, params->flags);
    store_word(b, base, VT_RT_SLOT_CULL_MASK, params->cull_mask);
@@ -337,6 +336,9 @@ vt_nir_build_traversal(nir_builder *b,
    store_vec3(b, base, VT_RT_SLOT_DIRECTION_X, params->direction);
    store_word(b, base, VT_RT_SLOT_TMAX, params->tmax);
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
+   /* Publish the slot only after its complete ray header is visible. */
+   store_word(b, base, VT_RT_SLOT_STATUS,
+              nir_imm_int(b, VT_RT_SLOT_STATUS_TRACE_REQUEST));
 
    nir_def *status = nir_ventus_rt_traverse(b, base);
    nir_def *raw_hit_t = load_word(b, base, VT_RT_SLOT_HIT_T);
@@ -391,33 +393,9 @@ vt_nir_build_traversal(nir_builder *b,
       candidate_non_opaque_triangle;
    nir_def *hit_record_valid = nir_ior(b, complete_hit, is_candidate);
    nir_def *hit_record_status =
-      nir_bcsel(b, hit_record_valid, nir_imm_int(b, VT_RT_STATUS_HIT),
-                nir_imm_int(b, VT_RT_STATUS_IDLE));
-
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_DONE,
-                             nir_ior(b,
-                                     nir_ieq_imm(b, status,
-                                                VT_RT_TRAVERSAL_COMPLETE_MISS),
-                                     nir_ieq_imm(b, status,
-                                                VT_RT_TRAVERSAL_COMPLETE_HIT)));
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_INCOMPLETE,
-                             nir_ior(b,
-                                     nir_ieq_imm(b, status,
-                                                VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE),
-                                     nir_ieq_imm(b, status,
-                                                VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB)));
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_ACCEPT_HIT,
-                             nir_ieq_imm(b, status,
-                                         VT_RT_TRAVERSAL_COMPLETE_HIT));
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                             VT_RT_CONTROL_SKIP_CLOSEST_HIT, nir_imm_false(b));
+      nir_bcsel(b, hit_record_valid,
+                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
+                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID));
 
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                           VT_RT_HIT_RECORD_STATUS,
@@ -464,7 +442,7 @@ vt_nir_build_traversal(nir_builder *b,
    nir_push_if(b, complete_miss);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_STATUS,
-                                nir_imm_int(b, VT_RT_STATUS_IDLE));
+                                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID));
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 

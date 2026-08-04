@@ -5,6 +5,8 @@
 
 #include "vt_nir.h"
 
+#include <limits.h>
+
 struct vt_nir_rt_abi_layout
 vt_nir_rt_default_abi_layout(void)
 {
@@ -29,11 +31,25 @@ vt_nir_rt_default_abi_layout(void)
 
    layout.payload_base_bytes = VT_RT_ABI_PAYLOAD_BASE_BYTES;
    layout.payload_size_bytes = VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES;
-   layout.region_size_bytes = VT_RT_ABI_REGION_SIZE_BYTES;
-
-   layout.total_size_bytes = VT_RT_ABI_TOTAL_SIZE_BYTES;
+   layout.region_size_bytes = VT_RT_ABI_FIXED_HEADER_SIZE_BYTES;
+   layout.private_base_bytes = layout.region_size_bytes;
+   layout.total_size_bytes = VT_RT_ABI_FIXED_HEADER_SIZE_BYTES;
 
    return layout;
+}
+
+bool
+vt_nir_rt_abi_layout_set_payload_size(struct vt_nir_rt_abi_layout *layout,
+                                      uint32_t payload_size_bytes)
+{
+   if (!layout || payload_size_bytes > UINT32_MAX - layout->payload_base_bytes)
+      return false;
+
+   layout->payload_size_bytes = payload_size_bytes;
+   layout->region_size_bytes = layout->payload_base_bytes + payload_size_bytes;
+   layout->private_base_bytes = layout->region_size_bytes;
+   layout->total_size_bytes = layout->region_size_bytes;
+   return true;
 }
 
 void
@@ -50,7 +66,10 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
    }
 
    for (unsigned i = 0; i < VT_RT_LAYOUT_COUNT; ++i) {
-      config->scratchpad[i].base_bytes = VT_RT_ABI_PDS_BASE_BYTES;
+      /* Megakernel v4: fixed RT state is at PDS logical offset zero.  crt0
+       * initializes TP above total_size_bytes, so LLVM AS5 stack objects do
+       * not overlap this prefix. */
+      config->scratchpad[i].base_bytes = 0;
       config->scratchpad[i].ray_state_base_bytes =
          layout->ray_state_base_bytes;
       config->scratchpad[i].payload_base_bytes =
@@ -65,6 +84,7 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
          layout->hit_attrib_base_bytes;
       config->scratchpad[i].hit_attrib_size_bytes =
          layout->hit_attrib_size_bytes;
+      config->scratchpad[i].private_base_bytes = layout->private_base_bytes;
       config->scratchpad[i].total_size_bytes = layout->total_size_bytes;
       config->scratchpad[i].stride_bytes =
          MAX2(config->scratchpad[i].stride_bytes, layout->total_size_bytes);
@@ -102,6 +122,9 @@ vt_nir_rt_config_apply_global_cps_layout(
          layout->hit_attrib_base_bytes;
       config->scratchpad[i].hit_attrib_size_bytes =
          layout->hit_attrib_size_bytes;
+      /* Global CPS owns its continuation storage; it does not reserve the
+       * Megakernel private-frame prefix. */
+      config->scratchpad[i].private_base_bytes = 0;
       config->scratchpad[i].total_size_bytes = frame_size;
       /* Global CPS is independent from legacy PDS sizing.  CPS lowering
        * grows scratch beyond this static RT region for call spills. */
