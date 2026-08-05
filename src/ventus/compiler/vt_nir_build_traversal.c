@@ -78,14 +78,46 @@ vt_nir_scratchpad_addr(nir_builder *b,
 }
 
 nir_def *
+vt_nir_load_active_level(nir_builder *b,
+                         const struct vt_nir_rt_config *config,
+                         enum vt_rt_shader_layout layout)
+{
+   return nir_ventus_rt_load_slot(
+      b, 1, 32,
+      vt_nir_scratchpad_addr(b, config, layout,
+                             VT_RT_ABI_CPS_HEADER_BASE_BYTES +
+                             VT_RT_CPS_ACTIVE_LEVEL * VT_RT_ABI_WORD_BYTES));
+}
+
+void
+vt_nir_store_active_level(nir_builder *b,
+                          const struct vt_nir_rt_config *config,
+                          enum vt_rt_shader_layout layout,
+                          nir_def *level)
+{
+   nir_ventus_rt_store_slot(
+      b, level,
+      vt_nir_scratchpad_addr(b, config, layout,
+                             VT_RT_ABI_CPS_HEADER_BASE_BYTES +
+                             VT_RT_CPS_ACTIVE_LEVEL * VT_RT_ABI_WORD_BYTES));
+}
+
+nir_def *
 vt_nir_payload_addr(nir_builder *b,
                     const struct vt_nir_rt_config *config,
                     enum vt_rt_shader_layout layout,
                     enum vt_rt_payload_word word)
 {
    const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return vt_nir_scratchpad_addr(b, config, layout,
-                                 sp->payload_base_bytes + word * 4);
+   const uint32_t payload_size =
+      sp->total_size_bytes - sp->payload_spill_size_bytes -
+      sp->payload_base_bytes;
+   nir_def *depth = vt_nir_load_active_level(b, config, layout);
+   nir_def *depth_offset = nir_imul_imm(b, depth, payload_size);
+   return nir_iadd(b,
+                   vt_nir_scratchpad_addr(b, config, layout,
+                                          sp->payload_base_bytes + word * 4),
+                   depth_offset);
 }
 
 nir_def *

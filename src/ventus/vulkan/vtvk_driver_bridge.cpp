@@ -608,6 +608,11 @@ vtvk_driver_relocate_push_constant_addresses(struct vtvk_driver_api *api,
       const uint64_t guest_address = guest_base + host_offset;
       memcpy(snapshot->data() + byte_offset, &guest_address,
              sizeof(guest_address));
+      if (vtvk_bridge_env_enabled("VENTUS_VK_DEBUG_BDA"))
+         mesa_logi("ventus-vk: relocated BDA host=0x%" PRIx64
+                   " -> guest=0x%" PRIx64 " snapshot+%zu size=%" PRIu64,
+                   host_address, guest_address, byte_offset,
+                   (uint64_t)host_size);
    }
 
    return true;
@@ -1409,7 +1414,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           global_completion.size()))
          goto out;
 
-      global_hit_attribute_stride = VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES;
+      global_hit_attribute_stride = info->hit_attribute_size_bytes;
       const uint64_t global_hit_attribute_size =
          (uint64_t)global_queue_capacity * global_hit_attribute_stride;
       if (!vtvk_driver_alloc_copy(&driver, NULL, global_hit_attribute_size,

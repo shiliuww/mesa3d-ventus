@@ -2251,9 +2251,31 @@ private:
             else
                builder.SetInsertPoint(pred);
             incoming = coercePhiIncoming(&nirPhi->def, incoming);
+            if (incoming->getType() != llvmPhi->getType()) {
+               /* NIR carries the bit size, not a scalar LLVM type.  ALU
+                * lowering represents ordinary 32-bit values as either i32
+                * or float depending on the operation, while phiType() uses
+                * the canonical i32 storage type.  Dropping that incoming
+                * edge to undef loses real control-flow values (notably the
+                * positive sqrt branch in intersection shaders). */
+               Type *incomingType = incoming->getType();
+               Type *phiTypeValue = llvmPhi->getType();
+               if (incomingType->isFloatingPointTy() &&
+                   phiTypeValue->isIntegerTy(
+                      incomingType->getPrimitiveSizeInBits())) {
+                  incoming = builder.CreateBitCast(incoming, phiTypeValue,
+                                                   "nir.phi.bits");
+               } else if (incomingType->isIntegerTy() &&
+                          phiTypeValue->isFloatingPointTy() &&
+                          incomingType->getIntegerBitWidth() ==
+                             phiTypeValue->getPrimitiveSizeInBits()) {
+                  incoming = builder.CreateBitCast(incoming, phiTypeValue,
+                                                   "nir.phi.bits");
+               } else {
+                  incoming = UndefValue::get(phiTypeValue);
+               }
+            }
             builder.restoreIP(savedInsertPoint);
-            if (incoming->getType() != llvmPhi->getType())
-               incoming = UndefValue::get(llvmPhi->getType());
             incomings.push_back(
                {pred, phiEdgeBlock(pred, llvmPhi->getParent()), incoming});
          }

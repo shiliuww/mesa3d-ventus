@@ -138,6 +138,23 @@ build_payload_location_probe(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static nir_shader *
+build_push_constant_probe(const nir_shader_compiler_options *options)
+{
+   nir_builder b =
+      nir_builder_init_simple_shader(MESA_SHADER_RAYGEN, options,
+                                     "vt_rt_push_constant_probe");
+
+   nir_def *address = nir_load_push_constant(
+      &b, 1, 64, nir_imm_int(&b, 4), .base = 8, .range = 16);
+   nir_variable *sink =
+      nir_variable_create(b.shader, nir_var_shader_temp,
+                          glsl_uint_type(), "push_constant_sink");
+   nir_store_var(&b, sink, nir_unpack_64_2x32_split_x(&b, address), 0x1);
+
+   return b.shader;
+}
+
 static unsigned
 count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
 {
@@ -224,6 +241,7 @@ main(int argc, char **argv)
       build_abi_probe_terminating_any_hit(&options);
    nir_shader *payload_location_probe =
       build_payload_location_probe(&options);
+   nir_shader *push_constant_probe = build_push_constant_probe(&options);
 
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(abi.control_base_bytes >=
@@ -254,9 +272,9 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 116);
    VT_RT_CHECK(abi.hit_record_base_bytes == 196);
    VT_RT_CHECK(abi.hit_attrib_base_bytes == 276);
-   VT_RT_CHECK(abi.payload_base_bytes == 308);
-   VT_RT_CHECK(abi.region_size_bytes == 308);
-   VT_RT_CHECK(abi.total_size_bytes == 308);
+   VT_RT_CHECK(abi.payload_base_bytes == 276);
+   VT_RT_CHECK(abi.region_size_bytes == 276);
+   VT_RT_CHECK(abi.total_size_bytes == 276);
    VT_RT_CHECK(abi.total_size_bytes == VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
@@ -348,6 +366,17 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
+
+   VT_RT_CHECK(count_intrinsic(push_constant_probe,
+                               nir_intrinsic_load_push_constant) == 1);
+   progress = vt_nir_lower_rt_io_monolithic(push_constant_probe, &config);
+   VT_RT_CHECK(progress);
+   VT_RT_CHECK(count_intrinsic(push_constant_probe,
+                               nir_intrinsic_load_push_constant) == 0);
+   VT_RT_CHECK(count_intrinsic(push_constant_probe,
+                               nir_intrinsic_ventus_rt_dispatch_arg) == 1);
+   VT_RT_CHECK(count_intrinsic(push_constant_probe,
+                               nir_intrinsic_load_global) == 1);
 
    struct vt_rt_intrinsic_counts closest_before;
    vt_rt_count_intrinsics(closest_hit, &closest_before);
@@ -581,6 +610,7 @@ main(int argc, char **argv)
    ralloc_free(any_hit);
    ralloc_free(intersection);
    ralloc_free(terminating_any_hit);
+   ralloc_free(push_constant_probe);
    ralloc_free(manual_raygen);
    ralloc_free(manual_miss);
    ralloc_free(manual_closest_hit);

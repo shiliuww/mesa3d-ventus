@@ -9,6 +9,7 @@
 
 struct lower_rt_io_state {
    const struct vt_nir_rt_config *config;
+   uint32_t trace_depth;
 };
 
 struct lower_global_root_continuation_state {
@@ -26,6 +27,32 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
    nir_def_init(&intrin->instr, &intrin->def, 1, bit_size);
    nir_builder_instr_insert(b, &intrin->instr);
    return &intrin->def;
+}
+
+/* Push constants are captured by the bridge in the immutable dispatch
+ * snapshot.  The megakernel must replace the logical Vulkan load before
+ * LLVM lowering: the NIR-to-LLVM path deliberately has no generic
+ * load_push_constant fallback, and would otherwise turn its address into
+ * undef. */
+static bool
+lower_monolithic_push_constants(nir_builder *b, nir_intrinsic_instr *intrin,
+                                void *data)
+{
+   (void)data;
+   if (intrin->intrinsic != nir_intrinsic_load_push_constant)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *base = load_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR, 64);
+   nir_def *offset = nir_iadd_imm(b, nir_u2u64(b, intrin->src[0].ssa),
+                                  nir_intrinsic_base(intrin));
+   nir_def_rewrite_uses(
+      &intrin->def,
+      nir_load_global(b, intrin->def.num_components, intrin->def.bit_size,
+                      nir_iadd(b, base, offset)));
+   nir_instr_remove(&intrin->instr);
+   return true;
 }
 
 static bool
@@ -148,6 +175,11 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    b->cursor = nir_after_instr(&intrin->instr);
 
+   /* The root raygen trace is depth 0.  Traces introduced while lowering an
+    * inlined callback are assigned the next fixed payload slot. */
+   vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
+                             nir_imm_int(b, state->trace_depth));
+
    struct vt_nir_rt_trace_params params = {
       .accel_struct = intrin->src[0].ssa,
       .flags = intrin->src[1].ssa,
@@ -237,6 +269,9 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
    }
    nir_pop_loop(b, loop);
+
+   vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
+                             nir_imm_int(b, state->trace_depth));
 
    nir_instr_remove(&intrin->instr);
    return true;
@@ -407,17 +442,23 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
    };
 
    bool progress = false;
+   bool trace_progress = false;
    for (uint32_t i = 0; i < 8; i++) {
+      state.trace_depth = i;
       bool pass_progress =
          nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,
                                     &state);
       progress |= pass_progress;
+      trace_progress |= pass_progress;
       if (!pass_progress)
          break;
    }
 
-   if (progress)
+   if (trace_progress)
       progress |= insert_raygen_release_before_returns(shader, config);
+
+   progress |= nir_shader_intrinsics_pass(
+      shader, lower_monolithic_push_constants, nir_metadata_none, NULL);
 
    if (progress) {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);

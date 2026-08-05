@@ -907,6 +907,37 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
       }
    }
 
+   /* A raygen shader commonly has exactly one shader_temp payload object
+    * (for example `hitValue`) with no SPIR-V Location decoration.  It is the
+    * payload passed to TraceRayEXT, not an ordinary private temporary.  Make
+    * the canonical single-payload location explicit before computing P; if
+    * this is left unresolved, callbacks still write H..H+P while the linked
+    * ABI incorrectly reserves P=0. */
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader || shader->info.stage != MESA_SHADER_RAYGEN)
+         continue;
+
+      nir_variable *payload = NULL;
+      bool ambiguous = false;
+      nir_foreach_variable_in_shader(var, shader) {
+         if (var->data.mode != nir_var_shader_temp ||
+             var->data.location >= 0)
+            continue;
+         if (payload)
+            ambiguous = true;
+         else
+            payload = var;
+      }
+      if (payload && !ambiguous) {
+         payload->data.location = 0;
+         payload->data.explicit_location = true;
+         if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE"))
+            mesa_logi("ventus-vk: inferred RT raygen payload location 0 for %s",
+                      payload->name ? payload->name : "<unnamed>");
+      }
+   }
+
    std::vector<vtvk_rt_payload_location_candidate> candidates;
    for (uint32_t i = 0; i < shader_count; i++)
       vtvk_rt_collect_payload_location_candidates(shaders[i], &candidates);
@@ -991,6 +1022,61 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
    }
 }
 
+static bool
+vtvk_rt_is_triangle_barycentrics(nir_shader *shader, nir_variable *var,
+                                  bool has_intersection)
+{
+   if (!shader || !var || has_intersection ||
+       var->data.mode != nir_var_ray_hit_attrib)
+      return false;
+
+   unsigned size = 0, align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   const int location = var->data.driver_location;
+   return location == 0 && size == 8 && align >= 4;
+}
+
+static bool
+vtvk_rt_compute_hit_attribute_rest(nir_shader **shaders, uint32_t shader_count,
+                                   bool *triangle_barycentrics,
+                                   uint32_t *rest_bytes)
+{
+   if (!triangle_barycentrics || !rest_bytes)
+      return false;
+
+   bool has_intersection = false;
+   for (uint32_t i = 0; i < shader_count; i++)
+      has_intersection |= shaders[i] &&
+                          shaders[i]->info.stage == MESA_SHADER_INTERSECTION;
+
+   uint32_t end = 0;
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader)
+         continue;
+      nir_foreach_variable_in_shader(var, shader) {
+         if (var->data.mode != nir_var_ray_hit_attrib)
+            continue;
+         if (vtvk_rt_is_triangle_barycentrics(shader, var, has_intersection))
+            continue;
+         unsigned size = 0, align = 0;
+         glsl_get_natural_size_align_bytes(var->type, &size, &align);
+         const int location = var->data.driver_location;
+         if (location < 0)
+            return false;
+         const uint64_t begin = (uint64_t)(uint32_t)location;
+         const uint64_t finish = begin + size;
+         if (finish > UINT32_MAX)
+            return false;
+         end = MAX2(end, (uint32_t)finish);
+      }
+   }
+
+   *triangle_barycentrics = !has_intersection;
+   *rest_bytes = ALIGN_POT(end, VT_RT_ABI_WORD_BYTES);
+   return true;
+}
+
 static void
 vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
 {
@@ -1002,7 +1088,25 @@ vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
       return;
 
    nir_opt_dead_cf(shader);
-   nir_lower_returns(shader);
+   /* Callback entry points are inlined into the trace loop.  Their terminal
+    * return is therefore a return from the callback, not from raygen.  Drop
+    * the synthetic entry-point return terminator before cloning the body;
+    * nir_inline_function_impl then falls through to the caller continuation.
+    * Keeping it would make the later raygen return lowering insert rt.release
+    * at every any-hit/closest-hit return. */
+   nir_foreach_block(block, impl) {
+      /* A return is not guaranteed to be the block's final instruction after
+       * dead-CF cleanup (metadata/debug instructions may follow it).  Remove
+       * every callback-local terminator before cloning; leaving one behind
+       * makes lower_returns synthesize setrpc/ret for the enclosing raygen. */
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_jump)
+            continue;
+         nir_jump_instr *jump = nir_instr_as_jump(instr);
+         if (jump->type == nir_jump_return || jump->type == nir_jump_halt)
+            nir_instr_remove(instr);
+      }
+   }
    nir_opt_dce(shader);
 
    struct hash_table *var_remap = _mesa_pointer_hash_table_create(b->shader);
@@ -1084,8 +1188,15 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
 
    nir_def *hit_t = intrin->src[0].ssa;
    nir_def *hit_kind = intrin->src[1].ssa;
-   nir_def *current_tmax = vt_nir_load_hit_record_word(
+   nir_def *committed_valid = nir_ieq_imm(
+      b, vt_nir_load_hit_record_word(b, config, layout,
+                                     VT_RT_HIT_RECORD_STATUS, 32),
+      VT_RT_HIT_RECORD_STATUS_VALID);
+   nir_def *committed_t = vt_nir_load_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
+   nir_def *ray_tmax = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_TMAX);
+   nir_def *current_tmax = nir_bcsel(b, committed_valid, committed_t, ray_tmax);
    nir_def *tmin = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_TMIN);
    nir_def *terminated = nir_ine_imm(
@@ -1191,6 +1302,28 @@ vtvk_load_rt_shader_record_group_index(nir_builder *b, nir_def *shader_record_pt
                                        group_index_offset));
 }
 
+/* The RTcore hit record carries the selected SBT index, but it does not own
+ * the application SBT base.  In particular the VTAS private traversal path
+ * must not manufacture a pointer from a zero base.  Derive the record from
+ * the immutable dispatch snapshot at the callback call site instead. */
+static nir_def *
+vtvk_load_rt_hit_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_trace_params *params,
+   const struct vt_nir_rt_result *result)
+{
+   if (!b || !params || !result || !result->sbt_index ||
+       !params->sbt_base || !params->sbt_stride_bytes)
+      return NULL;
+
+   return nir_iadd(
+      b, params->sbt_base,
+      nir_iadd_imm(
+         b,
+         nir_imul(b, nir_u2u64(b, result->sbt_index),
+                  nir_u2u64(b, params->sbt_stride_bytes)),
+         32)); /* shader-group-handle-size */
+}
+
 static void
 vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
                   const struct vt_nir_rt_result *result, void *data)
@@ -1218,11 +1351,15 @@ vtvk_emit_rt_closest_hit(nir_builder *b,
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->closest_hit.empty() ||
-       !result || !result->hit_shader_record_ptr)
+       !params || !result)
       return;
 
+   nir_def *record_ptr =
+      vtvk_load_rt_hit_shader_record_ptr(b, params, result);
+   if (!record_ptr)
+      return;
    nir_def *index =
-      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+      vtvk_load_rt_shader_record_group_index(b, record_ptr);
    vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->closest_hit,
                                              index);
 }
@@ -1236,11 +1373,15 @@ vtvk_emit_rt_any_hit(nir_builder *b, const struct vt_nir_rt_trace_params *params
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->any_hit.empty() ||
-       !result || !result->hit_shader_record_ptr)
+       !params || !result)
       return;
 
+   nir_def *record_ptr =
+      vtvk_load_rt_hit_shader_record_ptr(b, params, result);
+   if (!record_ptr)
+      return;
    nir_def *index =
-      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+      vtvk_load_rt_shader_record_group_index(b, record_ptr);
    vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->any_hit, index);
 }
 
@@ -1253,11 +1394,15 @@ vtvk_emit_rt_intersection(nir_builder *b, const struct vt_nir_rt_trace_params *p
       static_cast<const struct vtvk_rt_pipeline_callback_data *>(data);
 
    if (!cb || !cb->shaders || cb->shaders->intersection.empty() ||
-       !result || !result->hit_shader_record_ptr)
+       !params || !result)
       return;
 
+   nir_def *record_ptr =
+      vtvk_load_rt_hit_shader_record_ptr(b, params, result);
+   if (!record_ptr)
+      return;
    nir_def *index =
-      vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
+      vtvk_load_rt_shader_record_group_index(b, record_ptr);
    vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->intersection,
                                              index);
 }
@@ -1548,15 +1693,34 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                            pipeline->shader_count);
 
    struct vt_nir_rt_abi_layout rt_abi = vt_nir_rt_default_abi_layout();
+   bool triangle_barycentrics = false;
+   uint32_t hit_attribute_rest = 0;
+   if (!vtvk_rt_compute_hit_attribute_rest(
+          pipeline->shaders, pipeline->shader_count, &triangle_barycentrics,
+          &hit_attribute_rest) ||
+       !vt_nir_rt_abi_layout_set_hit_attrib_size(
+          &rt_abi, hit_attribute_rest, triangle_barycentrics)) {
+      mesa_loge("ventus-vk: RT hit-attribute layout exceeds ABI limits");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
    uint32_t rt_payload_size = 0;
    if (!vt_nir_rt_compute_pipeline_payload_size(pipeline->shaders,
                                                 pipeline->shader_count,
                                                 &rt_payload_size) ||
-       !vt_nir_rt_abi_layout_set_payload_size(&rt_abi, rt_payload_size)) {
+       !vt_nir_rt_abi_layout_set_payload_size(&rt_abi, rt_payload_size) ||
+       !vt_nir_rt_abi_layout_set_recursion_depth(
+          &rt_abi, pipeline->max_ray_recursion_depth)) {
       mesa_loge("ventus-vk: RT payload layout exceeds the v3 private ABI");
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
+   if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE"))
+      mesa_logi("ventus-vk: RT ABI hitattr=%u bary=%u payload=%u depth=%u spill=%u total=%u",
+                rt_abi.hit_attrib_size_bytes,
+                rt_abi.hit_attrib_barycentrics ? 1 : 0,
+                rt_abi.payload_size_bytes, rt_abi.max_ray_recursion_depth,
+                rt_abi.payload_spill_size_bytes, rt_abi.total_size_bytes);
 
    const bool staged_dispatch =
       pipeline->rt_execution_profile ==
@@ -1709,6 +1873,13 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
+   /* The fixed RT ABI may reserve parent-payload spill slots that are not
+    * represented by ordinary NIR shader scratch after callback inlining.
+    * Keep the dispatch/PDS frame at least as large as the linked ABI region
+    * and its fixed-depth spill area. */
+   pipeline->per_lane_scratch_size =
+      MAX2(pipeline->per_lane_scratch_size, rt_abi.total_size_bytes);
+   pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;
 
    struct vt_nir_to_llvm_options llvm_options = {
       .module_name = "ventus_rt_pipeline",

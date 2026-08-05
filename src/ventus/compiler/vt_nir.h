@@ -63,6 +63,10 @@ struct vt_nir_scratchpad_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
+   bool hit_attrib_barycentrics;
+   uint32_t payload_spill_base_bytes;
+   uint32_t payload_spill_size_bytes;
+   uint32_t max_ray_recursion_depth;
    /* First byte available to compiler-owned private objects.  The RT header
     * and linked pipeline payload occupy [base_bytes, private_base_bytes). */
    uint32_t private_base_bytes;
@@ -82,11 +86,18 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
+   bool hit_attrib_barycentrics;
    /* Fixed RT header plus the linked pipeline payload.  Megakernel PDS starts
     * at logical offset zero; ordinary LLVM private state starts after total. */
    uint32_t region_size_bytes;
    /* First byte after the fixed header and this pipeline's payload. */
    uint32_t private_base_bytes;
+   /* Compiler-owned depth-indexed payload area.  Depth zero occupies the
+    * active slot at payload_base_bytes; each subsequent ray depth gets one
+    * fixed-size P-byte slot immediately after it. */
+   uint32_t payload_spill_base_bytes;
+   uint32_t payload_spill_size_bytes;
+   uint32_t max_ray_recursion_depth;
    uint32_t total_size_bytes;
 };
 
@@ -182,6 +193,11 @@ bool vt_nir_rt_compute_pipeline_payload_size(nir_shader **shaders,
                                              uint32_t *payload_size_bytes);
 bool vt_nir_rt_abi_layout_set_payload_size(struct vt_nir_rt_abi_layout *layout,
                                            uint32_t payload_size_bytes);
+bool vt_nir_rt_abi_layout_set_hit_attrib_size(
+   struct vt_nir_rt_abi_layout *layout, uint32_t hit_attrib_size_bytes,
+   bool hit_attrib_barycentrics);
+bool vt_nir_rt_abi_layout_set_recursion_depth(
+   struct vt_nir_rt_abi_layout *layout, uint32_t max_ray_recursion_depth);
 
 /* Rebind the common RT regions into a PDS-free global CPS frame. */
 void vt_nir_rt_config_apply_global_cps_layout(
@@ -235,6 +251,14 @@ nir_def *vt_nir_scratchpad_addr(nir_builder *b,
                                 const struct vt_nir_rt_config *config,
                                 enum vt_rt_shader_layout layout,
                                 uint32_t byte_offset);
+
+nir_def *vt_nir_load_active_level(nir_builder *b,
+                                  const struct vt_nir_rt_config *config,
+                                  enum vt_rt_shader_layout layout);
+void vt_nir_store_active_level(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_shader_layout layout,
+                               nir_def *level);
 
 nir_def *vt_nir_payload_addr(nir_builder *b,
                              const struct vt_nir_rt_config *config,

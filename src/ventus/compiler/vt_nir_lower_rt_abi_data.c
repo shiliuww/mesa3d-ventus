@@ -32,6 +32,19 @@ struct vt_lower_rt_var_state {
    const struct vt_payload_location_map *payload_locations;
 };
 
+static bool
+is_barycentric_hit_attribute(const struct vt_lower_rt_var_state *state,
+                             nir_variable *var, uint32_t location)
+{
+   if (!state || state->mode != nir_var_ray_hit_attrib ||
+       !state->config->scratchpad[VT_RT_LAYOUT_ANY_HIT].hit_attrib_barycentrics)
+      return false;
+
+   unsigned size = 0, align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   return location == 0 && size == 8 && align >= 4;
+}
+
 static enum vt_rt_shader_layout
 current_layout(nir_builder *b)
 {
@@ -92,16 +105,43 @@ static nir_def *
 load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                  uint32_t word)
 {
-   return load_rt_slot_word(b, state->config, current_layout(b),
-                            state->base_offset + word * 4);
+   enum vt_rt_shader_layout layout = current_layout(b);
+   const struct vt_nir_scratchpad_layout *sp =
+      &state->config->scratchpad[layout];
+   const uint32_t payload_size =
+      sp->total_size_bytes - sp->payload_spill_size_bytes -
+      sp->payload_base_bytes;
+   nir_def *addr = vt_nir_scratchpad_addr(
+      b, state->config, layout, state->base_offset + word * 4);
+   /* Shader-temp/call-data locations are payload slots.  Function temporaries
+    * without a Vulkan location remain ordinary private values and use their
+    * fixed compiler frame offset. */
+   if (state->mode != nir_var_function_temp && payload_size) {
+      nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
+      addr = nir_iadd(b, addr,
+                      nir_imul_imm(b, depth, payload_size));
+   }
+   return nir_ventus_rt_load_slot(b, 1, 32, addr);
 }
 
 static void
 store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                   uint32_t word, nir_def *value)
 {
-   store_rt_slot_word(b, state->config, current_layout(b),
-                      state->base_offset + word * 4, value);
+   enum vt_rt_shader_layout layout = current_layout(b);
+   const struct vt_nir_scratchpad_layout *sp =
+      &state->config->scratchpad[layout];
+   const uint32_t payload_size =
+      sp->total_size_bytes - sp->payload_spill_size_bytes -
+      sp->payload_base_bytes;
+   nir_def *addr = vt_nir_scratchpad_addr(
+      b, state->config, layout, state->base_offset + word * 4);
+   if (state->mode != nir_var_function_temp && payload_size) {
+      nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
+      addr = nir_iadd(b, addr,
+                      nir_imul_imm(b, depth, payload_size));
+   }
+   nir_ventus_rt_store_slot(b, value, addr);
 }
 
 static struct vt_payload_location *
@@ -284,6 +324,44 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
       rt_var_driver_location(state, var) +
       nir_deref_instr_get_const_offset(deref, glsl_get_natural_size_align_bytes);
 
+   const bool barycentrics = is_barycentric_hit_attribute(state, var, location);
+   const bool candidate = b->shader->info.stage == MESA_SHADER_ANY_HIT ||
+                         b->shader->info.stage == MESA_SHADER_INTERSECTION;
+   if (barycentrics && intrin->def.bit_size == 32 &&
+       intrin->def.num_components == 2 &&
+       nir_deref_instr_get_const_offset(deref,
+                                        glsl_get_natural_size_align_bytes) == 0) {
+      nir_def *components[2];
+      for (unsigned comp = 0; comp < 2; comp++) {
+         const enum vt_rt_hit_record_word word =
+            (enum vt_rt_hit_record_word)(VT_RT_HIT_RECORD_BARYCENTRICS_X + comp);
+         components[comp] = candidate ?
+            vt_nir_load_candidate_hit_record_word(b, state->config,
+                                                  current_layout(b), word, 32) :
+            vt_nir_load_hit_record_word(b, state->config, current_layout(b),
+                                        word, 32);
+      }
+      if (intrin->intrinsic == nir_intrinsic_load_deref) {
+         nir_def_rewrite_uses(&intrin->def, nir_vec(b, components, 2));
+      } else {
+         nir_def *value = intrin->src[1].ssa;
+         for (unsigned comp = 0; comp < 2; comp++) {
+            const enum vt_rt_hit_record_word word =
+               (enum vt_rt_hit_record_word)(VT_RT_HIT_RECORD_BARYCENTRICS_X + comp);
+            if (candidate)
+               vt_nir_store_candidate_hit_record_word(
+                  b, state->config, current_layout(b), word,
+                  nir_channel(b, value, comp));
+            else
+               vt_nir_store_hit_record_word(
+                  b, state->config, current_layout(b), word,
+                  nir_channel(b, value, comp));
+         }
+      }
+      nir_instr_remove(instr);
+      return true;
+   }
+
    if (intrin->intrinsic == nir_intrinsic_load_deref) {
       uint32_t num_components = intrin->def.num_components;
       uint32_t bit_size = intrin->def.bit_size;
@@ -406,6 +484,7 @@ vt_nir_lower_rt_payload(nir_shader *shader,
    }
 
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
+
    uint32_t payload_base = config->scratchpad[layout].payload_base_bytes;
    nir_variable_mode payload_modes =
       nir_var_function_temp | nir_var_shader_call_data | nir_var_shader_temp;
@@ -457,6 +536,24 @@ load_active_hit_record_word(nir_builder *b, const struct vt_nir_rt_config *confi
    }
 
    return vt_nir_load_hit_record_word(b, config, layout, word, bit_size);
+}
+
+/* A procedural report is evaluated before any committed hit exists.  Reading
+ * committed HIT_T unconditionally makes the first report compare against the
+ * zero-filled record and reject every positive intersection. */
+static nir_def *
+load_committed_tmax(nir_builder *b, const struct vt_nir_rt_config *config,
+                   enum vt_rt_shader_layout layout)
+{
+   nir_def *committed_valid = nir_ieq_imm(
+      b, vt_nir_load_hit_record_word(b, config, layout,
+                                     VT_RT_HIT_RECORD_STATUS, 32),
+      VT_RT_HIT_RECORD_STATUS_VALID);
+   nir_def *committed_t = vt_nir_load_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
+   nir_def *ray_tmax = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_TMAX);
+   return nir_bcsel(b, committed_valid, committed_t, ray_tmax);
 }
 
 static bool
@@ -571,9 +668,7 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          return false;
       nir_def *hit_t = intrin->src[0].ssa;
       nir_def *hit_kind = intrin->src[1].ssa;
-      nir_def *current_tmax =
-         vt_nir_load_hit_record_word(b, config, layout,
-                                     VT_RT_HIT_RECORD_HIT_T, 32);
+      nir_def *current_tmax = load_committed_tmax(b, config, layout);
       nir_def *tmin = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
       nir_def *accepted =
          nir_iand(b, nir_flt(b, hit_t, current_tmax),

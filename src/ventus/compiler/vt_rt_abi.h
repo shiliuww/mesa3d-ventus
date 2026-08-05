@@ -131,9 +131,12 @@ enum vt_rt_cps_header_word {
 #define VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES 72
 
 #define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 276
-#define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 32
+/* The payload starts immediately after the non-barycentric hit attributes.
+ * The two triangle barycentric words live in hit-record words 9 and 10 and
+ * are therefore not part of this variable-sized region. */
+#define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 0
 
-#define VT_RT_ABI_SHADER_REGION_BASE_BYTES 308
+#define VT_RT_ABI_SHADER_REGION_BASE_BYTES VT_RT_ABI_HIT_ATTRIB_BASE_BYTES
 #define VT_RT_ABI_PAYLOAD_BASE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
 /* The linked RT pipeline determines P before lowering:
  * ALIGN16(max(location * 16 + natural_size)). */

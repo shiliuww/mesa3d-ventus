@@ -64,6 +64,24 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
    return count;
 }
 
+static unsigned
+count_store_slots(nir_shader *shader)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot)
+               count++;
+         }
+      }
+   }
+   return count;
+}
+
 int
 main(void)
 {
@@ -72,11 +90,11 @@ main(void)
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(VT_RT_ABI_VERSION == 4);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
-   VT_RT_CHECK(layout.payload_base_bytes == 308);
-   VT_RT_CHECK(layout.region_size_bytes == 308);
-   VT_RT_CHECK(layout.private_base_bytes == 308);
+   VT_RT_CHECK(layout.payload_base_bytes == 276);
+   VT_RT_CHECK(layout.region_size_bytes == 276);
+   VT_RT_CHECK(layout.private_base_bytes == 276);
    VT_RT_CHECK(layout.payload_size_bytes == 0);
-   VT_RT_CHECK(layout.total_size_bytes == 308);
+   VT_RT_CHECK(layout.total_size_bytes == 276);
 
    uint32_t payload_size = UINT32_MAX;
    VT_RT_CHECK(vt_nir_rt_compute_pipeline_payload_size(NULL, 0,
@@ -107,22 +125,38 @@ main(void)
    struct vt_nir_rt_config config = vt_nir_rt_default_config();
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes == 0);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes == 308);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes == 388);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].private_base_bytes == 388);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_CLOSEST_HIT].total_size_bytes == 388);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes == 276);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes == 356);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].private_base_bytes == 356);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_CLOSEST_HIT].total_size_bytes == 356);
+
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(&layout, 32, true));
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 2));
+   VT_RT_CHECK(layout.payload_spill_base_bytes == 356);
+   VT_RT_CHECK(layout.payload_spill_size_bytes == 96);
+   VT_RT_CHECK(layout.private_base_bytes == 452);
+   VT_RT_CHECK(layout.total_size_bytes == 452);
+   vt_nir_rt_config_apply_abi_layout(&config, &layout);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 356);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_size_bytes == 96);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].max_ray_recursion_depth == 2);
 
    nir_shader *store_shader = build_payload_store_shader();
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(vt_nir_lower_rt_payload(store_shader, &config));
    /* location 2 begins at payload_base + 2 * 16 = 340. */
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 340) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 344) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 348) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 352) == 1);
+   /* Payload addresses now include active_depth * P and are therefore no
+    * longer compile-time constants.  Verify the four words are still lowered
+    * to RT slot stores; the dynamic-base shape is covered by the NIR dump. */
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 340) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 344) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 348) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 352) == 0);
+   VT_RT_CHECK(count_store_slots(store_shader) == 4);
 
-   printf("PASS vt_rt_abi_v4_layout header=308 payload_union=48 "
+   printf("PASS vt_rt_abi_v4_layout header=276+hitattr payload_union=48 "
           "payload_sparse=80 private_base=388\n");
 
    ralloc_free(raygen);
