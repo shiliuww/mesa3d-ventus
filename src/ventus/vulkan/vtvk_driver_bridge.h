@@ -110,7 +110,11 @@ struct vtvk_driver_trace_rays_info {
    uint32_t per_lane_scratch_size;
    uint32_t continuation_frame_size;
    uint32_t max_ray_recursion_depth;
-   enum vtvk_rt_execution_profile execution_profile;
+   VkVentusRtExecutionProfile execution_profile;
+   VkVentusRtStageRole stage_role;
+   uint32_t state_descriptor_set;
+   uint32_t state_descriptor_binding;
+   bool internal_transparent_oracle;
    bool rt_uses_rv64;
    const char *kernel_path;
    uint64_t kernel_entry;

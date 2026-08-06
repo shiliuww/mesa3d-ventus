@@ -160,6 +160,11 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.continuation_frame_size = pipeline->continuation_frame_size;
    trace.max_ray_recursion_depth = pipeline->max_ray_recursion_depth;
    trace.execution_profile = pipeline->rt_execution_profile;
+   trace.stage_role = pipeline->rt_stage_role;
+   trace.state_descriptor_set = pipeline->rt_state_descriptor_set;
+   trace.state_descriptor_binding = pipeline->rt_state_descriptor_binding;
+   trace.internal_transparent_oracle =
+      pipeline->rt_internal_transparent_oracle;
    trace.rt_uses_rv64 = pipeline->rt_uses_rv64;
    trace.kernel_path = pipeline->generated_kernel_path;
    trace.kernel_entry = pipeline->generated_kernel_entry;

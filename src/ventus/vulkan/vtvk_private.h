@@ -37,7 +37,7 @@ struct vtvk_physical_device {
    VkMemoryType memory_types[1];
 
    const struct vk_sync_type *sync_types[1];
-   enum vtvk_rt_execution_profile rt_execution_profile;
+   enum vtvk_rt_internal_oracle_profile rt_internal_oracle_profile;
    bool rt_uses_rv64;
 };
 
@@ -49,7 +49,7 @@ struct vtvk_memory;
 
 struct vtvk_device {
    struct vk_device vk;
-   enum vtvk_rt_execution_profile rt_execution_profile;
+   enum vtvk_rt_internal_oracle_profile rt_internal_oracle_profile;
    bool rt_uses_rv64;
    void *driver_backend;
    struct vtvk_memory *memory_list;

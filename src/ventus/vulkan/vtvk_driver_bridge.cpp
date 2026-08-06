@@ -1265,8 +1265,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t raygen_wg_z = MAX2(info->depth, 1u);
    uint64_t pds_resident_lanes =
       vtvk_rt_resident_warps * vtvk_rt_lanes_per_warp;
+   const bool staged_dispatch =
+      info->execution_profile ==
+         VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
    const bool wavefront_global =
-      info->execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
+      staged_dispatch || info->internal_transparent_oracle;
    struct vtvk_driver_kernel_launch_resources resource_envelope = {};
    uint64_t pds_stack_base_per_thread = 0;
    uint64_t pds_size_per_thread = 0;
@@ -1395,6 +1398,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
 
    if (info->descriptor_count) {
       uint32_t slots = vtvk_driver_descriptor_table_slots(info);
+      bool staged_state_buffer_found = !staged_dispatch;
       descriptor_table.resize(slots);
       for (uint32_t slot = 0; slot < slots; slot++) {
          descriptor_table[slot].set =
@@ -1412,6 +1416,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          }
          uint32_t slot =
             vt_rt_descriptor_table_slot(src->set, src->binding);
+         if (staged_dispatch &&
+             src->set == info->state_descriptor_set &&
+             src->binding == info->state_descriptor_binding &&
+             src->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            staged_state_buffer_found = true;
          if (!vtvk_driver_upload_descriptor(&driver, src,
                                             &descriptor_table[slot],
                                             &uploads))
@@ -1431,6 +1440,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          }
       }
 
+      if (!staged_state_buffer_found) {
+         mesa_loge("ventus-vk: Staged Dispatch requires a path-state "
+                   "storage buffer at set=%u binding=%u",
+                   info->state_descriptor_set,
+                   info->state_descriptor_binding);
+         goto out;
+      }
+
       if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
                                   descriptor_table.size() *
                                      sizeof(descriptor_table[0]),
@@ -1439,6 +1456,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          goto out;
       }
    } else {
+      if (staged_dispatch) {
+         mesa_loge("ventus-vk: Staged Dispatch requires a bound path-state "
+                   "storage buffer");
+         goto out;
+      }
       if (!vtvk_driver_upload_as(&driver, info->tlas, &uploads)) {
          mesa_loge("ventus-vk: driver bridge failed to upload TLAS");
          goto out;

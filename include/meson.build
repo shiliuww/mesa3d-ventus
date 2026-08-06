@@ -70,6 +70,13 @@ if not with_glvnd and host_machine.system() != 'windows'
 endif
 
 # Non-upstream headers
+if with_ventus_vk
+  install_headers(
+    'ventus/vulkan/ventus_rt_profile.h',
+    subdir : 'ventus/vulkan',
+  )
+endif
+
 if with_egl
   install_headers(
     'EGL/eglext_angle.h',

@@ -4,7 +4,7 @@ vt_rt_profile_test = executable(
     'vt_rt_profile_test.c',
     '../vulkan/vtvk_rt_profile.c',
   ],
-  include_directories : [inc_src],
+  include_directories : [inc_include, inc_src],
   build_by_default : false,
 )
 

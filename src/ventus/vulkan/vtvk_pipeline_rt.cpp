@@ -1849,6 +1849,15 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
 
+   struct vtvk_rt_execution_profile_config profile_config;
+   VkResult profile_result = vtvk_rt_execution_profile_parse(
+      info->pNext, VTVK_MAX_BOUND_DESCRIPTOR_SETS,
+      VTVK_MAX_DESCRIPTOR_BINDINGS, &profile_config);
+   if (profile_result != VK_SUCCESS) {
+      mesa_loge("ventus-vk: invalid Ventus RT execution-profile contract");
+      return vk_error(device, profile_result);
+   }
+
    struct vtvk_pipeline *pipeline =
       (struct vtvk_pipeline *)vk_pipeline_zalloc(
          &device->vk, &vtvk_pipeline_ops, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -1859,7 +1868,15 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->nir_mem_ctx = ralloc_context(nullptr);
    pipeline->shader_count = info->stageCount;
    pipeline->max_ray_recursion_depth = info->maxPipelineRayRecursionDepth;
-   pipeline->rt_execution_profile = device->rt_execution_profile;
+   pipeline->rt_execution_profile = profile_config.profile;
+   pipeline->rt_stage_role = profile_config.stage_role;
+   pipeline->rt_state_descriptor_set = profile_config.state_descriptor_set;
+   pipeline->rt_state_descriptor_binding =
+      profile_config.state_descriptor_binding;
+   pipeline->rt_internal_transparent_oracle =
+      !profile_config.explicit_profile &&
+      device->rt_internal_oracle_profile ==
+         VTVK_RT_INTERNAL_ORACLE_TRANSPARENT;
    pipeline->rt_uses_rv64 = device->rt_uses_rv64;
    pipeline->retain_generated_artifacts =
       vtvk_env_enabled("VENTUS_VK_RETAIN_SHADER_ARTIFACTS");
@@ -1904,7 +1921,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    }
 
    const bool global_wavefront =
-      pipeline->rt_execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
+      pipeline->rt_execution_profile ==
+         VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH ||
+      pipeline->rt_internal_transparent_oracle;
 
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();

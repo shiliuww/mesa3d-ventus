@@ -139,8 +139,9 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxDescriptorSetAccelerationStructures = 64;
    p->minAccelerationStructureScratchOffsetAlignment = 128;
    p->shaderGroupHandleSize = 32;
-   p->maxRayRecursionDepth =
-      pdev->rt_execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL ? 4 : 1;
+   /* Execution profile is selected per pipeline, so capabilities cannot
+    * depend on an ambient process selector. */
+   p->maxRayRecursionDepth = 4;
    p->maxShaderGroupStride = 4096;
    p->shaderGroupBaseAlignment = 64;
    p->shaderGroupHandleCaptureReplaySize = 32;
@@ -240,15 +241,17 @@ vtvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    if (!pdev)
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   const char *profile_selector = getenv("VENTUS_VK_RT_EXECUTION_PROFILE");
-   if (!vtvk_rt_execution_profile_resolve(
-          profile_selector,
+   const char *public_selector = getenv("VENTUS_VK_RT_EXECUTION_PROFILE");
+   const char *internal_selector =
+      getenv("VENTUS_VK_INTERNAL_RT_ORACLE_PROFILE");
+   if (!vtvk_rt_internal_oracle_resolve(
+          public_selector,
+          internal_selector,
           getenv("VENTUS_VK_RT_WAVEFRONT_GLOBAL"),
           getenv("VENTUS_VK_RT_WAVEFRONT_MIRROR"),
-          &pdev->rt_execution_profile)) {
-      mesa_loge("ventus-vk: invalid RT execution profile '%s'; "
-                "expected compat or global; mirror has been removed",
-                profile_selector ? profile_selector : "");
+          &pdev->rt_internal_oracle_profile)) {
+      mesa_loge("ventus-vk: legacy RT execution selectors are unsupported; "
+                "applications must use the Ventus pipeline profile pNext");
       vk_free(&instance->vk.alloc, pdev);
       return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
    }
