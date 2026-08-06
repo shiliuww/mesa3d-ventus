@@ -139,6 +139,10 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    }
 
    struct vtvk_driver_trace_rays_info trace = {};
+   struct vtvk_cmd_buffer *cmd =
+      (struct vtvk_cmd_buffer *)vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   trace.device = cmd && cmd->vk.base.device ?
+      container_of(cmd->vk.base.device, struct vtvk_device, vk) : nullptr;
    trace.tlas = tlas;
    trace.storage_image_data = storage_image_data;
    trace.image_extent = image_extent;

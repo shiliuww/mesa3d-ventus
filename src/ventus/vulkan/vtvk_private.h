@@ -45,10 +45,14 @@ struct vtvk_queue {
    struct vk_queue vk;
 };
 
+struct vtvk_memory;
+
 struct vtvk_device {
    struct vk_device vk;
    enum vtvk_rt_execution_profile rt_execution_profile;
    bool rt_uses_rv64;
+   void *driver_backend;
+   struct vtvk_memory *memory_list;
 };
 
 struct vtvk_sampler {
@@ -119,6 +123,8 @@ void vtvk_destroy_physical_device(struct vk_physical_device *vk_pdev);
 extern const struct vk_command_buffer_ops vtvk_command_buffer_ops;
 
 VkDeviceAddress vtvk_buffer_get_device_address(VkBuffer buffer);
+VkDeviceAddress vtvk_buffer_get_bound_device_address(VkBuffer buffer);
+VkDeviceAddress vtvk_image_get_device_address(VkImage image);
 void *vtvk_buffer_host_ptr(VkBuffer buffer, VkDeviceSize offset,
                            VkDeviceSize size);
 void *vtvk_buffer_host_ptr_from_addr(VkDeviceAddress address,

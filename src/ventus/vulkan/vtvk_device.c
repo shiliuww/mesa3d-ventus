@@ -2,6 +2,7 @@
 
 #include "wsi_common.h"
 #include "vk_util.h"
+#include "vtvk_driver_bridge.h"
 #include "vtvk_entrypoints.h"
 
 static VkResult
@@ -97,6 +98,7 @@ vtvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       vk_free(&device->vk.alloc, vt_queue);
    }
 
+   vtvk_driver_backend_finish(device);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }

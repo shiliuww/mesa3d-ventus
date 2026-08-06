@@ -4,8 +4,14 @@
 #include "vtvk_private.h"
 
 struct vtvk_memory {
+   struct vtvk_device *device;
    VkDeviceSize size;
    void *map;
+   VkDeviceAddress dva_base;
+   VkDeviceSize backend_size;
+   VkMemoryAllocateFlags allocate_flags;
+   bool backend_allocated;
+   struct vtvk_memory *next;
 };
 
 struct vtvk_buffer {
@@ -14,6 +20,7 @@ struct vtvk_buffer {
    VkDeviceMemory memory;
    VkDeviceSize memory_offset;
    void *map;
+   VkDeviceAddress device_address;
    struct vtvk_buffer *next;
 };
 
@@ -24,6 +31,7 @@ struct vtvk_image {
    VkDeviceMemory memory;
    VkDeviceSize memory_offset;
    void *map;
+   VkDeviceAddress device_address;
 };
 
 struct vtvk_image_view {

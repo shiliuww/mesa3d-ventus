@@ -1,9 +1,12 @@
 #include "vtvk_memory.h"
 
+#include <inttypes.h>
 #include <string.h>
 
+#include "util/log.h"
 #include "vk_common_entrypoints.h"
 #include "vk_util.h"
+#include "vtvk_driver_bridge.h"
 #include "vtvk_entrypoints.h"
 
 static struct vtvk_buffer *vtvk_buffer_list;
@@ -56,7 +59,23 @@ vtvk_buffer_get_device_address(VkBuffer _buffer)
     * wrapper objects.  Using a wrapper address with buffer->size creates
     * overlapping fake ranges and can resolve an address to the wrong buffer.
     */
-   return buffer && buffer->map ? (VkDeviceAddress)(uintptr_t)buffer->map : 0;
+   if (!buffer ||
+       !(buffer->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ||
+       !buffer->memory)
+      return 0;
+   struct vtvk_memory *mem =
+      vtvk_handle_to_ptr((uint64_t)buffer->memory);
+   if (!mem ||
+       !(mem->allocate_flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT))
+      return 0;
+   return buffer->device_address;
+}
+
+VkDeviceAddress
+vtvk_buffer_get_bound_device_address(VkBuffer _buffer)
+{
+   struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)_buffer);
+   return buffer ? buffer->device_address : 0;
 }
 
 void *
@@ -81,7 +100,9 @@ vtvk_buffer_host_ptr_from_addr_with_usage(
           (buffer->usage & required_usage) != required_usage)
          continue;
 
-      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
+      VkDeviceAddress base = buffer->device_address;
+      if (!base)
+         continue;
       if (address < base)
          continue;
 
@@ -113,7 +134,9 @@ vtvk_buffer_resolve_device_address(VkDeviceAddress address,
       if (!buffer->map)
          continue;
 
-      VkDeviceAddress base = (VkDeviceAddress)(uintptr_t)buffer->map;
+      VkDeviceAddress base = buffer->device_address;
+      if (!base)
+         continue;
       if (address < base || address - base >= buffer->size)
          continue;
 
@@ -160,6 +183,13 @@ vtvk_image_host_ptr(VkImage _image, VkExtent3D *extent_out,
       *format_out = image->format;
    return image->map;
 }
+
+VkDeviceAddress
+vtvk_image_get_device_address(VkImage _image)
+{
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)_image);
+   return image ? image->device_address : 0;
+}
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_AllocateMemory(VkDevice _device,
                     const VkMemoryAllocateInfo *pAllocateInfo,
@@ -175,12 +205,31 @@ vtvk_AllocateMemory(VkDevice _device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    mem->size = pAllocateInfo->allocationSize;
+   mem->device = device;
+   const VkMemoryAllocateFlagsInfo *flags_info =
+      vk_find_struct_const(pAllocateInfo->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+   mem->allocate_flags = flags_info ? flags_info->flags : 0;
+   if (mem->allocate_flags &
+       VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
+      vk_free(alloc, mem);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
    mem->map = vk_alloc(alloc, mem->size ? mem->size : 1, 16,
                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!mem->map) {
       vk_free(alloc, mem);
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
+
+   mem->backend_size = mem->size ? mem->size : 1;
+   if (!vtvk_driver_memory_alloc(device, mem->backend_size, &mem->dva_base)) {
+      vk_free(alloc, mem->map);
+      vk_free(alloc, mem);
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+   mem->backend_allocated = true;
+   mem->next = device->memory_list;
+   device->memory_list = mem;
 
    *pMemory = (VkDeviceMemory)vtvk_ptr_to_handle(mem);
    return VK_SUCCESS;
@@ -197,6 +246,18 @@ vtvk_FreeMemory(VkDevice _device, VkDeviceMemory memory,
    if (!mem)
       return;
 
+   struct vtvk_memory **link = &device->memory_list;
+   while (*link) {
+      if (*link == mem) {
+         *link = mem->next;
+         break;
+      }
+      link = &(*link)->next;
+   }
+   if (mem->backend_allocated &&
+       !vtvk_driver_memory_free(device, mem->backend_size, mem->dva_base))
+      mesa_loge("ventus-vk: failed to release device memory at 0x%" PRIx64,
+                (uint64_t)mem->dva_base);
    vk_free(alloc, mem->map);
    vk_free(alloc, mem);
 }
@@ -363,12 +424,14 @@ vtvk_BindBufferMemory2(VkDevice device,
       struct vtvk_memory *mem =
          vtvk_handle_to_ptr((uint64_t)pBindInfos[i].memory);
 
-      if (!buffer || !mem || pBindInfos[i].memoryOffset > mem->size)
+      if (!buffer || !mem || pBindInfos[i].memoryOffset > mem->size ||
+          buffer->size > mem->size - pBindInfos[i].memoryOffset)
          return VK_ERROR_UNKNOWN;
 
       buffer->memory = pBindInfos[i].memory;
       buffer->memory_offset = pBindInfos[i].memoryOffset;
       buffer->map = (uint8_t *)mem->map + pBindInfos[i].memoryOffset;
+      buffer->device_address = mem->dva_base + pBindInfos[i].memoryOffset;
    }
    return VK_SUCCESS;
 }
@@ -393,6 +456,7 @@ vtvk_BindImageMemory2(VkDevice device,
       image->memory = pBindInfos[i].memory;
       image->memory_offset = pBindInfos[i].memoryOffset;
       image->map = (uint8_t *)mem->map + pBindInfos[i].memoryOffset;
+      image->device_address = mem->dva_base + pBindInfos[i].memoryOffset;
    }
    return VK_SUCCESS;
 }

@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <limits>
+#include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +31,7 @@
 #include "ventus/common/ventus_rt_bvh.h"
 #include "ventus/common/ventus_kernel_metadata.h"
 #include "ventus/compiler/vt_nir.h"
+#include "vtvk_memory.h"
 
 static_assert(VENTUS_RT_RESIDENT_WARPS > 0,
               "Ventus RT requires at least one resident warp");
@@ -135,10 +138,13 @@ struct vtvk_driver_api {
 
    int (*vt_dev_open)(void **device);
    int (*vt_dev_close)(void *device);
+   int (*vt_dev_caps)(void **device, uint64_t caps_id, uint64_t *value);
    int (*vt_buf_alloc)(void *device, uint64_t size, uint64_t *vaddr,
                        int buf_type, uint64_t task_id, uint64_t kernel_id);
    int (*vt_buf_free)(void *device, uint64_t size, uint64_t *vaddr,
                       uint64_t task_id, uint64_t kernel_id);
+   int (*vt_one_buf_free)(void *device, uint64_t size, uint64_t *vaddr,
+                          uint64_t task_id, uint64_t kernel_id);
    int (*vt_copy_to_dev)(void *device, uint64_t dev_vaddr, const void *src,
                          uint64_t size, uint64_t task_id, uint64_t kernel_id);
    int (*vt_copy_from_dev)(void *device, uint64_t dev_vaddr, void *dst,
@@ -165,11 +171,30 @@ struct vtvk_driver_api {
       uint32_t *out_request_count);
    int (*vt_rt_end_global)(
       void *device, const struct vtvk_driver_rt_global_consume_info *info);
+   std::vector<struct vtvk_driver_upload> *transient_allocations;
+   uint64_t dva_address_bits;
+   uint64_t dva_base;
+   uint64_t dva_window_size;
+   uint64_t dva_alloc_granule;
 };
 
 struct vtvk_driver_upload {
    uint64_t dev_addr;
    uint64_t size;
+};
+
+struct vtvk_driver_backend {
+   struct vtvk_driver_api api;
+   std::mutex mutex;
+};
+
+static std::mutex vtvk_driver_backend_init_mutex;
+
+enum vtvk_driver_dva_capability {
+   VTVK_DRIVER_CAP_DVA_ADDRESS_BITS = 0x9,
+   VTVK_DRIVER_CAP_DVA_BASE_ADDR = 0xa,
+   VTVK_DRIVER_CAP_DVA_WINDOW_SIZE = 0xb,
+   VTVK_DRIVER_CAP_DVA_ALLOC_GRANULE = 0xc,
 };
 
 struct vtvk_driver_kernel_resource_v3 {
@@ -567,8 +592,10 @@ vtvk_driver_open(struct vtvk_driver_api *api)
       goto fail
    VTVK_RESOLVE(vt_dev_open);
    VTVK_RESOLVE(vt_dev_close);
+   VTVK_RESOLVE(vt_dev_caps);
    VTVK_RESOLVE(vt_buf_alloc);
    VTVK_RESOLVE(vt_buf_free);
+   VTVK_RESOLVE(vt_one_buf_free);
    VTVK_RESOLVE(vt_copy_to_dev);
    VTVK_RESOLVE(vt_copy_from_dev);
    VTVK_RESOLVE(vt_upload_kernel_file);
@@ -578,6 +605,20 @@ vtvk_driver_open(struct vtvk_driver_api *api)
 
    if (api->vt_dev_open(&api->device) != 0 || !api->device) {
       mesa_loge("ventus-vk: driver bridge vt_dev_open failed");
+      goto fail;
+   }
+   if (api->vt_dev_caps(&api->device, VTVK_DRIVER_CAP_DVA_ADDRESS_BITS,
+                        &api->dva_address_bits) != 0 ||
+       api->vt_dev_caps(&api->device, VTVK_DRIVER_CAP_DVA_BASE_ADDR,
+                        &api->dva_base) != 0 ||
+       api->vt_dev_caps(&api->device, VTVK_DRIVER_CAP_DVA_WINDOW_SIZE,
+                        &api->dva_window_size) != 0 ||
+       api->vt_dev_caps(&api->device, VTVK_DRIVER_CAP_DVA_ALLOC_GRANULE,
+                        &api->dva_alloc_granule) != 0 ||
+       (api->dva_address_bits != 32 && api->dva_address_bits != 64) ||
+       !api->dva_window_size || !api->dva_alloc_granule ||
+       (api->dva_alloc_granule & (api->dva_alloc_granule - 1))) {
+      mesa_loge("ventus-vk: driver backend has no valid stable-DVA profile");
       goto fail;
    }
 
@@ -610,59 +651,174 @@ vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
       size = 1;
    if (api->vt_buf_alloc(api->device, size, dev_addr, 0, 0, 0) != 0)
       return false;
-   return !src ||
-          api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
+   if (src &&
+       api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) != 0) {
+      api->vt_one_buf_free(api->device, size, dev_addr, 0, 0);
+      return false;
+   }
+   if (api->transient_allocations)
+      api->transient_allocations->push_back({*dev_addr, size});
+   return true;
 }
 
-/* VkBufferDeviceAddress values are process addresses in this software Vulkan
- * implementation.  A shader may carry them in an otherwise opaque push
- * constant block, so copy every referenced Vulkan buffer once into the
- * Spike address space and rewrite just those 64-bit words in the per-trace
- * snapshot.  This keeps the command-buffer state API-neutral while giving
- * physical-storage-buffer loads a real guest address. */
 static bool
-vtvk_driver_relocate_push_constant_addresses(struct vtvk_driver_api *api,
-                                              std::vector<uint8_t> *snapshot,
-                                              uint32_t *relocation_count)
+vtvk_driver_release_transients(struct vtvk_driver_api *api)
 {
-   std::unordered_map<uint64_t, uint64_t> guest_bases;
-   if (!snapshot || !relocation_count)
-      return false;
-   *relocation_count = 0;
+   if (!api->transient_allocations)
+      return true;
 
-   for (size_t byte_offset = 0; byte_offset + sizeof(uint64_t) <= snapshot->size();
-        byte_offset += sizeof(uint64_t)) {
-      uint64_t host_address;
-      memcpy(&host_address, snapshot->data() + byte_offset, sizeof(host_address));
-
-      const void *host_base = NULL;
-      VkDeviceSize host_size = 0;
-      VkDeviceSize host_offset = 0;
-      if (!vtvk_buffer_host_allocation_from_addr(host_address, &host_base,
-                                                  &host_size, &host_offset))
-         continue;
-
-      const uint64_t host_base_address = (uint64_t)(uintptr_t)host_base;
-      uint64_t guest_base = 0;
-      auto existing = guest_bases.find(host_base_address);
-      if (existing != guest_bases.end()) {
-         guest_base = existing->second;
-      } else {
-         if (!host_size ||
-             !vtvk_driver_alloc_copy(api, host_base, host_size, &guest_base))
-            return false;
-         guest_bases.emplace(host_base_address, guest_base);
-      }
-
-      if (UINT64_MAX - guest_base < host_offset)
-         return false;
-      const uint64_t guest_address = guest_base + host_offset;
-      memcpy(snapshot->data() + byte_offset, &guest_address,
-             sizeof(guest_address));
-      (*relocation_count)++;
+   bool ok = true;
+   for (auto it = api->transient_allocations->rbegin();
+        it != api->transient_allocations->rend(); ++it) {
+      uint64_t address = it->dev_addr;
+      if (api->vt_one_buf_free(api->device, it->size, &address, 0, 0) != 0)
+         ok = false;
    }
+   api->transient_allocations->clear();
+   api->transient_allocations = nullptr;
+   return ok;
+}
 
+static bool
+vtvk_driver_upload_live_memory(struct vtvk_device *device,
+                               struct vtvk_driver_api *api)
+{
+   for (struct vtvk_memory *mem = device->memory_list; mem; mem = mem->next) {
+      if (!mem->backend_allocated || !mem->dva_base || !mem->map || !mem->size)
+         continue;
+      if (api->vt_copy_to_dev(api->device, mem->dva_base, mem->map,
+                              mem->size, 0, 0) != 0) {
+         mesa_loge("ventus-vk: failed to synchronize live memory at 0x%" PRIx64,
+                   (uint64_t)mem->dva_base);
+         return false;
+      }
+   }
    return true;
+}
+
+static bool
+vtvk_driver_readback_live_memory(struct vtvk_device *device,
+                                 struct vtvk_driver_api *api)
+{
+   for (struct vtvk_memory *mem = device->memory_list; mem; mem = mem->next) {
+      if (!mem->backend_allocated || !mem->dva_base || !mem->map || !mem->size)
+         continue;
+      if (api->vt_copy_from_dev(api->device, mem->dva_base, mem->map,
+                                mem->size, 0, 0) != 0) {
+         mesa_loge("ventus-vk: failed to read back live memory at 0x%" PRIx64,
+                   (uint64_t)mem->dva_base);
+         return false;
+      }
+   }
+   return true;
+}
+
+extern "C" bool
+vtvk_driver_backend_init(struct vtvk_device *device)
+{
+   if (!device)
+      return false;
+
+   std::lock_guard<std::mutex> init_lock(vtvk_driver_backend_init_mutex);
+   if (device->driver_backend)
+      return true;
+
+   auto *backend = new (std::nothrow) vtvk_driver_backend{};
+   if (!backend || !vtvk_driver_open(&backend->api)) {
+      delete backend;
+      return false;
+   }
+   device->driver_backend = backend;
+   return true;
+}
+
+extern "C" void
+vtvk_driver_backend_finish(struct vtvk_device *device)
+{
+   if (!device)
+      return;
+
+   std::lock_guard<std::mutex> init_lock(vtvk_driver_backend_init_mutex);
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      device->driver_backend);
+   if (!backend)
+      return;
+
+   {
+      std::lock_guard<std::mutex> backend_lock(backend->mutex);
+      vtvk_driver_release_transients(&backend->api);
+      vtvk_driver_close(&backend->api);
+   }
+   device->driver_backend = nullptr;
+   delete backend;
+}
+
+extern "C" bool
+vtvk_driver_memory_alloc(struct vtvk_device *device, uint64_t size,
+                         uint64_t *dva_out)
+{
+   if (!size || !dva_out || !vtvk_driver_backend_init(device))
+      return false;
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      device->driver_backend);
+   std::lock_guard<std::mutex> lock(backend->mutex);
+   struct vtvk_driver_api &api = backend->api;
+   if (api.vt_buf_alloc(api.device, size, dva_out, 0, 0, 0) != 0)
+      return false;
+
+   bool valid = *dva_out >= api.dva_base &&
+                (*dva_out - api.dva_base) < api.dva_window_size &&
+                size <= api.dva_window_size - (*dva_out - api.dva_base) &&
+                (*dva_out % api.dva_alloc_granule) == 0;
+   if (api.dva_address_bits == 32)
+      valid = valid && (*dva_out >> 32) == 0 &&
+              size <= 0x100000000ull - *dva_out;
+   if (valid)
+      return true;
+
+   uint64_t invalid_dva = *dva_out;
+   api.vt_one_buf_free(api.device, size, &invalid_dva, 0, 0);
+   *dva_out = 0;
+   return false;
+}
+
+extern "C" bool
+vtvk_driver_memory_free(struct vtvk_device *device, uint64_t size,
+                        uint64_t dva)
+{
+   if (!device || !device->driver_backend || !size || !dva)
+      return false;
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      device->driver_backend);
+   std::lock_guard<std::mutex> lock(backend->mutex);
+   return backend->api.vt_one_buf_free(backend->api.device, size, &dva,
+                                       0, 0) == 0;
+}
+
+extern "C" bool
+vtvk_driver_memory_upload(struct vtvk_device *device, uint64_t dva,
+                          const void *src, uint64_t size)
+{
+   if (!device || !device->driver_backend || !dva || !src || !size)
+      return false;
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      device->driver_backend);
+   std::lock_guard<std::mutex> lock(backend->mutex);
+   return backend->api.vt_copy_to_dev(backend->api.device, dva, src, size,
+                                      0, 0) == 0;
+}
+
+extern "C" bool
+vtvk_driver_memory_readback(struct vtvk_device *device, uint64_t dva,
+                            void *dst, uint64_t size)
+{
+   if (!device || !device->driver_backend || !dva || !dst || !size)
+      return false;
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      device->driver_backend);
+   std::lock_guard<std::mutex> lock(backend->mutex);
+   return backend->api.vt_copy_from_dev(backend->api.device, dva, dst, size,
+                                        0, 0) == 0;
 }
 
 static bool
@@ -777,11 +933,14 @@ vtvk_driver_upload_as(
       }
    }
 
-   struct vtvk_driver_upload upload = {};
-   upload.size = as_size;
-   if (!vtvk_driver_alloc_copy(api, image.data(), upload.size,
-                               &upload.dev_addr)) {
-      mesa_loge("ventus-vk: driver bridge failed to allocate/copy AS");
+   struct vtvk_driver_upload upload = {
+      .dev_addr = as->address,
+      .size = as_size,
+   };
+   if (!upload.dev_addr ||
+       api->vt_copy_to_dev(api->device, upload.dev_addr, image.data(),
+                           upload.size, 0, 0) != 0) {
+      mesa_loge("ventus-vk: driver bridge failed to upload AS at stable DVA");
       return false;
    }
 
@@ -829,13 +988,13 @@ vtvk_driver_patch_tlas_node(
          return false;
       }
       uint8_t *node = image + offset;
-      uint64_t host_blas_addr =
+      uint64_t blas_addr =
          vtvk_bridge_load_u64(node, VENTUS_INSTANCE_BLAS_ADDR_LO);
       struct vtvk_acceleration_structure *blas =
-         vtvk_find_as_by_address(host_blas_addr);
+         vtvk_find_as_by_address(blas_addr);
       if (!blas) {
-         mesa_loge("ventus-vk: driver bridge cannot find BLAS host address "
-                   "0x%" PRIx64, host_blas_addr);
+         mesa_loge("ventus-vk: driver bridge cannot find BLAS DVA 0x%" PRIx64,
+                   blas_addr);
          return false;
       }
       if (!vtvk_driver_upload_as(api, blas, uploads))
@@ -867,8 +1026,10 @@ vtvk_driver_upload_sbt_region(struct vtvk_driver_api *api,
       return false;
    }
 
-   if (!vtvk_driver_alloc_copy(api, host, src->size, &dst->addr)) {
-      mesa_loge("ventus-vk: driver bridge failed to upload %s SBT", name);
+   dst->addr = src->deviceAddress;
+   if (api->vt_copy_to_dev(api->device, dst->addr, host, src->size, 0, 0) != 0) {
+      mesa_loge("ventus-vk: driver bridge failed to upload %s SBT at stable DVA",
+                name);
       return false;
    }
 
@@ -956,7 +1117,10 @@ vtvk_driver_upload_descriptor(
       uint32_t stride = extent.width * bpp;
       uint64_t size = (uint64_t)stride * extent.height *
                       (extent.depth ? extent.depth : 1);
-      if (!host || !vtvk_driver_alloc_copy(api, host, size, &record->device_addr)) {
+      record->device_addr = vtvk_image_get_device_address(src->image);
+      if (!host || !record->device_addr ||
+          api->vt_copy_to_dev(api->device, record->device_addr, host, size,
+                              0, 0) != 0) {
          mesa_loge("ventus-vk: failed to upload image descriptor binding=%u",
                    src->binding);
          return false;
@@ -999,8 +1163,13 @@ vtvk_driver_upload_descriptor(
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
       void *host = vtvk_buffer_host_ptr(src->buffer, src->offset, src->range);
-      if (!host || !vtvk_driver_alloc_copy(api, host, src->range,
-                                           &record->device_addr)) {
+      VkDeviceAddress buffer_address =
+         vtvk_buffer_get_bound_device_address(src->buffer);
+      if (buffer_address && src->offset <= UINT64_MAX - buffer_address)
+         record->device_addr = buffer_address + src->offset;
+      if (!host || !record->device_addr ||
+          api->vt_copy_to_dev(api->device, record->device_addr, host,
+                              src->range, 0, 0) != 0) {
          mesa_loge("ventus-vk: failed to upload buffer descriptor binding=%u "
                    "range=%" PRIu64,
                    src->binding, (uint64_t)src->range);
@@ -1043,9 +1212,19 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if ((!kernel_path || !kernel_path[0]) && staged_without_kernel)
       return true;
 
-   struct vtvk_driver_api driver = {};
-   if (!info || !vtvk_driver_open(&driver))
+   if (!info || !info->device || !vtvk_driver_backend_init(info->device))
       return false;
+
+   auto *backend = static_cast<struct vtvk_driver_backend *>(
+      info->device->driver_backend);
+   std::lock_guard<std::mutex> backend_lock(backend->mutex);
+   struct vtvk_driver_api &driver = backend->api;
+   std::vector<struct vtvk_driver_upload> transient_allocations;
+   if (driver.transient_allocations) {
+      mesa_loge("ventus-vk: driver backend has an unfinished dispatch");
+      return false;
+   }
+   driver.transient_allocations = &transient_allocations;
 
    bool ok = false;
    std::unordered_map<struct vtvk_acceleration_structure *,
@@ -1068,6 +1247,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t global_candidate_hit_attribute_dev_addr = 0;
    uint64_t global_ray_ref_list_dev_addr = 0;
    uint64_t global_ray_ref_list_size = 0;
+
    uint32_t global_hit_attribute_stride = 0;
    struct vtvk_driver_rt_global_consume_info global_consume = {};
    bool global_session_teardown_armed = false;
@@ -1113,6 +1293,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vt_rt_global_completion_layout global_completion_layout = {};
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
+
+   if (!vtvk_driver_upload_live_memory(info->device, &driver))
+      goto out;
 
    if (kernel_path && kernel_path[0] &&
        !vtvk_driver_collect_pipeline_resources(info, kernel_path,
@@ -1287,10 +1470,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       }
       std::vector<uint8_t> push_constants(info->push_constants_size);
       memcpy(push_constants.data(), info->push_constants, push_constants.size());
-      uint32_t relocation_count = 0;
-      if (!vtvk_driver_relocate_push_constant_addresses(
-             &driver, &push_constants, &relocation_count) ||
-          !vtvk_driver_alloc_copy(&driver, push_constants.data(),
+      if (!vtvk_driver_alloc_copy(&driver, push_constants.data(),
                                   push_constants.size(),
                                   &push_constants_dev_addr)) {
          mesa_loge("ventus-vk: driver bridge failed to upload push constants");
@@ -1299,9 +1479,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       static bool logged;
       if (!logged) {
          logged = true;
-         mesa_logi("ventus-vk: uploaded RT push constants bytes=%u "
-                   "relocated_buffer_addresses=%u stages=0x%x",
-                   info->push_constants_size, relocation_count,
+         mesa_logi("ventus-vk: uploaded opaque RT push constants bytes=%u "
+                   "stages=0x%x",
+                   info->push_constants_size,
                    (unsigned)info->push_constants_stages);
       }
       if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG")) {
@@ -2309,9 +2489,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       }
    }
 
-   if (driver.vt_copy_from_dev(driver.device, image_dev_addr,
+   if (!vtvk_driver_readback_live_memory(info->device, &driver)) {
+      mesa_loge("ventus-vk: driver bridge failed to synchronize device writes");
+      goto out;
+   }
+   if (!info->descriptor_count &&
+       driver.vt_copy_from_dev(driver.device, image_dev_addr,
                                info->storage_image_data, image_bytes, 0, 0) != 0) {
-      mesa_loge("ventus-vk: driver bridge failed to copy storage image back");
+      mesa_loge("ventus-vk: legacy driver bridge failed to copy storage image back");
       goto out;
    }
 
@@ -2339,6 +2524,9 @@ out:
       mesa_loge("ventus-vk: global RT session teardown failed");
       ok = false;
    }
-   vtvk_driver_close(&driver);
+   if (!vtvk_driver_release_transients(&driver)) {
+      mesa_loge("ventus-vk: failed to release transient dispatch memory");
+      ok = false;
+   }
    return ok;
 }

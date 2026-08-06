@@ -883,7 +883,9 @@ vtvk_build_tlas(struct vtvk_device *device,
          inst->accelerationStructureReference;
       struct vtvk_acceleration_structure *blas_as =
          vtvk_find_as_by_address(blas_address);
-      const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_address;
+      const uint8_t *blas = blas_as ?
+         (blas_as->snapshot ? blas_as->snapshot :
+                              (const uint8_t *)blas_as->data) : nullptr;
       if (!blas_as || !blas_as->built || !blas ||
           vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
          return vk_error(device, VK_ERROR_UNKNOWN);
@@ -1036,7 +1038,18 @@ vtvk_CreateAccelerationStructureKHR(
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    as->snapshot_size = as->size;
-   as->address = (VkDeviceAddress)(uintptr_t)as->snapshot;
+   VkDeviceAddress buffer_address = vtvk_buffer_get_device_address(as->buffer);
+   if (!buffer_address || as->offset > UINT64_MAX - buffer_address) {
+      free(as->snapshot);
+      vk_free(alloc, as);
+      return vk_error(device, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
+   }
+   as->address = buffer_address + as->offset;
+   if (as->address % VTVK_AS_DEVICE_ADDRESS_ALIGNMENT) {
+      free(as->snapshot);
+      vk_free(alloc, as);
+      return vk_error(device, VK_ERROR_VALIDATION_FAILED_EXT);
+   }
 
    *pAccelerationStructure =
       (VkAccelerationStructureKHR)vtvk_ptr_to_handle(as);

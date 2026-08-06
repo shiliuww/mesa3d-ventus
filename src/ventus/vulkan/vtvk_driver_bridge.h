@@ -90,6 +90,7 @@ struct vtvk_rt_descriptor_source {
 };
 
 struct vtvk_driver_trace_rays_info {
+   struct vtvk_device *device;
    struct vtvk_acceleration_structure *tlas;
    void *storage_image_data;
    VkExtent3D image_extent;
@@ -125,6 +126,16 @@ struct vtvk_driver_trace_rays_info {
    uint32_t descriptor_count;
 };
 
+bool vtvk_driver_backend_init(struct vtvk_device *device);
+void vtvk_driver_backend_finish(struct vtvk_device *device);
+bool vtvk_driver_memory_alloc(struct vtvk_device *device, uint64_t size,
+                              uint64_t *dva_out);
+bool vtvk_driver_memory_free(struct vtvk_device *device, uint64_t size,
+                             uint64_t dva);
+bool vtvk_driver_memory_upload(struct vtvk_device *device, uint64_t dva,
+                               const void *src, uint64_t size);
+bool vtvk_driver_memory_readback(struct vtvk_device *device, uint64_t dva,
+                                 void *dst, uint64_t size);
 bool vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info);
 
 #ifdef __cplusplus
