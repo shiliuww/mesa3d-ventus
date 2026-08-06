@@ -194,7 +194,8 @@ enum vtvk_driver_kernel_resource_flags {
 struct vtvk_driver_kernel_launch_resources {
    uint64_t sgpr_usage;
    uint64_t vgpr_usage;
-   uint64_t pds_size_per_thread;
+   uint64_t pds_static_per_thread;
+   uint64_t pds_stack_size_per_thread;
    uint64_t lds_static_per_wg;
    uint64_t lds_stack_size_per_wf;
 };
@@ -405,12 +406,12 @@ vtvk_driver_normalize_kernel_resource(
        !vtvk_bridge_align_u64_checked(resource->pds_static_bytes,
                                       resource_alignment, &pds_static) ||
        !vtvk_bridge_align_u64_checked(resource->pds_stack_peak_bytes,
-                                      resource_alignment, &pds_stack) ||
-       __builtin_add_overflow(pds_static, pds_stack,
-                              &normalized->pds_size_per_thread)) {
+                                      resource_alignment, &pds_stack)) {
       mesa_loge("ventus-vk: kernel ELF %s resource size overflow", path);
       return false;
    }
+   normalized->pds_static_per_thread = pds_static;
+   normalized->pds_stack_size_per_thread = pds_stack;
    normalized->sgpr_usage =
       MAX2(normalized->sgpr_usage, minimum_sgpr_usage);
    return true;
@@ -428,8 +429,12 @@ vtvk_driver_merge_kernel_resource(
 
    envelope->sgpr_usage = MAX2(envelope->sgpr_usage, resource.sgpr_usage);
    envelope->vgpr_usage = MAX2(envelope->vgpr_usage, resource.vgpr_usage);
-   envelope->pds_size_per_thread =
-      MAX2(envelope->pds_size_per_thread, resource.pds_size_per_thread);
+   envelope->pds_static_per_thread =
+      MAX2(envelope->pds_static_per_thread,
+           resource.pds_static_per_thread);
+   envelope->pds_stack_size_per_thread =
+      MAX2(envelope->pds_stack_size_per_thread,
+           resource.pds_stack_size_per_thread);
    envelope->lds_static_per_wg =
       MAX2(envelope->lds_static_per_wg, resource.lds_static_per_wg);
    envelope->lds_stack_size_per_wf =
@@ -1083,6 +1088,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const bool wavefront_global =
       info->execution_profile == VTVK_RT_EXECUTION_WAVEFRONT_GLOBAL;
    struct vtvk_driver_kernel_launch_resources resource_envelope = {};
+   uint64_t pds_stack_base_per_thread = 0;
+   uint64_t pds_size_per_thread = 0;
    uint64_t pds_size = 0;
    uint64_t kernel_lds_size = 0;
    uint64_t continuation_size = wavefront_global ? 0 :
@@ -1107,18 +1114,34 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    struct vtvk_driver_kernel_metadata kernel = {};
    const char *dump_image = getenv("VENTUS_VK_DUMP_IMAGE");
 
+   if (kernel_path && kernel_path[0] &&
+       !vtvk_driver_collect_pipeline_resources(info, kernel_path,
+                                                &resource_envelope)) {
+      mesa_loge("ventus-vk: failed to derive RT kernel resource envelope");
+      goto out;
+   }
+   if (kernel_path && kernel_path[0] &&
+       __builtin_add_overflow(resource_envelope.lds_static_per_wg,
+                              resource_envelope.lds_stack_size_per_wf,
+                              &kernel_lds_size)) {
+      mesa_loge("ventus-vk: RT LDS resource envelope overflow");
+      goto out;
+   }
+
    if (wavefront_global && kernel_path && kernel_path[0]) {
       uint64_t unaligned_pds_size = 0;
-      if (!vtvk_driver_collect_pipeline_resources(info, kernel_path,
-                                                   &resource_envelope) ||
-          __builtin_mul_overflow(resource_envelope.pds_size_per_thread,
+      pds_stack_base_per_thread = resource_envelope.pds_static_per_thread;
+      if (__builtin_add_overflow(pds_stack_base_per_thread,
+                                 resource_envelope.pds_stack_size_per_thread,
+                                 &pds_size_per_thread)) {
+         mesa_loge("ventus-vk: global RT PDS resource envelope overflow");
+         goto out;
+      }
+      if (__builtin_mul_overflow(pds_size_per_thread,
                                  pds_resident_lanes,
                                  &unaligned_pds_size) ||
           !vtvk_bridge_align_u64_checked(unaligned_pds_size, 4096,
-                                         &pds_size) ||
-          __builtin_add_overflow(resource_envelope.lds_static_per_wg,
-                                 resource_envelope.lds_stack_size_per_wf,
-                                 &kernel_lds_size)) {
+                                         &pds_size)) {
          mesa_loge("ventus-vk: failed to derive global RT kernel "
                    "resource envelope");
          goto out;
@@ -1129,12 +1152,33 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                 " lds/static=%" PRIu64 " lds/stack/wf=%" PRIu64,
                 resource_envelope.sgpr_usage,
                 resource_envelope.vgpr_usage,
-                resource_envelope.pds_size_per_thread, pds_size,
+                pds_size_per_thread, pds_size,
                 resource_envelope.lds_static_per_wg,
                 resource_envelope.lds_stack_size_per_wf);
    } else if (!wavefront_global) {
+      static constexpr uint64_t compiler_pds_alignment = 128;
+      uint64_t rt_scratch_size = 0;
       uint64_t legacy_pds_size = 0;
-      if (__builtin_mul_overflow((uint64_t)info->per_lane_scratch_size,
+      if (!vtvk_bridge_align_u64_checked(info->per_lane_scratch_size,
+                                         compiler_pds_alignment,
+                                         &rt_scratch_size)) {
+         mesa_loge("ventus-vk: RT scratch size alignment overflow");
+         goto out;
+      }
+      if (rt_scratch_size && resource_envelope.pds_static_per_thread) {
+         mesa_loge("ventus-vk: compiler static-private storage overlaps the "
+                   "fixed RT scratch address range");
+         goto out;
+      }
+      pds_stack_base_per_thread =
+         MAX2(rt_scratch_size, resource_envelope.pds_static_per_thread);
+      if (__builtin_add_overflow(pds_stack_base_per_thread,
+                                 resource_envelope.pds_stack_size_per_thread,
+                                 &pds_size_per_thread)) {
+         mesa_loge("ventus-vk: MegaKernel PDS resource envelope overflow");
+         goto out;
+      }
+      if (__builtin_mul_overflow(pds_size_per_thread,
                                  pds_resident_lanes, &legacy_pds_size) ||
           !vtvk_bridge_align_u64_checked(
              MAX2(legacy_pds_size, (uint64_t)64 * 1024), 4096,
@@ -1142,6 +1186,15 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          mesa_loge("ventus-vk: legacy RT PDS allocation size overflow");
          goto out;
       }
+      mesa_logi("ventus-vk: MegaKernel RT private frame "
+                "scratch=%" PRIu64 " compiler/static=%" PRIu64
+                " compiler/stack=%" PRIu64 " stack-base=%" PRIu64
+                " total=%" PRIu64,
+                rt_scratch_size,
+                resource_envelope.pds_static_per_thread,
+                resource_envelope.pds_stack_size_per_thread,
+                pds_stack_base_per_thread,
+                pds_size_per_thread);
    }
 
    if (wavefront_global &&
@@ -1358,6 +1411,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
              &lds_stack_size_per_wf, sizeof(lds_stack_size_per_wf));
       memcpy(metadata.data() + VENTUS_KNL64_LDS_NON_STACK_SIZE,
              &lds_non_stack_size, sizeof(lds_non_stack_size));
+      memcpy(metadata.data() + VENTUS_KNL64_PDS_SIZE_PER_THREAD,
+             &pds_size_per_thread, sizeof(pds_size_per_thread));
+      memcpy(metadata.data() + VENTUS_KNL64_PDS_STACK_BASE_PER_THREAD,
+             &pds_stack_base_per_thread,
+             sizeof(pds_stack_base_per_thread));
    } else {
       uint32_t entry32 = 0;
       uint32_t args32 = 0;
@@ -1370,8 +1428,15 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          (uint32_t)resource_envelope.lds_stack_size_per_wf;
       const uint32_t lds_non_stack_size =
          (uint32_t)resource_envelope.lds_static_per_wg;
+      uint32_t pds_size_per_thread32 = 0;
+      uint32_t pds_stack_base_per_thread32 = 0;
       if (!vtvk_bridge_checked_u32("kernel entry", kernel_entry, &entry32) ||
-          !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32))
+          !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32) ||
+          !vtvk_bridge_checked_u32("per-thread PDS size", pds_size_per_thread,
+                                   &pds_size_per_thread32) ||
+          !vtvk_bridge_checked_u32("per-thread PDS stack base",
+                                   pds_stack_base_per_thread,
+                                   &pds_stack_base_per_thread32))
          goto out;
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
@@ -1389,6 +1454,11 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
              &lds_stack_size_per_wf, sizeof(lds_stack_size_per_wf));
       memcpy(metadata.data() + VENTUS_KNL32_LDS_NON_STACK_SIZE,
              &lds_non_stack_size, sizeof(lds_non_stack_size));
+      memcpy(metadata.data() + VENTUS_KNL32_PDS_SIZE_PER_THREAD,
+             &pds_size_per_thread32, sizeof(pds_size_per_thread32));
+      memcpy(metadata.data() + VENTUS_KNL32_PDS_STACK_BASE_PER_THREAD,
+             &pds_stack_base_per_thread32,
+             sizeof(pds_stack_base_per_thread32));
    }
 
    if (!vtvk_driver_alloc_copy(&driver, metadata.data(), metadata.size(),
@@ -1633,10 +1703,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.wg_size = 1;
    kernel.metaDataBaseAddr = metadata_dev_addr;
    kernel.ldsSize = kernel_lds_size;
-   kernel.pdsSize = wavefront_global ?
-      resource_envelope.pds_size_per_thread : info->per_lane_scratch_size;
-   kernel.sgprUsage = wavefront_global ? resource_envelope.sgpr_usage : 0;
-   kernel.vgprUsage = wavefront_global ? resource_envelope.vgpr_usage : 0;
+   kernel.pdsSize = pds_size_per_thread;
+   kernel.sgprUsage = resource_envelope.sgpr_usage;
+   kernel.vgprUsage = resource_envelope.vgpr_usage;
    kernel.pdsBaseAddr = pds_dev_addr;
    kernel.num_thread_global[0] = info->width;
    kernel.num_thread_global[1] = info->height;

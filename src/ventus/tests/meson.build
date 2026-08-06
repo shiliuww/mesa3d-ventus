@@ -8,9 +8,22 @@ vt_rt_profile_test = executable(
   build_by_default : false,
 )
 
+vt_kernel_metadata_layout_test = executable(
+  'vt_kernel_metadata_layout_test',
+  'vt_kernel_metadata_layout_test.c',
+  include_directories : [inc_src],
+  build_by_default : false,
+)
+
 test(
   'vt_rt_profile',
   vt_rt_profile_test,
+  suite : ['ventus'],
+)
+
+test(
+  'vt_kernel_metadata_layout',
+  vt_kernel_metadata_layout_test,
   suite : ['ventus'],
 )
 
