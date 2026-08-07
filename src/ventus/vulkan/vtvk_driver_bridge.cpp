@@ -1268,8 +1268,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const bool staged_dispatch =
       info->execution_profile ==
          VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
-   const bool wavefront_global =
-      staged_dispatch || info->internal_transparent_oracle;
+   const bool wavefront_global = staged_dispatch;
    struct vtvk_driver_kernel_launch_resources resource_envelope = {};
    uint64_t pds_stack_base_per_thread = 0;
    uint64_t pds_size_per_thread = 0;

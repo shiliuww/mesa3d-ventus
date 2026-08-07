@@ -62,7 +62,6 @@ struct vtvk_pipeline {
    VkVentusRtStageRole rt_stage_role;
    uint32_t rt_state_descriptor_set;
    uint32_t rt_state_descriptor_binding;
-   bool rt_internal_transparent_oracle;
    bool rt_uses_rv64;
    bool retain_generated_artifacts;
    struct vt_nir_pipeline_scratch_info scratch_info;

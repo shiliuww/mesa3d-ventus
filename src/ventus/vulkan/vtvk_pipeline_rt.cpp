@@ -1938,10 +1938,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->rt_state_descriptor_set = profile_config.state_descriptor_set;
    pipeline->rt_state_descriptor_binding =
       profile_config.state_descriptor_binding;
-   pipeline->rt_internal_transparent_oracle =
-      !profile_config.explicit_profile &&
-      device->rt_internal_oracle_profile ==
-         VTVK_RT_INTERNAL_ORACLE_TRANSPARENT;
    pipeline->rt_uses_rv64 = device->rt_uses_rv64;
    pipeline->retain_generated_artifacts =
       vtvk_env_enabled("VENTUS_VK_RETAIN_SHADER_ARTIFACTS");
@@ -2014,8 +2010,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    const bool global_wavefront =
       pipeline->rt_execution_profile ==
-         VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH ||
-      pipeline->rt_internal_transparent_oracle;
+         VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
 
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();

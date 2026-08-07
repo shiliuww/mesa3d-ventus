@@ -115,7 +115,6 @@ struct vtvk_driver_trace_rays_info {
    VkVentusRtStageRole stage_role;
    uint32_t state_descriptor_set;
    uint32_t state_descriptor_binding;
-   bool internal_transparent_oracle;
    bool rt_uses_rv64;
    const char *kernel_path;
    uint64_t kernel_entry;

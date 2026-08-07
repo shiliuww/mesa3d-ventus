@@ -10,11 +10,6 @@
 extern "C" {
 #endif
 
-enum vtvk_rt_internal_oracle_profile {
-   VTVK_RT_INTERNAL_ORACLE_MEGAKERNEL = 0,
-   VTVK_RT_INTERNAL_ORACLE_TRANSPARENT,
-};
-
 struct vtvk_rt_execution_profile_config {
    VkVentusRtExecutionProfile profile;
    VkVentusRtStageRole stage_role;
@@ -31,12 +26,11 @@ vtvk_rt_execution_profile_parse(
    struct vtvk_rt_execution_profile_config *config);
 
 bool
-vtvk_rt_internal_oracle_resolve(
+vtvk_rt_legacy_selectors_absent(
    const char *public_selector,
    const char *internal_selector,
    const char *legacy_global,
-   const char *legacy_mirror,
-   enum vtvk_rt_internal_oracle_profile *profile);
+   const char *legacy_mirror);
 
 #ifdef __cplusplus
 }

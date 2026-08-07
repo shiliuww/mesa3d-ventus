@@ -1,7 +1,5 @@
 #include "vtvk_rt_profile.h"
 
-#include <string.h>
-
 static bool
 vtvk_rt_stage_role_is_staged(VkVentusRtStageRole role)
 {
@@ -73,28 +71,13 @@ vtvk_rt_execution_profile_parse(
 }
 
 bool
-vtvk_rt_internal_oracle_resolve(
+vtvk_rt_legacy_selectors_absent(
    const char *public_selector,
    const char *internal_selector,
    const char *legacy_global,
-   const char *legacy_mirror,
-   enum vtvk_rt_internal_oracle_profile *profile)
+   const char *legacy_mirror)
 {
-   if (!profile)
-      return false;
-
-   if ((public_selector && public_selector[0]) || legacy_global || legacy_mirror)
-      return false;
-
-   if (internal_selector && internal_selector[0]) {
-      if (strcmp(internal_selector, "compat") == 0)
-         *profile = VTVK_RT_INTERNAL_ORACLE_MEGAKERNEL;
-      else if (strcmp(internal_selector, "global") == 0)
-         *profile = VTVK_RT_INTERNAL_ORACLE_TRANSPARENT;
-      else
-         return false;
-   } else {
-      *profile = VTVK_RT_INTERNAL_ORACLE_MEGAKERNEL;
-   }
-   return true;
+   return !(public_selector && public_selector[0]) &&
+          !(internal_selector && internal_selector[0]) &&
+          !legacy_global && !legacy_mirror;
 }

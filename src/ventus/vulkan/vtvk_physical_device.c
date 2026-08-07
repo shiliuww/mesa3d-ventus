@@ -244,12 +244,11 @@ vtvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    const char *public_selector = getenv("VENTUS_VK_RT_EXECUTION_PROFILE");
    const char *internal_selector =
       getenv("VENTUS_VK_INTERNAL_RT_ORACLE_PROFILE");
-   if (!vtvk_rt_internal_oracle_resolve(
+   if (!vtvk_rt_legacy_selectors_absent(
           public_selector,
           internal_selector,
           getenv("VENTUS_VK_RT_WAVEFRONT_GLOBAL"),
-          getenv("VENTUS_VK_RT_WAVEFRONT_MIRROR"),
-          &pdev->rt_internal_oracle_profile)) {
+          getenv("VENTUS_VK_RT_WAVEFRONT_MIRROR"))) {
       mesa_loge("ventus-vk: legacy RT execution selectors are unsupported; "
                 "applications must use the Ventus pipeline profile pNext");
       vk_free(&instance->vk.alloc, pdev);

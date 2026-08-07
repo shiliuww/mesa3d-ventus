@@ -118,37 +118,20 @@ check_profile_parser(void)
 }
 
 static void
-check_internal_oracle(void)
+check_legacy_selector_rejection(void)
 {
-   enum vtvk_rt_internal_oracle_profile profile =
-      VTVK_RT_INTERNAL_ORACLE_TRANSPARENT;
-   assert(vtvk_rt_internal_oracle_resolve(
-      NULL, NULL, NULL, NULL, &profile));
-   assert(profile == VTVK_RT_INTERNAL_ORACLE_MEGAKERNEL);
-
-   assert(vtvk_rt_internal_oracle_resolve(
-      NULL, "compat", NULL, NULL, &profile));
-   assert(profile == VTVK_RT_INTERNAL_ORACLE_MEGAKERNEL);
-   assert(vtvk_rt_internal_oracle_resolve(
-      NULL, "global", NULL, NULL, &profile));
-   assert(profile == VTVK_RT_INTERNAL_ORACLE_TRANSPARENT);
-
-   assert(!vtvk_rt_internal_oracle_resolve(
-      "compat", NULL, NULL, NULL, &profile));
-   assert(!vtvk_rt_internal_oracle_resolve(
-      NULL, NULL, "0", NULL, &profile));
-   assert(!vtvk_rt_internal_oracle_resolve(
-      NULL, NULL, NULL, "0", &profile));
-   assert(!vtvk_rt_internal_oracle_resolve(
-      NULL, "invalid", NULL, NULL, &profile));
-   assert(!vtvk_rt_internal_oracle_resolve(
-      NULL, NULL, NULL, NULL, NULL));
+   assert(vtvk_rt_legacy_selectors_absent(NULL, NULL, NULL, NULL));
+   assert(!vtvk_rt_legacy_selectors_absent("compat", NULL, NULL, NULL));
+   assert(!vtvk_rt_legacy_selectors_absent(NULL, "compat", NULL, NULL));
+   assert(!vtvk_rt_legacy_selectors_absent(NULL, "global", NULL, NULL));
+   assert(!vtvk_rt_legacy_selectors_absent(NULL, NULL, "0", NULL));
+   assert(!vtvk_rt_legacy_selectors_absent(NULL, NULL, NULL, "0"));
 }
 
 int
 main(void)
 {
    check_profile_parser();
-   check_internal_oracle();
+   check_legacy_selector_rejection();
    return 0;
 }
