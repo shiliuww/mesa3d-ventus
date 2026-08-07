@@ -116,6 +116,7 @@ public:
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")),
         globalRtWavefront(options && options->global_rt_wavefront),
         globalRtCompactResume(options && options->global_rt_compact_resume),
+        privateBaseBytes(options ? options->private_base_bytes : 0),
         entryPointName(options && options->entry_point_name ?
                        options->entry_point_name : ""),
         entryPointIsKernel(options && options->entry_point_is_kernel) {}
@@ -199,6 +200,7 @@ private:
    bool debugLowering;
    bool globalRtWavefront;
    bool globalRtCompactResume;
+   uint32_t privateBaseBytes;
    std::string entryPointName;
    bool entryPointIsKernel;
    bool translationFailed = false;
@@ -214,6 +216,8 @@ private:
    std::vector<BasicBlock *> continueTargets;
    BasicBlock *returnTarget = nullptr;
    Value *raygenLaunchId[3] = {nullptr, nullptr, nullptr};
+   AllocaInst *privateFrame = nullptr;
+   unsigned privateFrameNextWord = 0;
 
    static bool envEnabled(const char *name)
    {
@@ -237,6 +241,8 @@ private:
       raygenLaunchId[1] = nullptr;
       raygenLaunchId[2] = nullptr;
       translationFailed = false;
+      privateFrame = nullptr;
+      privateFrameNextWord = 0;
    }
 
    bool instructionUsesUnsupportedDef(nir_instr *instr) const
@@ -729,21 +735,52 @@ private:
          return std::max(4u, (bytes + 3u) / 4u);
       };
 
-      auto allocVar = [&](nir_variable *var) {
+      std::vector<nir_variable *> vars;
+      auto collectVar = [&](nir_variable *var) {
          if (!var || variables.count(var) ||
              var->data.mode == nir_var_mem_push_const)
             return;
+         vars.push_back(var);
+      };
+
+      nir_foreach_variable_in_shader(var, shader)
+         collectVar(var);
+
+      foreach_list_typed(nir_variable, var, node, &impl->locals)
+         collectVar(var);
+
+      if (privateBaseBytes) {
+         uint64_t words = (uint64_t(privateBaseBytes) + 3u) / 4u;
+         for (nir_variable *var : vars)
+            words += storageWords(var->type);
+         if (words > UINT32_MAX)
+            words = UINT32_MAX;
+         privateFrame = entryAlloca(ArrayType::get(i32, (unsigned)words),
+                                    "ventus.private.frame", Align(16));
+         privateFrameNextWord = (privateBaseBytes + 3u) / 4u;
+      }
+
+      auto allocVar = [&](nir_variable *var) {
+         const unsigned words = storageWords(var->type);
+         if (privateFrame) {
+            Value *indices[] = {ConstantInt::get(i32, 0),
+                                ConstantInt::get(i32, privateFrameNextWord)};
+            Value *ptr = builder.CreateInBoundsGEP(
+               privateFrame->getAllocatedType(), privateFrame, indices,
+               var->name ? var->name : "nir.var");
+            privateFrameNextWord += words;
+            variables[var] = ptr;
+            return;
+         }
+
          AllocaInst *alloca =
-            builder.CreateAlloca(ArrayType::get(i32, storageWords(var->type)), nullptr,
+            builder.CreateAlloca(ArrayType::get(i32, words), nullptr,
                                  var->name ? var->name : "nir.var");
          alloca->setAlignment(Align(16));
          variables[var] = alloca;
       };
 
-      nir_foreach_variable_in_shader(var, shader)
-         allocVar(var);
-
-      foreach_list_typed(nir_variable, var, node, &impl->locals)
+      for (nir_variable *var : vars)
          allocVar(var);
    }
 
@@ -2318,7 +2355,7 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
    const char *moduleName = options && options->module_name ? options->module_name : "ventus_nir";
    auto *module = new Module(moduleName, context);
    module->setTargetTriple(options && options->target_triple ? options->target_triple : "riscv32-unknown-elf");
-   module->setDataLayout(options && options->data_layout ? options->data_layout : "e-m:e-p:32:32-i64:64-n32-S128");
+   module->setDataLayout(options && options->data_layout ? options->data_layout : "e-m:e-p:32:32-i64:64-n32-S128-A5-G1");
 
    VentusNirToLlvm translator(context, *module, options);
    for (unsigned i = 0; i < shader_count; ++i) {

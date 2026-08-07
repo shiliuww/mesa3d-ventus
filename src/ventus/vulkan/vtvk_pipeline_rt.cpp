@@ -833,7 +833,7 @@ vtvk_rt_unique_payload_location_for_var(
 
 static void
 vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
-                                        uint32_t shader_count)
+                                         uint32_t shader_count)
 {
    for (uint32_t i = 0; i < shader_count; i++) {
       nir_shader *shader = shaders[i];
@@ -933,6 +933,63 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
          }
       }
    }
+}
+
+static bool
+vtvk_rt_is_triangle_barycentrics(nir_shader *shader, nir_variable *var,
+                                  bool has_intersection)
+{
+   if (!shader || !var || has_intersection ||
+       var->data.mode != nir_var_ray_hit_attrib)
+      return false;
+
+   unsigned size = 0, align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   /* The local SPIR-V/NIR path may represent hitAttributeEXT vec2 as a
+    * padded vec3.  Only its first two components belong to the V4 record. */
+   return var->data.driver_location == 0 && size >= 8 && align >= 4;
+}
+
+static bool
+vtvk_rt_compute_hit_attribute_rest(nir_shader **shaders,
+                                   uint32_t shader_count,
+                                   bool *triangle_barycentrics,
+                                   uint32_t *rest_bytes)
+{
+   if (!triangle_barycentrics || !rest_bytes)
+      return false;
+
+   bool has_intersection = false;
+   for (uint32_t i = 0; i < shader_count; i++)
+      has_intersection |= shaders[i] &&
+                          shaders[i]->info.stage == MESA_SHADER_INTERSECTION;
+
+   uint32_t end = 0;
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *shader = shaders[i];
+      if (!shader)
+         continue;
+
+      nir_foreach_variable_in_shader(var, shader) {
+         if (var->data.mode != nir_var_ray_hit_attrib ||
+             vtvk_rt_is_triangle_barycentrics(shader, var, has_intersection))
+            continue;
+
+         unsigned size = 0, align = 0;
+         glsl_get_natural_size_align_bytes(var->type, &size, &align);
+         if (var->data.driver_location < 0)
+            return false;
+         const uint64_t finish =
+            (uint64_t)(uint32_t)var->data.driver_location + size;
+         if (finish > UINT32_MAX)
+            return false;
+         end = MAX2(end, (uint32_t)finish);
+      }
+   }
+
+   *triangle_barycentrics = !has_intersection;
+   *rest_bytes = ALIGN_POT(end, VT_RT_ABI_WORD_BYTES);
+   return true;
 }
 
 static void
@@ -1401,8 +1458,8 @@ vtvk_lower_rt_callable_invocations(
 /* A procedural report stays inside one compact intersection callback.  The
  * matching any-hit code is inlined at the report site, so locals and control
  * flow naturally continue to a later reportIntersectionEXT in the same
- * shader.  DONE records that at least one report was accepted; the committed
- * record retains the nearest accepted report even if a later one is ignored. */
+ * shader.  The committed-record validity remembers an earlier accepted report
+ * while CALLBACK_DECISION carries the final shader-return effect. */
 struct vtvk_rt_intersection_report_lower_data {
    const struct vt_nir_rt_config *config;
    nir_shader *any_hit;
@@ -1430,21 +1487,24 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
    nir_def *ray_tmax = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_TMAX);
+   nir_def *committed_valid = nir_ieq_imm(
+      b, committed_status, VT_RT_HIT_RECORD_STATUS_VALID);
    nir_def *current_tmax = nir_bcsel(
-      b, nir_ieq_imm(b, committed_status, VT_RT_STATUS_HIT),
+      b, committed_valid,
       committed_tmax, ray_tmax);
    nir_def *tmin = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_TMIN);
-   nir_def *terminated = nir_ine_imm(
+   nir_def *terminated = nir_ieq_imm(
       b, vt_nir_load_control_word(
-            b, config, layout, VT_RT_CONTROL_TERMINATE_RAY, 32), 0);
+            b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32),
+      VT_RT_CALLBACK_TERMINATE);
    nir_def *ray_ref = vt_nir_rt_global_callback_ray_ref(b);
    nir_def *candidate_attributes = vt_nir_rt_global_load_completion_addr(
       b, ray_ref, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
    nir_def *committed_attributes = vt_nir_rt_global_load_completion_addr(
       b, ray_ref, VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO);
    nir_def *in_range = nir_iand(
-      b, nir_fge(b, current_tmax, hit_t), nir_fge(b, hit_t, tmin));
+      b, nir_flt(b, hit_t, current_tmax), nir_fge(b, hit_t, tmin));
    nir_def *eligible = nir_iand(b, in_range, nir_inot(b, terminated));
 
    /* Preserve the AABB metadata populated by RTcore, changing only the
@@ -1452,8 +1512,9 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
     * the record says otherwise. */
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_STATUS,
-      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_STATUS_HIT),
-                nir_imm_int(b, VT_RT_STATUS_IDLE)));
+      nir_bcsel(b, eligible,
+                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
+                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID)));
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, hit_t);
    vt_nir_store_candidate_hit_record_word(
@@ -1461,12 +1522,13 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_FRONT_FACE,
       nir_ieq_imm(b, hit_kind, 0xfe));
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_ACCEPT_HIT,
-                               eligible);
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_IGNORE_HIT,
-                               nir_inot(b, eligible));
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_TERMINATE_RAY,
-                               terminated);
+   vt_nir_store_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
+      nir_bcsel(b, terminated, nir_imm_int(b, VT_RT_CALLBACK_TERMINATE),
+                nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                          nir_bcsel(b, committed_valid,
+                                    nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                                    nir_imm_int(b, VT_RT_CALLBACK_IGNORE)))));
 
    nir_def *flags = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_FLAGS);
@@ -1485,17 +1547,12 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_pop_if(b, NULL);
    }
 
+   nir_def *decision = vt_nir_load_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32);
    nir_def *accepted = nir_iand(
-      b, nir_ine_imm(
-            b, vt_nir_load_control_word(
-                  b, config, layout, VT_RT_CONTROL_ACCEPT_HIT, 32), 0),
-      nir_inot(b, nir_ine_imm(
-                       b, vt_nir_load_control_word(
-                             b, config, layout, VT_RT_CONTROL_IGNORE_HIT, 32), 0)));
-   nir_def *was_accepted = nir_ine_imm(
-      b, vt_nir_load_control_word(b, config, layout, VT_RT_CONTROL_DONE, 32), 0);
-   vt_nir_store_control_word(b, config, layout, VT_RT_CONTROL_DONE,
-                               nir_ior(b, was_accepted, accepted));
+      b, eligible,
+      nir_ior(b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
+              nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE)));
 
    nir_push_if(b, accepted);
    for (uint32_t word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
@@ -1512,6 +1569,14 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
                        nir_iadd(b, committed_attributes, offset), 0x1);
    }
    nir_pop_if(b, NULL);
+
+   vt_nir_store_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
+      nir_bcsel(b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE),
+                nir_imm_int(b, VT_RT_CALLBACK_TERMINATE),
+                nir_bcsel(b, nir_ior(b, committed_valid, accepted),
+                          nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                          nir_imm_int(b, VT_RT_CALLBACK_IGNORE))));
 
    nir_def_rewrite_uses(&intrin->def, accepted);
    nir_instr_remove(&intrin->instr);
@@ -1920,6 +1985,33 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
 
+   struct vt_nir_rt_abi_layout rt_abi = vt_nir_rt_default_abi_layout();
+   bool triangle_barycentrics = false;
+   uint32_t hit_attribute_rest = 0;
+   uint32_t rt_payload_size = 0;
+   if (!vtvk_rt_compute_hit_attribute_rest(
+          pipeline->shaders, pipeline->shader_count, &triangle_barycentrics,
+          &hit_attribute_rest) ||
+       !vt_nir_rt_abi_layout_set_hit_attrib_size(
+          &rt_abi, hit_attribute_rest, triangle_barycentrics) ||
+       !vt_nir_rt_compute_pipeline_payload_size(
+          pipeline->shaders, pipeline->shader_count, &rt_payload_size) ||
+       !vt_nir_rt_abi_layout_set_payload_size(&rt_abi, rt_payload_size) ||
+       !vt_nir_rt_abi_layout_set_recursion_depth(
+          &rt_abi, pipeline->max_ray_recursion_depth)) {
+      mesa_loge("ventus-vk: RT frame layout exceeds MegaKernel ABI v4 limits");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
+   if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+      mesa_logi("ventus-vk: RT ABI v4 hitattr=%u bary=%u payload=%u depth=%u spill=%u private_base=%u",
+                rt_abi.hit_attrib_size_bytes,
+                rt_abi.hit_attrib_barycentrics ? 1 : 0,
+                rt_abi.payload_size_bytes, rt_abi.max_ray_recursion_depth,
+                rt_abi.payload_spill_size_bytes, rt_abi.private_base_bytes);
+   }
+
    const bool global_wavefront =
       pipeline->rt_execution_profile ==
          VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH ||
@@ -1927,11 +2019,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
-      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-      vt_nir_rt_config_apply_abi_layout(&config, &abi);
+      vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
 
       if (global_wavefront) {
-         vt_nir_rt_config_apply_global_cps_layout(&config, &abi);
+         vt_nir_rt_config_apply_global_cps_layout(&config, &rt_abi);
          config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
          config.defer_intersection_reports = true;
       }
@@ -1946,10 +2037,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
-      struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
-      vt_nir_rt_config_apply_abi_layout(&rt_io_config, &abi);
+      vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
       if (global_wavefront) {
-         vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &abi);
+         vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &rt_abi);
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
       }
 
@@ -2072,6 +2162,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
+   pipeline->per_lane_scratch_size =
+      MAX2(pipeline->per_lane_scratch_size, rt_abi.total_size_bytes);
+   pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;
 
    struct vt_nir_to_llvm_options llvm_options = {
       .module_name = "ventus_rt_pipeline",
@@ -2079,9 +2172,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                                 "riscv32-unknown-elf",
       .data_layout = pipeline->rt_uses_rv64 ?
          "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128-A5-G1" :
-         "e-m:e-p:32:32-i64:64-n32-S128",
+         "e-m:e-p:32:32-i64:64-n32-S128-A5-G1",
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
+      .private_base_bytes = global_wavefront ? 0 : rt_abi.private_base_bytes,
    };
 
    pipeline->llvm_module =

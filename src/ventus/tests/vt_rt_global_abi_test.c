@@ -101,7 +101,8 @@ main(void)
          VT_RT_HIT_RECORD_WORD_COUNT);
    CHECK(VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_LAST -
          VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE + 1 ==
-         VT_RT_CONTROL_WORD_COUNT);
+         VT_RT_GLOBAL_CANDIDATE_CONTROL_WORD_COUNT);
+   CHECK(VT_RT_CONTROL_WORD_COUNT == 1);
    CHECK(vt_rt_global_completion_field_offset_bytes(
             &completion, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE, 31) !=
          vt_rt_global_completion_field_offset_bytes(

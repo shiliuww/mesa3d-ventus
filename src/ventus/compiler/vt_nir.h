@@ -61,6 +61,11 @@ struct vt_nir_scratchpad_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
+   bool hit_attrib_barycentrics;
+   uint32_t payload_spill_base_bytes;
+   uint32_t payload_spill_size_bytes;
+   uint32_t max_ray_recursion_depth;
+   uint32_t private_base_bytes;
    uint32_t total_size_bytes;
 };
 
@@ -77,8 +82,12 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
-   /* PDS-free static RT state: ray, hit records, attributes, and payload. */
+   bool hit_attrib_barycentrics;
    uint32_t region_size_bytes;
+   uint32_t private_base_bytes;
+   uint32_t payload_spill_base_bytes;
+   uint32_t payload_spill_size_bytes;
+   uint32_t max_ray_recursion_depth;
    uint32_t total_size_bytes;
 };
 
@@ -100,7 +109,6 @@ struct vt_nir_rt_trace_params {
    nir_def *direction;
    nir_def *tmax;
    nir_def *payload;
-   nir_def *abi_tag;
 };
 
 struct vt_nir_rt_result {
@@ -168,6 +176,17 @@ struct vt_nir_rt_config vt_nir_rt_default_config(void);
 
 struct vt_nir_rt_abi_layout vt_nir_rt_default_abi_layout(void);
 
+bool vt_nir_rt_compute_pipeline_payload_size(nir_shader **shaders,
+                                             unsigned shader_count,
+                                             uint32_t *payload_size_bytes);
+bool vt_nir_rt_abi_layout_set_payload_size(struct vt_nir_rt_abi_layout *layout,
+                                           uint32_t payload_size_bytes);
+bool vt_nir_rt_abi_layout_set_hit_attrib_size(
+   struct vt_nir_rt_abi_layout *layout, uint32_t hit_attrib_size_bytes,
+   bool hit_attrib_barycentrics);
+bool vt_nir_rt_abi_layout_set_recursion_depth(
+   struct vt_nir_rt_abi_layout *layout, uint32_t max_ray_recursion_depth);
+
 /* Rebind the common RT regions into a PDS-free global CPS frame. */
 void vt_nir_rt_config_apply_global_cps_layout(
    struct vt_nir_rt_config *config,
@@ -225,6 +244,14 @@ nir_def *vt_nir_scratchpad_addr(nir_builder *b,
                                 const struct vt_nir_rt_config *config,
                                 enum vt_rt_shader_layout layout,
                                 uint32_t byte_offset);
+
+nir_def *vt_nir_load_active_level(nir_builder *b,
+                                  const struct vt_nir_rt_config *config,
+                                  enum vt_rt_shader_layout layout);
+void vt_nir_store_active_level(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_shader_layout layout,
+                               nir_def *level);
 
 nir_def *vt_nir_payload_addr(nir_builder *b,
                              const struct vt_nir_rt_config *config,

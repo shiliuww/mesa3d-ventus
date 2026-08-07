@@ -132,20 +132,32 @@ main()
    const vt_nir_to_llvm_options llvm_options = {
       .module_name = "vt_float_phi",
       .target_triple = "riscv32-unknown-elf",
-      .data_layout = "e-m:e-p:32:32-i64:64-n32-S128",
+      .data_layout = "e-m:e-p:32:32-i64:64-n32-S128-A5-G1",
       .require_ssa_function_temps = true,
+      .private_base_bytes = 320,
    };
 
    llvm::Module *module =
       vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
    VT_RT_CHECK(module != nullptr);
    VT_RT_CHECK(!llvm::verifyModule(*module));
+   VT_RT_CHECK(module->getDataLayout().getAllocaAddrSpace() == 5);
 
    bool found_phi = false;
    bool found_float_bits = false;
+   bool found_reserved_private_prefix = false;
    for (llvm::Function &function : *module) {
       for (llvm::BasicBlock &block : function) {
          for (llvm::Instruction &instruction : block) {
+            auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+            if (alloca && alloca->getName() == "ventus.private.frame") {
+               VT_RT_CHECK(alloca->getAddressSpace() == 5);
+               auto *frame = llvm::dyn_cast<llvm::ArrayType>(
+                  alloca->getAllocatedType());
+               found_reserved_private_prefix =
+                  frame && frame->getNumElements() >= 80;
+            }
+
             auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction);
             if (!phi)
                continue;
@@ -164,6 +176,7 @@ main()
 
    VT_RT_CHECK(found_phi);
    VT_RT_CHECK(found_float_bits);
+   VT_RT_CHECK(found_reserved_private_prefix);
 
    delete module;
    ralloc_free(shader);

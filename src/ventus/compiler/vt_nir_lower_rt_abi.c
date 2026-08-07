@@ -25,6 +25,13 @@ vt_nir_lower_rt_abi(nir_shader *shader,
       return false;
 
    bool progress = false;
+   if (shader->info.stage == MESA_SHADER_RAYGEN) {
+      nir_builder b = nir_builder_create(impl);
+      b.cursor = nir_before_impl(impl);
+      vt_nir_store_active_level(&b, config, VT_RT_LAYOUT_RAYGEN,
+                                nir_imm_int(&b, 0));
+      progress = true;
+   }
    progress |= vt_nir_lower_rt_payload(shader, config);
    progress |= vt_nir_lower_rt_hit_record(shader, config);
    progress |= vt_nir_lower_rt_control(shader, config);

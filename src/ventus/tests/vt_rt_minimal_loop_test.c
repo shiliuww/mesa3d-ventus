@@ -15,8 +15,17 @@ build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
    nir_variable *payload =
       nir_variable_create(b.shader, nir_var_shader_call_data,
                           glsl_vec4_type(), "payload_in");
+   payload->data.explicit_location = true;
+   payload->data.location = 0;
    nir_def *payload_value = nir_load_var(&b, payload);
    nir_store_var(&b, payload, payload_value, 0xf);
+
+   /* glslang can pad hitAttributeEXT vec2 to a vec3 in NIR.  V4 still maps
+    * the first two components to the committed hit record barycentrics. */
+   nir_variable *attribs =
+      nir_variable_create(b.shader, nir_var_ray_hit_attrib,
+                          glsl_vec_type(3), "padded_barycentrics");
+   nir_def *barycentrics = nir_load_var(&b, attribs);
 
    nir_def *record_ptr = nir_load_shader_record_ptr(&b);
    nir_def *hit_t = nir_load_ray_t_max(&b);
@@ -55,6 +64,11 @@ build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
    nir_store_var(&b, sink,
                  nir_vec4(&b, nir_unpack_64_2x32_split_y(&b, record_ptr),
                           hit_t, instance_custom_index, instance_id),
+                 0xf);
+   nir_store_var(&b, sink,
+                 nir_vec4(&b, nir_channel(&b, barycentrics, 0),
+                          nir_channel(&b, barycentrics, 1), geometry_id,
+                          hit_kind),
                  0xf);
    nir_store_var(&b, sink,
                  nir_vec4(&b, nir_channel(&b, world_origin, 0),
@@ -294,39 +308,50 @@ main(int argc, char **argv)
                abi.hit_record_base_bytes + abi.hit_record_size_bytes);
    VT_RT_CHECK(abi.payload_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
-   VT_RT_CHECK(abi.payload_size_bytes == 48);
+   VT_RT_CHECK(abi.payload_size_bytes == 0);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES ==
                VT_RT_CPS_HEADER_WORD_COUNT * 4);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.hit_record_size_bytes == 72);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 2);
-   VT_RT_CHECK(VT_RT_ABI_TAG == 0x56540002u);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 4);
+   VT_RT_CHECK(VT_RT_ABI_TAG == 0x56540004u);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(VT_RT_SLOT_ABI_TAG * 4 == 92);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
-   VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_ABI_CPS_HEADER_BASE_BYTES);
+   VT_RT_CHECK(abi.ray_state_size_bytes == 92);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_ABI_TAG == 148);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR == 272);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE == 280);
    VT_RT_CHECK(VT_NIR_RT_DISPATCH_ARG_SIZE == 288);
    VT_RT_CHECK(abi.control_base_bytes == 112);
-   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 144);
-   VT_RT_CHECK(abi.hit_record_base_bytes == 224);
-   VT_RT_CHECK(abi.hit_attrib_base_bytes == 304);
-   VT_RT_CHECK(abi.payload_base_bytes == 336);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 116);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 196);
+   VT_RT_CHECK(abi.hit_attrib_base_bytes == 276);
+   VT_RT_CHECK(abi.payload_base_bytes == 276);
    VT_RT_CHECK(abi.payload_base_bytes + abi.payload_size_bytes ==
                VT_RT_ABI_REGION_SIZE_BYTES);
-   VT_RT_CHECK(abi.total_size_bytes ==
-               VT_RT_ABI_PDS_BASE_BYTES + 384);
+   VT_RT_CHECK(abi.total_size_bytes == 276);
    VT_RT_CHECK(abi.total_size_bytes ==
                VT_RT_ABI_PDS_BASE_BYTES + VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
+
+   nir_shader *pipeline[] = {
+      raygen, miss, closest_hit, any_hit, intersection, terminating_any_hit,
+   };
+   uint32_t linked_payload_size = 0;
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(&abi, 0, true));
+   VT_RT_CHECK(vt_nir_rt_compute_pipeline_payload_size(
+      pipeline, ARRAY_SIZE(pipeline), &linked_payload_size));
+   VT_RT_CHECK(linked_payload_size == 16);
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(
+      &abi, linked_payload_size));
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&abi, 1));
+   vt_nir_rt_config_apply_abi_layout(&config, &abi);
 
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
@@ -346,6 +371,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(cps_after.trace_ray == 0);
 
    struct vt_nir_rt_config global_config = vt_nir_rt_default_config();
+   vt_nir_rt_config_apply_global_cps_layout(&global_config, &abi);
    fprintf(stderr, "stage global-terminal\n");
    global_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
    /* The profile gate must not accidentally invoke any PDS ABI lower. */
@@ -423,7 +449,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
    VT_RT_CHECK(after.ventus_rt_release == 1);
    VT_RT_CHECK(vt_rt_count_dispatch_arg_offset(
-                  raygen, VT_NIR_RT_DISPATCH_ARG_ABI_TAG) == 1);
+                  raygen, VT_NIR_RT_DISPATCH_ARG_ABI_TAG) == 0);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(raygen));
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);
@@ -488,16 +514,25 @@ main(int argc, char **argv)
                   closest_hit,
                   VT_RT_ABI_PDS_BASE_BYTES + abi.hit_record_base_bytes +
                      VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI * 4) > 0);
+   VT_RT_CHECK(count_load_slot_from_const_addr(
+                  closest_hit,
+                  VT_RT_ABI_PDS_BASE_BYTES + abi.hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_BARYCENTRICS_X * 4) > 0);
+   VT_RT_CHECK(count_load_slot_from_const_addr(
+                  closest_hit,
+                  VT_RT_ABI_PDS_BASE_BYTES + abi.hit_record_base_bytes +
+                     VT_RT_HIT_RECORD_BARYCENTRICS_Y * 4) > 0);
    VT_RT_CHECK(closest_after.ventus_rt_store_slot >
                closest_before.ventus_rt_store_slot);
    VT_RT_CHECK(count_variables(closest_hit, nir_var_shader_call_data) == 0);
 
    /* Terminal global closest-hit consumes a compact ray_ref list, reads the
     * queue/completion planes, and writes the original payload address. */
-   progress = vt_nir_lower_rt_abi(global_callback_closest_hit, &config);
-   VT_RT_CHECK(progress);
    struct vt_nir_rt_config callback_config = vt_nir_rt_default_config();
+   vt_nir_rt_config_apply_global_cps_layout(&callback_config, &abi);
    callback_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK;
+   progress = vt_nir_lower_rt_abi(global_callback_closest_hit, &callback_config);
+   VT_RT_CHECK(progress);
    VT_RT_CHECK(vt_nir_lower_rt_global_callback(global_callback_closest_hit,
                                                 &callback_config));
    nir_validate_shader(global_callback_closest_hit,
@@ -631,9 +666,6 @@ main(int argc, char **argv)
    VT_RT_CHECK(count_store_slot_to_const_addr(payload_location_probe,
                                              absolute_payload_base + 32) == 1);
 
-   nir_shader *pipeline[] = {
-      raygen, miss, closest_hit, any_hit, intersection, terminating_any_hit,
-   };
    struct vt_nir_pipeline_scratch_info scratch_info;
    uint32_t per_lane_scratch =
       vt_nir_pipeline_compute_scratch(pipeline, 6, &scratch_info);

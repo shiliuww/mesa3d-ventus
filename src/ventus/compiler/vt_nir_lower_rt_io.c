@@ -9,6 +9,7 @@
 
 struct lower_rt_io_state {
    const struct vt_nir_rt_config *config;
+   uint32_t trace_depth;
 };
 
 struct lower_global_root_continuation_state {
@@ -28,41 +29,67 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
    return &intrin->def;
 }
 
-static bool
-trace_ray_has_const_flag(nir_intrinsic_instr *intrin, uint32_t flag)
+static nir_def *
+trace_ray_has_flag(nir_builder *b, nir_def *flags, uint32_t flag)
 {
-   return nir_src_is_const(intrin->src[1]) &&
-          (nir_src_as_uint(intrin->src[1]) & flag) != 0;
-}
-
-static void
-store_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
-                     enum vt_rt_control_word word, nir_def *value)
-{
-   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, value);
+   return nir_ine_imm(b, nir_iand_imm(b, flags, flag), 0);
 }
 
 static nir_def *
-load_raygen_control(nir_builder *b, const struct vt_nir_rt_config *config,
-                    enum vt_rt_control_word word)
+load_raygen_callback_decision(nir_builder *b,
+                              const struct vt_nir_rt_config *config)
 {
-   return vt_nir_load_control_word(b, config, VT_RT_LAYOUT_RAYGEN, word, 32);
+   return vt_nir_load_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                                   VT_RT_CONTROL_CALLBACK_DECISION, 32);
+}
+
+static void
+store_raygen_callback_decision(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_callback_decision decision)
+{
+   vt_nir_store_control_word(b, config, VT_RT_LAYOUT_RAYGEN,
+                             VT_RT_CONTROL_CALLBACK_DECISION,
+                             nir_imm_int(b, decision));
 }
 
 static void
 accept_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
 {
-   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_true(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_false(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_ACCEPT);
 }
 
 static void
 ignore_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
 {
-   store_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT, nir_imm_false(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_IGNORE_HIT, nir_imm_true(b));
-   store_raygen_control(b, config, VT_RT_CONTROL_TERMINATE_RAY, nir_imm_false(b));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_IGNORE);
+}
+
+/* The remote V4 layout reserves one complete payload frame per active trace
+ * level.  The local synchronous MegaKernel executes an inlined child trace in
+ * that next frame, so marshal the frame at the call/return boundary. */
+static void
+copy_raygen_payload_level(nir_builder *b,
+                          const struct vt_nir_rt_config *config,
+                          uint32_t source_level, uint32_t dest_level)
+{
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   const uint32_t payload_size =
+      sp->total_size_bytes - sp->payload_spill_size_bytes -
+      sp->payload_base_bytes;
+
+   for (uint32_t offset = 0; offset < payload_size;
+        offset += VT_RT_ABI_WORD_BYTES) {
+      nir_def *source = vt_nir_scratchpad_addr(
+         b, config, VT_RT_LAYOUT_RAYGEN,
+         sp->payload_base_bytes + source_level * payload_size + offset);
+      nir_def *dest = vt_nir_scratchpad_addr(
+         b, config, VT_RT_LAYOUT_RAYGEN,
+         sp->payload_base_bytes + dest_level * payload_size + offset);
+      nir_def *value = nir_ventus_rt_load_slot(b, 1, 32, source);
+      nir_ventus_rt_store_slot(b, value, dest);
+   }
 }
 
 static void
@@ -74,7 +101,8 @@ emit_trace_callbacks(nir_builder *b,
                      nir_def *complete_miss,
                      nir_def *candidate_non_opaque,
                      nir_def *candidate_procedural,
-                     bool skip_closest_hit)
+                     nir_def *dynamic_skip_closest_hit,
+                     bool constant_skip_closest_hit)
 {
    const bool callbacks_enabled =
       config && config->enable_monolithic_shader_callbacks;
@@ -95,8 +123,13 @@ emit_trace_callbacks(nir_builder *b,
    }
 
    nir_push_if(b, complete_hit);
-   if (!skip_closest_hit && config->emit_closest_hit)
+   if (config->emit_closest_hit && !constant_skip_closest_hit) {
+      if (dynamic_skip_closest_hit)
+         nir_push_if(b, nir_inot(b, dynamic_skip_closest_hit));
       config->emit_closest_hit(b, params, result, config->callback_data);
+      if (dynamic_skip_closest_hit)
+         nir_pop_if(b, NULL);
+   }
 
    nir_push_else(b, NULL);
    nir_push_if(b, complete_miss);
@@ -118,7 +151,8 @@ emit_trace_callbacks(nir_builder *b,
       config->emit_intersection(b, params, result, config->callback_data);
    if (config->emit_any_hit) {
       nir_def *reported =
-         nir_i2b(b, load_raygen_control(b, config, VT_RT_CONTROL_ACCEPT_HIT));
+         nir_ieq_imm(b, load_raygen_callback_decision(b, config),
+                     VT_RT_CALLBACK_ACCEPT);
       nir_push_if(b, reported);
       /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
       accept_candidate_hit(b, config);
@@ -164,11 +198,23 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .direction = intrin->src[8].ssa,
       .tmax = intrin->src[9].ssa,
       .payload = intrin->src[10].ssa,
-      .abi_tag = load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_ABI_TAG, 32),
    };
 
-   bool skip_closest_hit =
-      trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
+   const bool constant_flags = nir_src_is_const(intrin->src[1]);
+   const bool constant_skip_closest_hit =
+      constant_flags &&
+      (nir_src_as_uint(intrin->src[1]) & VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
+   nir_def *dynamic_skip_closest_hit =
+      constant_flags ? NULL :
+                       trace_ray_has_flag(
+                          b, params.flags, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
+
+   if (state->trace_depth > 0)
+      copy_raygen_payload_level(b, config, state->trace_depth - 1,
+                                state->trace_depth);
+   vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
+                             nir_imm_int(b, state->trace_depth));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_PENDING);
 
    nir_loop *loop = nir_push_loop(b);
    {
@@ -191,7 +237,8 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
       emit_trace_callbacks(b, config, &params, &result, complete_hit,
                            complete_miss, candidate_non_opaque,
-                           candidate_procedural, skip_closest_hit);
+                           candidate_procedural, dynamic_skip_closest_hit,
+                           constant_skip_closest_hit);
 
       nir_push_if(b, terminal);
       nir_jump(b, nir_jump_break);
@@ -204,6 +251,13 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
    }
    nir_pop_loop(b, loop);
+
+   if (state->trace_depth > 0)
+      copy_raygen_payload_level(b, config, state->trace_depth,
+                                state->trace_depth - 1);
+   vt_nir_store_active_level(
+      b, config, VT_RT_LAYOUT_RAYGEN,
+      nir_imm_int(b, state->trace_depth > 0 ? state->trace_depth - 1 : 0));
 
    nir_instr_remove(&intrin->instr);
    return true;
@@ -278,10 +332,17 @@ lower_global_root_continuation(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT);
    nir_def *complete_miss =
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_MISS);
+   const bool constant_flags = nir_src_is_const(intrin->src[1]);
+   const bool constant_skip_closest_hit =
+      constant_flags &&
+      (nir_src_as_uint(intrin->src[1]) & VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
+   nir_def *dynamic_skip_closest_hit =
+      constant_flags ? NULL :
+                       trace_ray_has_flag(
+                          b, params.flags, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
    emit_trace_callbacks(b, config, &params, &result, complete_hit,
                         complete_miss, nir_imm_false(b), nir_imm_false(b),
-                        trace_ray_has_const_flag(
-                           intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT));
+                        dynamic_skip_closest_hit, constant_skip_closest_hit);
    return true;
 }
 
@@ -349,6 +410,8 @@ insert_raygen_release_before_returns(nir_shader *shader,
          nir_def *slot_base =
             vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
                                    raygen->ray_state_base_bytes);
+         nir_ventus_rt_store_slot(
+            &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
          nir_ventus_rt_release(&b, slot_base);
          progress = true;
       }
@@ -373,12 +436,14 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
 
    bool progress = false;
    for (uint32_t i = 0; i < 8; i++) {
+      state.trace_depth = i;
       bool pass_progress =
          nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,
                                     &state);
       progress |= pass_progress;
       if (!pass_progress)
          break;
+
    }
 
    if (progress)

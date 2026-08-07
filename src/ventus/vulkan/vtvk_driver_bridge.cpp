@@ -1739,7 +1739,12 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           global_completion.size()))
          goto out;
 
-      global_hit_attribute_stride = VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES;
+      /* The migration-only global oracle keeps attributes in a separate
+       * completion plane.  V4 triangle barycentrics live in hit records, but
+       * the driver bridge still requires a non-empty, disjoint backing range. */
+      global_hit_attribute_stride =
+         MAX2(info->hit_attribute_size_bytes,
+              2u * (uint32_t)sizeof(uint32_t));
       const uint64_t global_hit_attribute_size =
          (uint64_t)global_queue_capacity * global_hit_attribute_stride;
       if (!vtvk_driver_alloc_copy(&driver, NULL, global_hit_attribute_size,

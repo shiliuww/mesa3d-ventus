@@ -80,6 +80,10 @@ enum vt_rt_global_trace_field {
    (VT_RT_SUBMISSION_MAILBOX_HEADER_SIZE_BYTES + \
     VT_RT_GLOBAL_TRACE_FIELD_COUNT * 4u)
 
+/* Preserve the migration-oracle wire range even though V4 uses only decision
+ * word 0.  This keeps Mesa and the Spike global worker on one plane size. */
+#define VT_RT_GLOBAL_CANDIDATE_CONTROL_WORD_COUNT 6u
+
 /*
  * Traversal completion is intentionally a separate ray_ref-indexed plane.
  * Queue fields say what to traverse next; this plane records the visible
@@ -123,7 +127,7 @@ enum vt_rt_global_completion_field {
    VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE,
    VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_LAST =
       VT_RT_GLOBAL_COMPLETION_CANDIDATE_CONTROL_BASE +
-      VT_RT_CONTROL_WORD_COUNT - 1,
+      VT_RT_GLOBAL_CANDIDATE_CONTROL_WORD_COUNT - 1,
    VT_RT_GLOBAL_COMPLETION_FIELD_COUNT,
 };
 
