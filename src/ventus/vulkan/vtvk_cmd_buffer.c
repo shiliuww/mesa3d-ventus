@@ -34,35 +34,6 @@ vtvk_bind_point_from_shader_stages(VkShaderStageFlags stage_flags)
              VK_PIPELINE_BIND_POINT_GRAPHICS;
 }
 
-VkPipeline
-vtvk_cmd_buffer_bound_rt_pipeline(VkCommandBuffer commandBuffer)
-{
-   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
-   return cmd ? cmd->bound_rt_pipeline : VK_NULL_HANDLE;
-}
-
-VkDescriptorSet
-vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuffer,
-                                     uint32_t set)
-{
-   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
-   if (!cmd || set >= VTVK_MAX_BOUND_DESCRIPTOR_SETS)
-      return VK_NULL_HANDLE;
-   return cmd->bound_descriptor_sets[set];
-}
-
-const void *
-vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
-                               uint32_t *size_out,
-                               VkShaderStageFlags *stages_out)
-{
-   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
-   if (size_out)
-      *size_out = cmd ? cmd->push_constants_size : 0;
-   if (stages_out)
-      *stages_out = cmd ? cmd->push_constants_stages : 0;
-   return cmd && cmd->push_constants_size ? cmd->push_constants : NULL;
-}
 static VkResult
 vtvk_cmd_buffer_create(struct vk_command_pool *pool,
                        VkCommandBufferLevel level,
@@ -92,6 +63,7 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
    (void)flags;
    struct vtvk_cmd_buffer *cmd =
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
+   vtvk_cmd_buffer_clear_rt_commands(cmd);
    cmd->bound_rt_pipeline = VK_NULL_HANDLE;
    memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
    memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
@@ -107,6 +79,7 @@ vtvk_cmd_buffer_destroy(struct vk_command_buffer *cmd_buffer)
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
    struct vk_command_pool *pool = cmd_buffer->pool;
 
+   vtvk_cmd_buffer_clear_rt_commands(cmd);
    vk_command_buffer_finish(cmd_buffer);
    vk_free(&pool->alloc, cmd);
 }

@@ -30,6 +30,15 @@ vtvk_signal_fence(VkFence _fence)
    if (fence)
       fence->signaled = true;
 }
+
+static VkResult
+vtvk_submit_command_buffer(VkCommandBuffer command_buffer)
+{
+   struct vtvk_cmd_buffer *cmd =
+      vtvk_handle_to_ptr((uint64_t)command_buffer);
+   return vtvk_cmd_buffer_execute_rt_commands(cmd);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vtvk_CreateFence(VkDevice _device,
                  const VkFenceCreateInfo *pCreateInfo,
@@ -100,8 +109,14 @@ vtvk_QueueSubmit(VkQueue queue,
                  VkFence fence)
 {
    (void)queue;
-   (void)submitCount;
-   (void)pSubmits;
+   for (uint32_t submit = 0; submit < submitCount; submit++) {
+      for (uint32_t i = 0; i < pSubmits[submit].commandBufferCount; i++) {
+         VkResult result = vtvk_submit_command_buffer(
+            pSubmits[submit].pCommandBuffers[i]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    vtvk_signal_fence(fence);
    return VK_SUCCESS;
 }
@@ -113,8 +128,14 @@ vtvk_QueueSubmit2(VkQueue queue,
                   VkFence fence)
 {
    (void)queue;
-   (void)submitCount;
-   (void)pSubmits;
+   for (uint32_t submit = 0; submit < submitCount; submit++) {
+      for (uint32_t i = 0; i < pSubmits[submit].commandBufferInfoCount; i++) {
+         VkResult result = vtvk_submit_command_buffer(
+            pSubmits[submit].pCommandBufferInfos[i].commandBuffer);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    vtvk_signal_fence(fence);
    return VK_SUCCESS;
 }
@@ -158,4 +179,3 @@ vtvk_DestroySemaphore(VkDevice _device,
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    vk_free(alloc, vtvk_handle_to_ptr((uint64_t)semaphore));
 }
-

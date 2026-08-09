@@ -1,9 +1,12 @@
 #include "vtvk_pipeline.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "util/log.h"
+#include "vk_command_buffer.h"
+#include "vk_command_pool.h"
 #include "vtvk_driver_bridge.h"
 #include "vtvk_entrypoints.h"
 
@@ -11,6 +14,72 @@ static void *
 vtvk_handle_to_ptr(uint64_t handle)
 {
    return (void *)(uintptr_t)handle;
+}
+
+enum vtvk_rt_recorded_command_type {
+   VTVK_RT_RECORDED_TRACE_RAYS,
+   VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT,
+   VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT2,
+};
+
+struct vtvk_rt_recorded_command {
+   struct vtvk_rt_recorded_command *next;
+   enum vtvk_rt_recorded_command_type type;
+   VkPipeline pipeline;
+   VkDescriptorSet descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+   uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
+   uint32_t push_constants_size;
+   VkShaderStageFlags push_constant_stages;
+   VkStridedDeviceAddressRegionKHR raygen_sbt;
+   VkStridedDeviceAddressRegionKHR miss_sbt;
+   VkStridedDeviceAddressRegionKHR hit_sbt;
+   VkStridedDeviceAddressRegionKHR callable_sbt;
+   VkDeviceAddress indirect_address;
+   uint32_t width;
+   uint32_t height;
+   uint32_t depth;
+};
+
+static struct vtvk_rt_recorded_command *
+vtvk_record_rt_command(VkCommandBuffer command_buffer,
+                       enum vtvk_rt_recorded_command_type type)
+{
+   struct vtvk_cmd_buffer *cmd =
+      (struct vtvk_cmd_buffer *)vtvk_handle_to_ptr((uint64_t)command_buffer);
+   if (!cmd)
+      return nullptr;
+
+   struct vtvk_rt_recorded_command *record =
+      (struct vtvk_rt_recorded_command *)vk_zalloc(
+         &cmd->vk.pool->alloc, sizeof(*record), 8,
+         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!record) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return nullptr;
+   }
+
+   record->type = type;
+   record->pipeline = cmd->bound_rt_pipeline;
+   memcpy(record->descriptor_sets, cmd->bound_descriptor_sets,
+          sizeof(record->descriptor_sets));
+   memcpy(record->push_constants, cmd->push_constants,
+          sizeof(record->push_constants));
+   record->push_constants_size = cmd->push_constants_size;
+   record->push_constant_stages = cmd->push_constants_stages;
+
+   if (cmd->rt_commands_tail)
+      cmd->rt_commands_tail->next = record;
+   else
+      cmd->rt_commands_head = record;
+   cmd->rt_commands_tail = record;
+   cmd->rt_command_count++;
+   return record;
+}
+
+static VkStridedDeviceAddressRegionKHR
+vtvk_copy_sbt_region(const VkStridedDeviceAddressRegionKHR *region)
+{
+   return region ? *region : VkStridedDeviceAddressRegionKHR{};
 }
 
 static bool
@@ -49,22 +118,22 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
    return true;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
-                     const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
-                     const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
-                     const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
-                     const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
-                     uint32_t width,
-                     uint32_t height,
-                     uint32_t depth)
+static bool
+vtvk_execute_trace_rays(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_rt_recorded_command *record,
+   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+   uint32_t width,
+   uint32_t height,
+   uint32_t depth)
 {
    static bool logged;
 
-   VkPipeline pipeline_handle =
-      vtvk_cmd_buffer_bound_rt_pipeline(commandBuffer);
    struct vtvk_pipeline *pipeline =
-      vtvk_pipeline_from_handle(pipeline_handle);
+      vtvk_pipeline_from_handle(record->pipeline);
    VkAccelerationStructureKHR tlas_handle = VK_NULL_HANDLE;
    VkImage storage_image = VK_NULL_HANDLE;
    VkExtent3D image_extent = {};
@@ -75,8 +144,7 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    std::vector<vtvk_rt_descriptor_source> descriptors;
    descriptors.reserve(VT_RT_DESCRIPTOR_TABLE_SLOT_COUNT);
    for (uint32_t set = 0; set < VTVK_MAX_BOUND_DESCRIPTOR_SETS; set++) {
-      VkDescriptorSet descriptor_set =
-         vtvk_cmd_buffer_bound_descriptor_set(commandBuffer, set);
+      VkDescriptorSet descriptor_set = record->descriptor_sets[set];
       for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
            binding++) {
          struct vtvk_descriptor_binding_info info = {};
@@ -106,18 +174,18 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    void *storage_image_data =
       vtvk_image_host_ptr(storage_image, &image_extent, &image_format);
 
-   uint32_t push_constant_size = 0;
-   VkShaderStageFlags push_constant_stages = 0;
+   const uint32_t push_constant_size = record->push_constants_size;
+   const VkShaderStageFlags push_constant_stages =
+      record->push_constant_stages;
    const void *push_constant_data =
-      vtvk_cmd_buffer_push_constants(commandBuffer, &push_constant_size,
-                                     &push_constant_stages);
+      push_constant_size ? record->push_constants : nullptr;
 
    if (!pipeline || !tlas || !tlas->address || !storage_image_data) {
       mesa_loge("ventus-vk: vkCmdTraceRaysKHR missing Spike dispatch state "
                 "pipeline=%p tlas=0x%" PRIx64 " image=%p camera=%p",
                 (void *)pipeline, tlas ? (uint64_t)tlas->address : 0,
                 storage_image_data, camera_data);
-      return;
+      return false;
    }
 
    if (!logged) {
@@ -139,8 +207,6 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    }
 
    struct vtvk_driver_trace_rays_info trace = {};
-   struct vtvk_cmd_buffer *cmd =
-      (struct vtvk_cmd_buffer *)vtvk_handle_to_ptr((uint64_t)commandBuffer);
    trace.device = cmd && cmd->vk.base.device ?
       container_of(cmd->vk.base.device, struct vtvk_device, vk) : nullptr;
    trace.tlas = tlas;
@@ -181,7 +247,34 @@ vtvk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    trace.push_constants_size = push_constant_size;
    trace.push_constants_stages = push_constant_stages;
 
-   vtvk_driver_trace_rays(&trace);
+   return vtvk_driver_trace_rays(&trace);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdTraceRaysKHR(
+   VkCommandBuffer commandBuffer,
+   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+   uint32_t width,
+   uint32_t height,
+   uint32_t depth)
+{
+   struct vtvk_rt_recorded_command *record = vtvk_record_rt_command(
+      commandBuffer, VTVK_RT_RECORDED_TRACE_RAYS);
+   if (!record)
+      return;
+
+   record->raygen_sbt = vtvk_copy_sbt_region(pRaygenShaderBindingTable);
+   record->miss_sbt = vtvk_copy_sbt_region(pMissShaderBindingTable);
+   record->hit_sbt = vtvk_copy_sbt_region(pHitShaderBindingTable);
+   record->callable_sbt = vtvk_copy_sbt_region(pCallableShaderBindingTable);
+   record->width = width;
+   record->height = height;
+   record->depth = depth;
+   mesa_logi("ventus-vk: recorded vkCmdTraceRaysKHR %ux%ux%u", width,
+             height, depth);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -193,61 +286,105 @@ vtvk_CmdTraceRaysIndirectKHR(
    const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
    VkDeviceAddress indirectDeviceAddress)
 {
-   if (indirectDeviceAddress & 3) {
-      mesa_loge("ventus-vk: indirect RT dispatch address is not 4-byte "
-                "aligned: 0x%" PRIx64,
-                (uint64_t)indirectDeviceAddress);
+   struct vtvk_rt_recorded_command *record = vtvk_record_rt_command(
+      commandBuffer, VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT);
+   if (!record)
       return;
-   }
 
-   const VkTraceRaysIndirectCommandKHR *command =
-      (const VkTraceRaysIndirectCommandKHR *)
-         vtvk_buffer_host_ptr_from_addr_with_usage(
-            indirectDeviceAddress, sizeof(*command),
-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-   if (!command) {
-      mesa_loge("ventus-vk: indirect RT dispatch address is not a complete "
-                "INDIRECT_BUFFER range: 0x%" PRIx64,
-                (uint64_t)indirectDeviceAddress);
-      return;
-   }
-
-   static bool logged;
-   if (!logged) {
-      logged = true;
-      mesa_logi("ventus-vk: vkCmdTraceRaysIndirectKHR resolved "
-                "%ux%ux%u from 0x%" PRIx64,
-                command->width, command->height, command->depth,
-                (uint64_t)indirectDeviceAddress);
-   }
-
-   vtvk_CmdTraceRaysKHR(
-      commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
-      pHitShaderBindingTable, pCallableShaderBindingTable,
-      command->width, command->height, command->depth);
+   record->raygen_sbt = vtvk_copy_sbt_region(pRaygenShaderBindingTable);
+   record->miss_sbt = vtvk_copy_sbt_region(pMissShaderBindingTable);
+   record->hit_sbt = vtvk_copy_sbt_region(pHitShaderBindingTable);
+   record->callable_sbt = vtvk_copy_sbt_region(pCallableShaderBindingTable);
+   record->indirect_address = indirectDeviceAddress;
+   mesa_logi("ventus-vk: recorded vkCmdTraceRaysIndirectKHR address=0x%" PRIx64,
+             (uint64_t)indirectDeviceAddress);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
                               VkDeviceAddress indirectDeviceAddress)
 {
-   if (indirectDeviceAddress & 3) {
+   struct vtvk_rt_recorded_command *record = vtvk_record_rt_command(
+      commandBuffer, VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT2);
+   if (!record)
+      return;
+
+   record->indirect_address = indirectDeviceAddress;
+   mesa_logi("ventus-vk: recorded vkCmdTraceRaysIndirect2KHR address=0x%" PRIx64,
+             (uint64_t)indirectDeviceAddress);
+}
+
+extern "C" void
+vtvk_cmd_buffer_clear_rt_commands(struct vtvk_cmd_buffer *cmd)
+{
+   if (!cmd)
+      return;
+
+   struct vtvk_rt_recorded_command *record = cmd->rt_commands_head;
+   while (record) {
+      struct vtvk_rt_recorded_command *next = record->next;
+      vk_free(&cmd->vk.pool->alloc, record);
+      record = next;
+   }
+   cmd->rt_commands_head = nullptr;
+   cmd->rt_commands_tail = nullptr;
+   cmd->rt_command_count = 0;
+}
+
+static bool
+vtvk_execute_indirect_trace(struct vtvk_cmd_buffer *cmd,
+                            const struct vtvk_rt_recorded_command *record)
+{
+   if (record->indirect_address & 3) {
+      mesa_loge("ventus-vk: indirect RT dispatch address is not 4-byte "
+                "aligned: 0x%" PRIx64,
+                (uint64_t)record->indirect_address);
+      return false;
+   }
+
+   const VkTraceRaysIndirectCommandKHR *command =
+      (const VkTraceRaysIndirectCommandKHR *)
+         vtvk_buffer_host_ptr_from_addr_with_usage(
+            record->indirect_address, sizeof(*command),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+   if (!command) {
+      mesa_loge("ventus-vk: indirect RT dispatch address is not a complete "
+                "INDIRECT_BUFFER range: 0x%" PRIx64,
+                (uint64_t)record->indirect_address);
+      return false;
+   }
+
+   mesa_logi("ventus-vk: queue submit resolved vkCmdTraceRaysIndirectKHR "
+             "%ux%ux%u from 0x%" PRIx64,
+             command->width, command->height, command->depth,
+             (uint64_t)record->indirect_address);
+   return vtvk_execute_trace_rays(
+      cmd, record, &record->raygen_sbt, &record->miss_sbt,
+      &record->hit_sbt, &record->callable_sbt,
+      command->width, command->height, command->depth);
+}
+
+static bool
+vtvk_execute_indirect2_trace(struct vtvk_cmd_buffer *cmd,
+                             const struct vtvk_rt_recorded_command *record)
+{
+   if (record->indirect_address & 3) {
       mesa_loge("ventus-vk: indirect2 RT dispatch address is not 4-byte "
                 "aligned: 0x%" PRIx64,
-                (uint64_t)indirectDeviceAddress);
-      return;
+                (uint64_t)record->indirect_address);
+      return false;
    }
 
    const VkTraceRaysIndirectCommand2KHR *command =
       (const VkTraceRaysIndirectCommand2KHR *)
          vtvk_buffer_host_ptr_from_addr_with_usage(
-            indirectDeviceAddress, sizeof(*command),
+            record->indirect_address, sizeof(*command),
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
    if (!command) {
       mesa_loge("ventus-vk: indirect2 RT dispatch address is not a complete "
                 "INDIRECT_BUFFER range: 0x%" PRIx64,
-                (uint64_t)indirectDeviceAddress);
-      return;
+                (uint64_t)record->indirect_address);
+      return false;
    }
 
    const VkStridedDeviceAddressRegionKHR raygen = {
@@ -271,15 +408,42 @@ vtvk_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
       .size = command->callableShaderBindingTableSize,
    };
 
-   static bool logged;
-   if (!logged) {
-      logged = true;
-      mesa_logi("ventus-vk: vkCmdTraceRaysIndirect2KHR resolved "
-                "%ux%ux%u and SBT regions from 0x%" PRIx64,
-                command->width, command->height, command->depth,
-                (uint64_t)indirectDeviceAddress);
-   }
+   mesa_logi("ventus-vk: vkCmdTraceRaysIndirect2KHR resolved %ux%ux%u and "
+             "SBT regions at queue submit from 0x%" PRIx64,
+             command->width, command->height, command->depth,
+             (uint64_t)record->indirect_address);
+   return vtvk_execute_trace_rays(cmd, record, &raygen, &miss, &hit,
+                                  &callable, command->width,
+                                  command->height, command->depth);
+}
 
-   vtvk_CmdTraceRaysKHR(commandBuffer, &raygen, &miss, &hit, &callable,
-                        command->width, command->height, command->depth);
+extern "C" VkResult
+vtvk_cmd_buffer_execute_rt_commands(struct vtvk_cmd_buffer *cmd)
+{
+   if (!cmd)
+      return VK_ERROR_UNKNOWN;
+
+   for (const struct vtvk_rt_recorded_command *record = cmd->rt_commands_head;
+        record; record = record->next) {
+      bool success = false;
+      switch (record->type) {
+      case VTVK_RT_RECORDED_TRACE_RAYS:
+         mesa_logi("ventus-vk: queue submit executing vkCmdTraceRaysKHR "
+                   "%ux%ux%u", record->width, record->height, record->depth);
+         success = vtvk_execute_trace_rays(
+            cmd, record, &record->raygen_sbt, &record->miss_sbt,
+            &record->hit_sbt, &record->callable_sbt,
+            record->width, record->height, record->depth);
+         break;
+      case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT:
+         success = vtvk_execute_indirect_trace(cmd, record);
+         break;
+      case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT2:
+         success = vtvk_execute_indirect2_trace(cmd, record);
+         break;
+      }
+      if (!success)
+         return VK_ERROR_DEVICE_LOST;
+   }
+   return VK_SUCCESS;
 }
