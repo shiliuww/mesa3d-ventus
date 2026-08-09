@@ -36,7 +36,7 @@ vtvk_submit_command_buffer(VkCommandBuffer command_buffer)
 {
    struct vtvk_cmd_buffer *cmd =
       vtvk_handle_to_ptr((uint64_t)command_buffer);
-   return vtvk_cmd_buffer_execute_rt_commands(cmd);
+   return vtvk_cmd_buffer_execute_commands(cmd);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

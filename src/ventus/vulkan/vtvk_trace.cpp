@@ -23,7 +23,7 @@ enum vtvk_rt_recorded_command_type {
 };
 
 struct vtvk_rt_recorded_command {
-   struct vtvk_rt_recorded_command *next;
+   struct vtvk_recorded_command base;
    enum vtvk_rt_recorded_command_type type;
    VkPipeline pipeline;
    VkDescriptorSet descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
@@ -40,6 +40,10 @@ struct vtvk_rt_recorded_command {
    uint32_t depth;
 };
 
+static VkResult vtvk_execute_recorded_rt_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command);
+
 static struct vtvk_rt_recorded_command *
 vtvk_record_rt_command(VkCommandBuffer command_buffer,
                        enum vtvk_rt_recorded_command_type type)
@@ -50,13 +54,10 @@ vtvk_record_rt_command(VkCommandBuffer command_buffer,
       return nullptr;
 
    struct vtvk_rt_recorded_command *record =
-      (struct vtvk_rt_recorded_command *)vk_zalloc(
-         &cmd->vk.pool->alloc, sizeof(*record), 8,
-         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!record) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      (struct vtvk_rt_recorded_command *)vtvk_cmd_buffer_alloc_command(
+         cmd, sizeof(*record), vtvk_execute_recorded_rt_command, nullptr);
+   if (!record)
       return nullptr;
-   }
 
    record->type = type;
    record->pipeline = cmd->bound_rt_pipeline;
@@ -67,12 +68,6 @@ vtvk_record_rt_command(VkCommandBuffer command_buffer,
    record->push_constants_size = cmd->push_constants_size;
    record->push_constant_stages = cmd->push_constants_stages;
 
-   if (cmd->rt_commands_tail)
-      cmd->rt_commands_tail->next = record;
-   else
-      cmd->rt_commands_head = record;
-   cmd->rt_commands_tail = record;
-   cmd->rt_command_count++;
    return record;
 }
 
@@ -314,23 +309,6 @@ vtvk_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
              (uint64_t)indirectDeviceAddress);
 }
 
-extern "C" void
-vtvk_cmd_buffer_clear_rt_commands(struct vtvk_cmd_buffer *cmd)
-{
-   if (!cmd)
-      return;
-
-   struct vtvk_rt_recorded_command *record = cmd->rt_commands_head;
-   while (record) {
-      struct vtvk_rt_recorded_command *next = record->next;
-      vk_free(&cmd->vk.pool->alloc, record);
-      record = next;
-   }
-   cmd->rt_commands_head = nullptr;
-   cmd->rt_commands_tail = nullptr;
-   cmd->rt_command_count = 0;
-}
-
 static bool
 vtvk_execute_indirect_trace(struct vtvk_cmd_buffer *cmd,
                             const struct vtvk_rt_recorded_command *record)
@@ -417,33 +395,29 @@ vtvk_execute_indirect2_trace(struct vtvk_cmd_buffer *cmd,
                                   command->height, command->depth);
 }
 
-extern "C" VkResult
-vtvk_cmd_buffer_execute_rt_commands(struct vtvk_cmd_buffer *cmd)
+static VkResult
+vtvk_execute_recorded_rt_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
 {
-   if (!cmd)
-      return VK_ERROR_UNKNOWN;
-
-   for (const struct vtvk_rt_recorded_command *record = cmd->rt_commands_head;
-        record; record = record->next) {
-      bool success = false;
-      switch (record->type) {
-      case VTVK_RT_RECORDED_TRACE_RAYS:
-         mesa_logi("ventus-vk: queue submit executing vkCmdTraceRaysKHR "
-                   "%ux%ux%u", record->width, record->height, record->depth);
-         success = vtvk_execute_trace_rays(
-            cmd, record, &record->raygen_sbt, &record->miss_sbt,
-            &record->hit_sbt, &record->callable_sbt,
-            record->width, record->height, record->depth);
-         break;
-      case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT:
-         success = vtvk_execute_indirect_trace(cmd, record);
-         break;
-      case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT2:
-         success = vtvk_execute_indirect2_trace(cmd, record);
-         break;
-      }
-      if (!success)
-         return VK_ERROR_DEVICE_LOST;
+   const struct vtvk_rt_recorded_command *record =
+      (const struct vtvk_rt_recorded_command *)command;
+   bool success = false;
+   switch (record->type) {
+   case VTVK_RT_RECORDED_TRACE_RAYS:
+      mesa_logi("ventus-vk: queue submit executing vkCmdTraceRaysKHR "
+                "%ux%ux%u", record->width, record->height, record->depth);
+      success = vtvk_execute_trace_rays(
+         cmd, record, &record->raygen_sbt, &record->miss_sbt,
+         &record->hit_sbt, &record->callable_sbt,
+         record->width, record->height, record->depth);
+      break;
+   case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT:
+      success = vtvk_execute_indirect_trace(cmd, record);
+      break;
+   case VTVK_RT_RECORDED_TRACE_RAYS_INDIRECT2:
+      success = vtvk_execute_indirect2_trace(cmd, record);
+      break;
    }
-   return VK_SUCCESS;
+   return success ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
 }

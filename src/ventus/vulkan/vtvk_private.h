@@ -45,7 +45,7 @@ struct vtvk_queue {
 };
 
 struct vtvk_memory;
-struct vtvk_rt_recorded_command;
+struct vtvk_recorded_command;
 
 struct vtvk_device {
    struct vk_device vk;
@@ -73,9 +73,22 @@ struct vtvk_cmd_buffer {
    uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
    uint32_t push_constants_size;
    VkShaderStageFlags push_constants_stages;
-   struct vtvk_rt_recorded_command *rt_commands_head;
-   struct vtvk_rt_recorded_command *rt_commands_tail;
-   uint32_t rt_command_count;
+   struct vtvk_recorded_command *commands_head;
+   struct vtvk_recorded_command *commands_tail;
+   uint32_t command_count;
+};
+
+typedef VkResult (*vtvk_recorded_command_execute_func)(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command);
+typedef void (*vtvk_recorded_command_destroy_func)(
+   struct vtvk_cmd_buffer *cmd,
+   struct vtvk_recorded_command *command);
+
+struct vtvk_recorded_command {
+   struct vtvk_recorded_command *next;
+   vtvk_recorded_command_execute_func execute;
+   vtvk_recorded_command_destroy_func destroy;
 };
 
 struct vtvk_acceleration_structure {
@@ -143,8 +156,13 @@ bool vtvk_buffer_host_allocation_from_addr(VkDeviceAddress address,
                                            const void **base_out,
                                            VkDeviceSize *size_out,
                                            VkDeviceSize *offset_out);
-VkResult vtvk_cmd_buffer_execute_rt_commands(struct vtvk_cmd_buffer *cmd);
-void vtvk_cmd_buffer_clear_rt_commands(struct vtvk_cmd_buffer *cmd);
+void *vtvk_cmd_buffer_alloc_command(
+   struct vtvk_cmd_buffer *cmd,
+   size_t size,
+   vtvk_recorded_command_execute_func execute,
+   vtvk_recorded_command_destroy_func destroy);
+VkResult vtvk_cmd_buffer_execute_commands(struct vtvk_cmd_buffer *cmd);
+void vtvk_cmd_buffer_clear_commands(struct vtvk_cmd_buffer *cmd);
 bool vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
                                      uint32_t binding,
                                      struct vtvk_descriptor_binding_info *out);

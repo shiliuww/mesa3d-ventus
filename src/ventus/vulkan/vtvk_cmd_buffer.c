@@ -56,6 +56,69 @@ vtvk_cmd_buffer_create(struct vk_command_pool *pool,
    return VK_SUCCESS;
 }
 
+void *
+vtvk_cmd_buffer_alloc_command(
+   struct vtvk_cmd_buffer *cmd,
+   size_t size,
+   vtvk_recorded_command_execute_func execute,
+   vtvk_recorded_command_destroy_func destroy)
+{
+   assert(size >= sizeof(struct vtvk_recorded_command));
+   struct vtvk_recorded_command *command =
+      vk_zalloc(&cmd->vk.pool->alloc, size, 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!command) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
+
+   command->execute = execute;
+   command->destroy = destroy;
+   if (cmd->commands_tail)
+      cmd->commands_tail->next = command;
+   else
+      cmd->commands_head = command;
+   cmd->commands_tail = command;
+   cmd->command_count++;
+   return command;
+}
+
+VkResult
+vtvk_cmd_buffer_execute_commands(struct vtvk_cmd_buffer *cmd)
+{
+   if (!cmd)
+      return VK_ERROR_UNKNOWN;
+
+   for (const struct vtvk_recorded_command *command = cmd->commands_head;
+        command; command = command->next) {
+      if (!command->execute)
+         return VK_ERROR_UNKNOWN;
+      VkResult result = command->execute(cmd, command);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+void
+vtvk_cmd_buffer_clear_commands(struct vtvk_cmd_buffer *cmd)
+{
+   if (!cmd)
+      return;
+
+   struct vtvk_recorded_command *command = cmd->commands_head;
+   while (command) {
+      struct vtvk_recorded_command *next = command->next;
+      if (command->destroy)
+         command->destroy(cmd, command);
+      vk_free(&cmd->vk.pool->alloc, command);
+      command = next;
+   }
+   cmd->commands_head = NULL;
+   cmd->commands_tail = NULL;
+   cmd->command_count = 0;
+}
+
 static void
 vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
                       VkCommandBufferResetFlags flags)
@@ -63,7 +126,7 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
    (void)flags;
    struct vtvk_cmd_buffer *cmd =
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
-   vtvk_cmd_buffer_clear_rt_commands(cmd);
+   vtvk_cmd_buffer_clear_commands(cmd);
    cmd->bound_rt_pipeline = VK_NULL_HANDLE;
    memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
    memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
@@ -79,7 +142,7 @@ vtvk_cmd_buffer_destroy(struct vk_command_buffer *cmd_buffer)
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
    struct vk_command_pool *pool = cmd_buffer->pool;
 
-   vtvk_cmd_buffer_clear_rt_commands(cmd);
+   vtvk_cmd_buffer_clear_commands(cmd);
    vk_command_buffer_finish(cmd_buffer);
    vk_free(&pool->alloc, cmd);
 }

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "vk_command_buffer.h"
+#include "vk_command_pool.h"
 #include "vtvk_entrypoints.h"
 
 static bool
@@ -78,18 +79,45 @@ vtvk_ResetQueryPool(VkDevice device, VkQueryPool queryPool,
    vtvk_reset_queries(pool, firstQuery, queryCount);
 }
 
+struct vtvk_recorded_query_reset_command {
+   struct vtvk_recorded_command base;
+   VkQueryPool query_pool;
+   uint32_t first_query;
+   uint32_t query_count;
+};
+
+static VkResult
+vtvk_execute_recorded_query_reset_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
+{
+   (void)cmd;
+   const struct vtvk_recorded_query_reset_command *reset =
+      (const struct vtvk_recorded_query_reset_command *)command;
+   VK_FROM_HANDLE(vtvk_query_pool, pool, reset->query_pool);
+
+   if (!vtvk_query_range_valid(pool, reset->first_query, reset->query_count))
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   vtvk_reset_queries(pool, reset->first_query, reset->query_count);
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                        uint32_t firstQuery, uint32_t queryCount)
 {
-   VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
-   VK_FROM_HANDLE(vtvk_query_pool, pool, queryPool);
-
-   if (!vtvk_query_range_valid(pool, firstQuery, queryCount)) {
-      vk_command_buffer_set_error(cmd, VK_ERROR_UNKNOWN);
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   struct vtvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
+   struct vtvk_recorded_query_reset_command *reset =
+      vtvk_cmd_buffer_alloc_command(
+         cmd, sizeof(*reset), vtvk_execute_recorded_query_reset_command,
+         NULL);
+   if (!reset)
       return;
-   }
-   vtvk_reset_queries(pool, firstQuery, queryCount);
+   reset->query_pool = queryPool;
+   reset->first_query = firstQuery;
+   reset->query_count = queryCount;
 }
 
 static size_t
@@ -169,6 +197,53 @@ vtvk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
    return result;
 }
 
+struct vtvk_recorded_query_copy_command {
+   struct vtvk_recorded_command base;
+   VkQueryPool query_pool;
+   uint32_t first_query;
+   uint32_t query_count;
+   VkBuffer dst_buffer;
+   VkDeviceSize dst_offset;
+   VkDeviceSize stride;
+   VkQueryResultFlags flags;
+};
+
+static VkResult
+vtvk_execute_recorded_query_copy_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
+{
+   (void)cmd;
+   const struct vtvk_recorded_query_copy_command *copy =
+      (const struct vtvk_recorded_query_copy_command *)command;
+   VK_FROM_HANDLE(vtvk_query_pool, pool, copy->query_pool);
+
+   if (!vtvk_query_range_valid(pool, copy->first_query, copy->query_count))
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   if (!copy->query_count)
+      return VK_SUCCESS;
+
+   const size_t record_size = vtvk_query_record_size(copy->flags);
+   if (copy->stride > SIZE_MAX ||
+       (copy->query_count > 1 &&
+        (size_t)copy->stride >
+           (SIZE_MAX - record_size) / (copy->query_count - 1)))
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   const size_t required_size =
+      (size_t)copy->stride * (copy->query_count - 1) + record_size;
+   uint8_t *destination =
+      vtvk_buffer_host_ptr(copy->dst_buffer, copy->dst_offset, required_size);
+   if (!destination)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   for (uint32_t i = 0; i < copy->query_count; i++) {
+      vtvk_store_query_result(destination + (size_t)copy->stride * i,
+                              &pool->queries[copy->first_query + i],
+                              copy->flags);
+   }
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
                              VkQueryPool queryPool, uint32_t firstQuery,
@@ -176,32 +251,20 @@ vtvk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
                              VkDeviceSize dstOffset, VkDeviceSize stride,
                              VkQueryResultFlags flags)
 {
-   VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
-   VK_FROM_HANDLE(vtvk_query_pool, pool, queryPool);
-
-   if (!vtvk_query_range_valid(pool, firstQuery, queryCount))
-      goto fail;
-   if (!queryCount)
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   struct vtvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
+   struct vtvk_recorded_query_copy_command *copy =
+      vtvk_cmd_buffer_alloc_command(
+         cmd, sizeof(*copy), vtvk_execute_recorded_query_copy_command,
+         NULL);
+   if (!copy)
       return;
-
-   const size_t record_size = vtvk_query_record_size(flags);
-   if (stride > SIZE_MAX ||
-       (queryCount > 1 &&
-        (size_t)stride > (SIZE_MAX - record_size) / (queryCount - 1)))
-      goto fail;
-   const size_t required_size =
-      (size_t)stride * (queryCount - 1) + record_size;
-   uint8_t *destination =
-      vtvk_buffer_host_ptr(dstBuffer, dstOffset, required_size);
-   if (!destination)
-      goto fail;
-
-   for (uint32_t i = 0; i < queryCount; i++) {
-      vtvk_store_query_result(destination + (size_t)stride * i,
-                              &pool->queries[firstQuery + i], flags);
-   }
-   return;
-
-fail:
-   vk_command_buffer_set_error(cmd, VK_ERROR_UNKNOWN);
+   copy->query_pool = queryPool;
+   copy->first_query = firstQuery;
+   copy->query_count = queryCount;
+   copy->dst_buffer = dstBuffer;
+   copy->dst_offset = dstOffset;
+   copy->stride = stride;
+   copy->flags = flags;
 }

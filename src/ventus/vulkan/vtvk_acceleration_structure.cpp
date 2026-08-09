@@ -9,6 +9,7 @@
 
 #include "util/log.h"
 #include "vk_command_buffer.h"
+#include "vk_command_pool.h"
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 #include "ventus/common/ventus_rt_bvh.h"
@@ -1117,6 +1118,253 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
    pSizeInfo->buildScratchSize = 4096 + primitive_bytes;
 }
 
+struct vtvk_recorded_as_build_command {
+   struct vtvk_recorded_command base;
+   bool indirect;
+   uint32_t info_count;
+   uint32_t total_geometry_count;
+   VkAccelerationStructureBuildGeometryInfoKHR *infos;
+   VkAccelerationStructureGeometryKHR *geometries;
+   uint32_t *geometry_offsets;
+   VkAccelerationStructureBuildRangeInfoKHR *ranges;
+   VkDeviceAddress *indirect_addresses;
+   uint32_t *indirect_strides;
+   uint32_t *max_primitive_counts;
+};
+
+static void
+vtvk_destroy_recorded_as_build_command(
+   struct vtvk_cmd_buffer *cmd,
+   struct vtvk_recorded_command *command)
+{
+   struct vtvk_recorded_as_build_command *build =
+      (struct vtvk_recorded_as_build_command *)command;
+   vk_free(&cmd->vk.pool->alloc, build->infos);
+   vk_free(&cmd->vk.pool->alloc, build->geometries);
+   vk_free(&cmd->vk.pool->alloc, build->geometry_offsets);
+   vk_free(&cmd->vk.pool->alloc, build->ranges);
+   vk_free(&cmd->vk.pool->alloc, build->indirect_addresses);
+   vk_free(&cmd->vk.pool->alloc, build->indirect_strides);
+   vk_free(&cmd->vk.pool->alloc, build->max_primitive_counts);
+}
+
+static VkResult
+vtvk_execute_recorded_as_build_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
+{
+   const struct vtvk_recorded_as_build_command *build =
+      (const struct vtvk_recorded_as_build_command *)command;
+   struct vtvk_device *device =
+      container_of(cmd->vk.base.device, struct vtvk_device, vk);
+
+   if (!build->indirect) {
+      for (uint32_t i = 0; i < build->info_count; i++) {
+         const uint32_t offset = build->geometry_offsets[i];
+         const VkAccelerationStructureBuildRangeInfoKHR *ranges =
+            build->infos[i].geometryCount ? build->ranges + offset : nullptr;
+         VkResult result =
+            vtvk_build_as(device, &build->infos[i],
+                          ranges ? &ranges : nullptr);
+         if (result != VK_SUCCESS) {
+            mesa_loge("ventus-vk: AS build failed for Ventus BVH ABI v1 "
+                      "object=%u (%d)", i, result);
+            return result;
+         }
+      }
+      mesa_logi("ventus-vk: queue submit AS build wrote Ventus BVH ABI v1 "
+                "objects=%u", build->info_count);
+      return VK_SUCCESS;
+   }
+
+   std::vector<std::vector<VkAccelerationStructureBuildRangeInfoKHR>>
+      resolved_ranges(build->info_count);
+   for (uint32_t i = 0; i < build->info_count; i++) {
+      const uint32_t geometry_count = build->infos[i].geometryCount;
+      const VkDeviceAddress address = build->indirect_addresses[i];
+      const uint32_t stride = build->indirect_strides[i];
+      if ((address & 3) || (stride & 3)) {
+         mesa_loge("ventus-vk: indirect AS build address/stride is not "
+                   "4-byte aligned: address=0x%" PRIx64 " stride=%u",
+                   (uint64_t)address, stride);
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+      if (!geometry_count)
+         continue;
+
+      const VkDeviceSize specified_span =
+         VkDeviceSize(geometry_count) * stride;
+      const VkDeviceSize loaded_span =
+         VkDeviceSize(geometry_count - 1) * stride +
+         sizeof(VkAccelerationStructureBuildRangeInfoKHR);
+      const VkDeviceSize span = std::max(specified_span, loaded_span);
+      const uint8_t *range_bytes =
+         (const uint8_t *)vtvk_buffer_host_ptr_from_addr_with_usage(
+            address, span, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+      if (!range_bytes) {
+         mesa_loge("ventus-vk: indirect AS build %u does not name a complete "
+                   "INDIRECT_BUFFER range: address=0x%" PRIx64
+                   " span=%" PRIu64,
+                   i, (uint64_t)address, (uint64_t)span);
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+
+      resolved_ranges[i].resize(geometry_count);
+      const uint32_t max_offset = build->geometry_offsets[i];
+      for (uint32_t j = 0; j < geometry_count; j++) {
+         memcpy(&resolved_ranges[i][j],
+                range_bytes + VkDeviceSize(j) * stride,
+                sizeof(resolved_ranges[i][j]));
+         if (resolved_ranges[i][j].primitiveCount >
+             build->max_primitive_counts[max_offset + j]) {
+            mesa_loge("ventus-vk: indirect AS build %u geometry %u "
+                      "primitiveCount=%u exceeds maximum=%u",
+                      i, j, resolved_ranges[i][j].primitiveCount,
+                      build->max_primitive_counts[max_offset + j]);
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+         }
+      }
+   }
+
+   for (uint32_t i = 0; i < build->info_count; i++) {
+      const VkAccelerationStructureBuildRangeInfoKHR *ranges =
+         resolved_ranges[i].empty() ? nullptr : resolved_ranges[i].data();
+      VkResult result =
+         vtvk_build_as(device, &build->infos[i],
+                       ranges ? &ranges : nullptr);
+      if (result != VK_SUCCESS) {
+         mesa_loge("ventus-vk: indirect AS build failed for Ventus BVH "
+                   "ABI v1 object=%u (%d)", i, result);
+         return result;
+      }
+   }
+
+   mesa_logi("ventus-vk: queue submit indirect AS build wrote Ventus BVH "
+             "ABI v1 objects=%u geometries=%u",
+             build->info_count, build->total_geometry_count);
+   return VK_SUCCESS;
+}
+
+static struct vtvk_recorded_as_build_command *
+vtvk_record_as_build_command(
+   VkCommandBuffer command_buffer,
+   uint32_t info_count,
+   const VkAccelerationStructureBuildGeometryInfoKHR *infos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *range_infos,
+   const VkDeviceAddress *indirect_addresses,
+   const uint32_t *indirect_strides,
+   const uint32_t *const *max_primitive_counts)
+{
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, command_buffer);
+   struct vtvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
+   const bool indirect = indirect_addresses != nullptr;
+   if (!info_count || !infos ||
+       (!indirect && !range_infos) ||
+       (indirect && (!indirect_strides || !max_primitive_counts))) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_VALIDATION_FAILED_EXT);
+      return nullptr;
+   }
+
+   uint64_t geometry_count64 = 0;
+   for (uint32_t i = 0; i < info_count; i++)
+      geometry_count64 += infos[i].geometryCount;
+   if (geometry_count64 > UINT32_MAX) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return nullptr;
+   }
+   const uint32_t geometry_count = (uint32_t)geometry_count64;
+
+   struct vtvk_recorded_as_build_command *build =
+      (struct vtvk_recorded_as_build_command *)
+         vtvk_cmd_buffer_alloc_command(
+            cmd, sizeof(*build), vtvk_execute_recorded_as_build_command,
+            vtvk_destroy_recorded_as_build_command);
+   if (!build)
+      return nullptr;
+
+   const VkAllocationCallbacks *alloc = &cmd->vk.pool->alloc;
+   build->indirect = indirect;
+   build->info_count = info_count;
+   build->total_geometry_count = geometry_count;
+   build->infos = (VkAccelerationStructureBuildGeometryInfoKHR *)
+      vk_zalloc(alloc, sizeof(*build->infos) * info_count, 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   build->geometry_offsets = (uint32_t *)
+      vk_zalloc(alloc, sizeof(*build->geometry_offsets) * info_count, 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (geometry_count) {
+      build->geometries = (VkAccelerationStructureGeometryKHR *)
+         vk_zalloc(alloc, sizeof(*build->geometries) * geometry_count, 8,
+                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (indirect) {
+         build->max_primitive_counts = (uint32_t *)
+            vk_zalloc(alloc,
+                      sizeof(*build->max_primitive_counts) * geometry_count, 8,
+                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      } else {
+         build->ranges = (VkAccelerationStructureBuildRangeInfoKHR *)
+            vk_zalloc(alloc, sizeof(*build->ranges) * geometry_count, 8,
+                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      }
+   }
+   if (indirect) {
+      build->indirect_addresses = (VkDeviceAddress *)
+         vk_zalloc(alloc, sizeof(*build->indirect_addresses) * info_count, 8,
+                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      build->indirect_strides = (uint32_t *)
+         vk_zalloc(alloc, sizeof(*build->indirect_strides) * info_count, 8,
+                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   }
+
+   if (!build->infos || !build->geometry_offsets ||
+       (geometry_count &&
+        (!build->geometries ||
+         (indirect ? !build->max_primitive_counts : !build->ranges))) ||
+       (indirect &&
+        (!build->indirect_addresses || !build->indirect_strides))) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return nullptr;
+   }
+
+   uint32_t geometry_offset = 0;
+   for (uint32_t i = 0; i < info_count; i++) {
+      build->geometry_offsets[i] = geometry_offset;
+      build->infos[i] = infos[i];
+      build->infos[i].pNext = nullptr;
+      build->infos[i].pGeometries =
+         infos[i].geometryCount ? build->geometries + geometry_offset : nullptr;
+      build->infos[i].ppGeometries = nullptr;
+
+      if (indirect) {
+         build->indirect_addresses[i] = indirect_addresses[i];
+         build->indirect_strides[i] = indirect_strides[i];
+      }
+      for (uint32_t j = 0; j < infos[i].geometryCount; j++) {
+         const VkAccelerationStructureGeometryKHR *geometry =
+            (infos[i].pGeometries || infos[i].ppGeometries) ?
+            vtvk_build_geometry(&infos[i], j) : nullptr;
+         if (!geometry ||
+             (!indirect && !range_infos[i]) ||
+             (indirect && !max_primitive_counts[i])) {
+            vk_command_buffer_set_error(vk_cmd,
+                                        VK_ERROR_VALIDATION_FAILED_EXT);
+            return nullptr;
+         }
+         build->geometries[geometry_offset + j] = *geometry;
+         build->geometries[geometry_offset + j].pNext = nullptr;
+         if (indirect) {
+            build->max_primitive_counts[geometry_offset + j] =
+               max_primitive_counts[i][j];
+         } else {
+            build->ranges[geometry_offset + j] = range_infos[i][j];
+         }
+      }
+      geometry_offset += infos[i].geometryCount;
+   }
+   return build;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdBuildAccelerationStructuresKHR(
    VkCommandBuffer commandBuffer,
@@ -1124,22 +1372,8 @@ vtvk_CmdBuildAccelerationStructuresKHR(
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
 {
-   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
-   struct vtvk_device *device =
-      container_of(vk_cmd->base.device, struct vtvk_device, vk);
-
-   for (uint32_t i = 0; i < infoCount; i++) {
-      VkResult result =
-         vtvk_build_as(device, &pInfos[i], ppBuildRangeInfos + i);
-      if (result != VK_SUCCESS) {
-         mesa_loge("ventus-vk: AS build failed for Ventus BVH ABI v1 (%d)",
-                   result);
-         return;
-      }
-   }
-
-   mesa_logi("ventus-vk: AS build wrote Ventus BVH ABI v1 objects=%u",
-             infoCount);
+   vtvk_record_as_build_command(commandBuffer, infoCount, pInfos,
+                                ppBuildRangeInfos, nullptr, nullptr, nullptr);
 }
 
 static VkResult
@@ -1237,20 +1471,103 @@ vtvk_copy_acceleration_structure(
    return VK_SUCCESS;
 }
 
+struct vtvk_recorded_as_copy_command {
+   struct vtvk_recorded_command base;
+   VkCopyAccelerationStructureInfoKHR info;
+};
+
+static VkResult
+vtvk_execute_recorded_as_copy_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
+{
+   const struct vtvk_recorded_as_copy_command *copy =
+      (const struct vtvk_recorded_as_copy_command *)command;
+   struct vtvk_device *device =
+      container_of(cmd->vk.base.device, struct vtvk_device, vk);
+   VkResult result = vtvk_copy_acceleration_structure(device, &copy->info);
+   if (result != VK_SUCCESS)
+      mesa_loge("ventus-vk: AS copy failed at queue submit (%d)", result);
+   return result;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdCopyAccelerationStructureKHR(
    VkCommandBuffer commandBuffer,
    const VkCopyAccelerationStructureInfoKHR *pInfo)
 {
    VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
-   struct vtvk_device *device =
-      container_of(vk_cmd->base.device, struct vtvk_device, vk);
-
-   VkResult result = vtvk_copy_acceleration_structure(device, pInfo);
-   if (result != VK_SUCCESS) {
-      mesa_loge("ventus-vk: AS copy failed (%d)", result);
-      vk_command_buffer_set_error(vk_cmd, result);
+   struct vtvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
+   if (!pInfo) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_VALIDATION_FAILED_EXT);
+      return;
    }
+   struct vtvk_recorded_as_copy_command *copy =
+      (struct vtvk_recorded_as_copy_command *)
+         vtvk_cmd_buffer_alloc_command(
+            cmd, sizeof(*copy), vtvk_execute_recorded_as_copy_command,
+            nullptr);
+   if (!copy)
+      return;
+   copy->info = *pInfo;
+   copy->info.pNext = nullptr;
+}
+
+struct vtvk_recorded_as_property_command {
+   struct vtvk_recorded_command base;
+   uint32_t acceleration_structure_count;
+   VkAccelerationStructureKHR *acceleration_structures;
+   VkQueryType query_type;
+   VkQueryPool query_pool;
+   uint32_t first_query;
+};
+
+static void
+vtvk_destroy_recorded_as_property_command(
+   struct vtvk_cmd_buffer *cmd,
+   struct vtvk_recorded_command *command)
+{
+   struct vtvk_recorded_as_property_command *property =
+      (struct vtvk_recorded_as_property_command *)command;
+   vk_free(&cmd->vk.pool->alloc, property->acceleration_structures);
+}
+
+static VkResult
+vtvk_execute_recorded_as_property_command(
+   struct vtvk_cmd_buffer *cmd,
+   const struct vtvk_recorded_command *command)
+{
+   const struct vtvk_recorded_as_property_command *property =
+      (const struct vtvk_recorded_as_property_command *)command;
+   VK_FROM_HANDLE(vtvk_query_pool, pool, property->query_pool);
+   struct vtvk_device *device =
+      container_of(cmd->vk.base.device, struct vtvk_device, vk);
+
+   if (!pool || pool->vk.query_type != property->query_type ||
+       property->first_query > pool->vk.query_count ||
+       property->acceleration_structure_count >
+          pool->vk.query_count - property->first_query)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   std::vector<uint64_t> values(property->acceleration_structure_count);
+   for (uint32_t i = 0; i < property->acceleration_structure_count; i++) {
+      if (pool->queries[property->first_query + i].available)
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      const struct vtvk_acceleration_structure *as =
+         (const struct vtvk_acceleration_structure *)vtvk_handle_to_ptr(
+            (uint64_t)property->acceleration_structures[i]);
+      VkResult result = vtvk_acceleration_structure_property(
+         device, as, property->query_type, &values[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   for (uint32_t i = 0; i < property->acceleration_structure_count; i++) {
+      pool->queries[property->first_query + i].value = values[i];
+      pool->queries[property->first_query + i].available = true;
+   }
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1263,37 +1580,38 @@ vtvk_CmdWriteAccelerationStructuresPropertiesKHR(
    uint32_t firstQuery)
 {
    VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
-   VK_FROM_HANDLE(vtvk_query_pool, pool, queryPool);
-   struct vtvk_device *device =
-      container_of(vk_cmd->base.device, struct vtvk_device, vk);
-
-   if (!pool || pool->vk.query_type != queryType ||
-       firstQuery > pool->vk.query_count ||
-       accelerationStructureCount > pool->vk.query_count - firstQuery) {
-      vk_command_buffer_set_error(vk_cmd, VK_ERROR_UNKNOWN);
+   struct vtvk_cmd_buffer *cmd =
+      container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
+   if (accelerationStructureCount && !pAccelerationStructures) {
+      vk_command_buffer_set_error(vk_cmd, VK_ERROR_VALIDATION_FAILED_EXT);
       return;
    }
 
-   std::vector<uint64_t> values(accelerationStructureCount);
-   for (uint32_t i = 0; i < accelerationStructureCount; i++) {
-      if (pool->queries[firstQuery + i].available) {
-         vk_command_buffer_set_error(vk_cmd, VK_ERROR_UNKNOWN);
+   struct vtvk_recorded_as_property_command *property =
+      (struct vtvk_recorded_as_property_command *)
+         vtvk_cmd_buffer_alloc_command(
+            cmd, sizeof(*property),
+            vtvk_execute_recorded_as_property_command,
+            vtvk_destroy_recorded_as_property_command);
+   if (!property)
+      return;
+   property->acceleration_structure_count = accelerationStructureCount;
+   property->query_type = queryType;
+   property->query_pool = queryPool;
+   property->first_query = firstQuery;
+   if (accelerationStructureCount) {
+      property->acceleration_structures = (VkAccelerationStructureKHR *)
+         vk_alloc(&cmd->vk.pool->alloc,
+                  sizeof(*property->acceleration_structures) *
+                     accelerationStructureCount,
+                  8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!property->acceleration_structures) {
+         vk_command_buffer_set_error(vk_cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
          return;
       }
-      const struct vtvk_acceleration_structure *as =
-         (const struct vtvk_acceleration_structure *)
-            vtvk_handle_to_ptr((uint64_t)pAccelerationStructures[i]);
-      VkResult result = vtvk_acceleration_structure_property(
-         device, as, queryType, &values[i]);
-      if (result != VK_SUCCESS) {
-         vk_command_buffer_set_error(vk_cmd, result);
-         return;
-      }
-   }
-
-   for (uint32_t i = 0; i < accelerationStructureCount; i++) {
-      pool->queries[firstQuery + i].value = values[i];
-      pool->queries[firstQuery + i].available = true;
+      memcpy(property->acceleration_structures, pAccelerationStructures,
+             sizeof(*property->acceleration_structures) *
+                accelerationStructureCount);
    }
 }
 
@@ -1306,89 +1624,9 @@ vtvk_CmdBuildAccelerationStructuresIndirectKHR(
    const uint32_t *pIndirectStrides,
    const uint32_t *const *ppMaxPrimitiveCounts)
 {
-   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
-   struct vtvk_device *device =
-      container_of(vk_cmd->base.device, struct vtvk_device, vk);
-
-   if (!infoCount || !pInfos || !pIndirectDeviceAddresses ||
-       !pIndirectStrides || !ppMaxPrimitiveCounts) {
-      mesa_loge("ventus-vk: indirect AS build is missing command arrays");
-      return;
-   }
-
-   std::vector<std::vector<VkAccelerationStructureBuildRangeInfoKHR>>
-      build_ranges(infoCount);
-   uint64_t total_geometry_count = 0;
-
-   for (uint32_t i = 0; i < infoCount; i++) {
-      const uint32_t geometry_count = pInfos[i].geometryCount;
-      const VkDeviceAddress address = pIndirectDeviceAddresses[i];
-      const uint32_t stride = pIndirectStrides[i];
-      total_geometry_count += geometry_count;
-
-      if ((address & 3) || (stride & 3)) {
-         mesa_loge("ventus-vk: indirect AS build address/stride is not "
-                   "4-byte aligned: address=0x%" PRIx64 " stride=%u",
-                   (uint64_t)address, stride);
-         return;
-      }
-      if (!geometry_count)
-         continue;
-      if (!ppMaxPrimitiveCounts[i]) {
-         mesa_loge("ventus-vk: indirect AS build %u has no maximum "
-                   "primitive counts",
-                   i);
-         return;
-      }
-
-      const VkDeviceSize specified_span =
-         VkDeviceSize(geometry_count) * stride;
-      const VkDeviceSize loaded_span =
-         VkDeviceSize(geometry_count - 1) * stride +
-         sizeof(VkAccelerationStructureBuildRangeInfoKHR);
-      const VkDeviceSize span = std::max(specified_span, loaded_span);
-      const uint8_t *range_bytes =
-         (const uint8_t *)vtvk_buffer_host_ptr_from_addr_with_usage(
-            address, span, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-      if (!range_bytes) {
-         mesa_loge("ventus-vk: indirect AS build %u does not name a complete "
-                   "INDIRECT_BUFFER range: address=0x%" PRIx64
-                   " span=%" PRIu64,
-                   i, (uint64_t)address, (uint64_t)span);
-         return;
-      }
-
-      build_ranges[i].resize(geometry_count);
-      for (uint32_t j = 0; j < geometry_count; j++) {
-         memcpy(&build_ranges[i][j], range_bytes + VkDeviceSize(j) * stride,
-                sizeof(build_ranges[i][j]));
-         if (build_ranges[i][j].primitiveCount >
-             ppMaxPrimitiveCounts[i][j]) {
-            mesa_loge("ventus-vk: indirect AS build %u geometry %u "
-                      "primitiveCount=%u exceeds maximum=%u",
-                      i, j, build_ranges[i][j].primitiveCount,
-                      ppMaxPrimitiveCounts[i][j]);
-            return;
-         }
-      }
-   }
-
-   for (uint32_t i = 0; i < infoCount; i++) {
-      const VkAccelerationStructureBuildRangeInfoKHR *ranges =
-         build_ranges[i].empty() ? nullptr : build_ranges[i].data();
-      VkResult result = vtvk_build_as(
-         device, &pInfos[i], ranges ? &ranges : nullptr);
-      if (result != VK_SUCCESS) {
-         mesa_loge("ventus-vk: indirect AS build failed for Ventus BVH "
-                   "ABI v1 object=%u (%d)",
-                   i, result);
-         return;
-      }
-   }
-
-   mesa_logi("ventus-vk: indirect AS build wrote Ventus BVH ABI v1 "
-             "objects=%u geometries=%" PRIu64,
-             infoCount, total_geometry_count);
+   vtvk_record_as_build_command(
+      commandBuffer, infoCount, pInfos, nullptr, pIndirectDeviceAddresses,
+      pIndirectStrides, ppMaxPrimitiveCounts);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

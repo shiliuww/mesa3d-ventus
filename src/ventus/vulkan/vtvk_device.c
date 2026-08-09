@@ -12,7 +12,7 @@ vtvk_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct vtvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct vtvk_cmd_buffer, vk);
-      VkResult result = vtvk_cmd_buffer_execute_rt_commands(cmd);
+      VkResult result = vtvk_cmd_buffer_execute_commands(cmd);
       if (result != VK_SUCCESS)
          return result;
    }
