@@ -420,9 +420,6 @@ vt_nir_build_traversal(nir_builder *b,
                 nir_bcsel(b, complete_hit, hit_shader_record_ptr,
                           nir_bcsel(b, complete_miss, miss_shader_record_ptr,
                                     nir_imm_int64(b, 0))));
-   nir_def *opaque = nir_inot(b, candidate_non_opaque_triangle);
-   nir_def *need_software_opacity =
-      candidate_non_opaque_triangle;
    nir_def *hit_record_valid = nir_ior(b, complete_hit, is_candidate);
    nir_def *hit_record_status =
       nir_bcsel(b, hit_record_valid,
@@ -444,12 +441,6 @@ vt_nir_build_traversal(nir_builder *b,
                                           nir_unpack_64_2x32_split_y(b, shader_record_ptr));
    vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                           VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
-   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                          VT_RT_HIT_RECORD_OPAQUE, opaque);
-   vt_nir_store_candidate_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                          VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
-                                          need_software_opacity);
-
    nir_push_if(b, complete_hit);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_STATUS, hit_record_status);
@@ -465,11 +456,6 @@ vt_nir_build_traversal(nir_builder *b,
                                 nir_unpack_64_2x32_split_y(b, shader_record_ptr));
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
                                 VT_RT_HIT_RECORD_FRONT_FACE, nir_imm_true(b));
-   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                VT_RT_HIT_RECORD_OPAQUE, opaque);
-   vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,
-                                VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
-                                need_software_opacity);
    nir_push_else(b, NULL);
    nir_push_if(b, complete_miss);
    vt_nir_store_hit_record_word(b, config, VT_RT_LAYOUT_RAYGEN,

@@ -584,9 +584,16 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
          raygen_sp->base_bytes + raygen_sp->payload_base_bytes +
             payload_offset);
    }
-   if (offset >= sp->hit_attrib_base_bytes &&
-       offset < sp->hit_attrib_base_bytes + sp->hit_attrib_size_bytes) {
-      uint32_t attrib_offset = offset - sp->hit_attrib_base_bytes;
+   const bool candidate_hit_attrib =
+      offset >= sp->hit_attrib_base_bytes &&
+      offset < sp->hit_attrib_base_bytes + sp->hit_attrib_size_bytes;
+   const bool committed_hit_attrib =
+      offset >= sp->committed_hit_attrib_base_bytes &&
+      offset < sp->committed_hit_attrib_base_bytes + sp->hit_attrib_size_bytes;
+   if (candidate_hit_attrib || committed_hit_attrib) {
+      uint32_t attrib_offset = offset -
+         (candidate_hit_attrib ? sp->hit_attrib_base_bytes :
+                                sp->committed_hit_attrib_base_bytes);
       nir_def *status = load_completion_field(
          b, ray_ref, VT_RT_GLOBAL_COMPLETION_STATUS);
       nir_def *candidate = nir_ior(
@@ -599,8 +606,10 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
       nir_def *candidate_addr = load_completion_addr(
          b, ray_ref,
          VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
-      return nir_iadd_imm(b, nir_bcsel(b, candidate, candidate_addr,
-                                       committed_addr), attrib_offset);
+      return nir_iadd_imm(b,
+                          committed_hit_attrib ? committed_addr :
+                          nir_bcsel(b, candidate, candidate_addr, committed_addr),
+                          attrib_offset);
    }
    return NULL;
 }

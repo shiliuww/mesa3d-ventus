@@ -5,6 +5,10 @@
 
 #include "vt_nir.h"
 
+#include <stdio.h>
+
+#include "util/bitset.h"
+
 #define VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT 0x8u
 
 struct lower_rt_io_state {
@@ -16,6 +20,226 @@ struct lower_global_root_continuation_state {
    const struct vt_nir_rt_config *config;
    struct set *lowered_traces;
 };
+
+/* A nested monolithic trace overwrites RTcore's sole hardware-visible PDS
+ * context.  Preserve only parent words read after the child returns.  The
+ * saved values are NIR SSA defs, not another PDS frame: a later nested trace
+ * gets its own defs at its own call site and the register allocator decides
+ * whether any value must spill. */
+enum pds_context_addr {
+   PDS_CONTEXT_ADDR_WORD,
+   PDS_CONTEXT_ADDR_OUTSIDE,
+   PDS_CONTEXT_ADDR_UNKNOWN,
+};
+
+static bool
+const_u32(nir_def *def, uint32_t *value)
+{
+   nir_src src = nir_src_for_ssa(def);
+   if (!nir_src_is_const(src))
+      return false;
+
+   *value = nir_src_as_uint(src);
+   return true;
+}
+
+/* The ABI generates payload addresses as
+ *   payload_base + word * 4 + active_level * payload_size.
+ * The dynamic addend cannot alias the fixed RTcore context.  Other dynamic
+ * PDS addresses are conservatively treated as aliases of every context word.
+ */
+static enum pds_context_addr
+classify_pds_context_addr(nir_def *addr, uint32_t context_size,
+                          uint32_t *word)
+{
+   uint32_t value;
+   if (const_u32(addr, &value)) {
+      if (value >= context_size || value % VT_RT_ABI_WORD_BYTES)
+         return PDS_CONTEXT_ADDR_OUTSIDE;
+      *word = value / VT_RT_ABI_WORD_BYTES;
+      return PDS_CONTEXT_ADDR_WORD;
+   }
+
+   nir_instr *instr = nir_def_instr(addr);
+   if (instr->type != nir_instr_type_alu)
+      return PDS_CONTEXT_ADDR_UNKNOWN;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_iadd)
+      return PDS_CONTEXT_ADDR_UNKNOWN;
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (!const_u32(alu->src[i].src.ssa, &value))
+         continue;
+      if (value >= context_size)
+         return PDS_CONTEXT_ADDR_OUTSIDE;
+   }
+
+   return PDS_CONTEXT_ADDR_UNKNOWN;
+}
+
+static void
+transfer_pds_context_liveness(const nir_instr *instr, BITSET_WORD *live,
+                              uint32_t context_words)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return;
+
+   const nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot;
+   const bool store = intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot;
+   if (!load && !store)
+      return;
+
+   const unsigned addr_src = load ? 0 : 1;
+   uint32_t word = 0;
+   switch (classify_pds_context_addr(intrin->src[addr_src].ssa,
+                                     context_words * VT_RT_ABI_WORD_BYTES,
+                                     &word)) {
+   case PDS_CONTEXT_ADDR_WORD:
+      if (load)
+         BITSET_SET(live, word);
+      else
+         BITSET_CLEAR(live, word);
+      break;
+   case PDS_CONTEXT_ADDR_UNKNOWN:
+      /* An indirect PDS access may read or overwrite any ABI word. */
+      for (uint32_t i = 0; i < context_words; i++)
+         BITSET_SET(live, i);
+      break;
+   case PDS_CONTEXT_ADDR_OUTSIDE:
+      break;
+   }
+}
+
+static void
+union_successor_liveness(nir_block *block, const BITSET_WORD *live_in,
+                         unsigned bitset_words, BITSET_WORD *live)
+{
+   memset(live, 0, bitset_words * sizeof(*live));
+   for (unsigned i = 0; i < ARRAY_SIZE(block->successors); i++) {
+      nir_block *succ = block->successors[i];
+      if (!succ)
+         continue;
+      const BITSET_WORD *succ_live = live_in + succ->index * bitset_words;
+      for (unsigned j = 0; j < bitset_words; j++)
+         live[j] |= succ_live[j];
+   }
+}
+
+/* Return the PDS words live immediately after trace.  Backward CFG dataflow
+ * makes branch paths union naturally and reaches a fixed point for loops. */
+static BITSET_WORD *
+nested_parent_live_words(nir_function_impl *impl, nir_intrinsic_instr *trace,
+                         const struct vt_nir_rt_config *config)
+{
+   nir_index_blocks(impl);
+   const uint32_t context_words =
+      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
+      VT_RT_ABI_WORD_BYTES;
+   const unsigned bitset_words = BITSET_WORDS(context_words);
+   /* end_block has index num_blocks and is a successor of exit blocks. */
+   BITSET_WORD *live_in = calloc((impl->num_blocks + 1) * bitset_words,
+                                 sizeof(*live_in));
+   BITSET_WORD *live = calloc(bitset_words, sizeof(*live));
+   BITSET_WORD *next = calloc(bitset_words, sizeof(*next));
+   BITSET_WORD *result = calloc(bitset_words, sizeof(*result));
+   assert(live_in && live && next && result);
+
+   bool progress;
+   do {
+      progress = false;
+      nir_foreach_block_reverse(block, impl) {
+         union_successor_liveness(block, live_in, bitset_words, next);
+         nir_foreach_instr_reverse(instr, block)
+            transfer_pds_context_liveness(instr, next, context_words);
+
+         BITSET_WORD *block_live = live_in + block->index * bitset_words;
+         if (memcmp(block_live, next, bitset_words * sizeof(*next))) {
+            memcpy(block_live, next, bitset_words * sizeof(*next));
+            progress = true;
+         }
+      }
+   } while (progress);
+
+   nir_block *trace_block = trace->instr.block;
+   union_successor_liveness(trace_block, live_in, bitset_words, live);
+   bool found_trace = false;
+   nir_foreach_instr_reverse(instr, trace_block) {
+      if (instr == &trace->instr) {
+         memcpy(result, live, bitset_words * sizeof(*result));
+         found_trace = true;
+         break;
+      }
+      transfer_pds_context_liveness(instr, live, context_words);
+   }
+   assert(found_trace);
+
+   if (getenv("VT_NIR_DEBUG_PDS_LIVENESS_ALL")) {
+      for (uint32_t word = 0; word < context_words; word++)
+         BITSET_SET(result, word);
+   }
+
+   free(next);
+   free(live);
+   free(live_in);
+   return result;
+}
+
+static nir_def **
+save_nested_parent_context(nir_builder *b, const struct vt_nir_rt_config *config,
+                           const BITSET_WORD *live)
+{
+   const uint32_t context_words =
+      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
+      VT_RT_ABI_WORD_BYTES;
+   nir_def **saved = calloc(context_words, sizeof(*saved));
+   assert(saved);
+
+   for (uint32_t word = 0; word < context_words; word++) {
+      if (!BITSET_TEST(live, word))
+         continue;
+      saved[word] = nir_ventus_rt_load_slot(
+         b, 1, 32, vt_nir_scratchpad_addr(
+            b, config, VT_RT_LAYOUT_RAYGEN, word * VT_RT_ABI_WORD_BYTES));
+   }
+
+   return saved;
+}
+
+static void
+debug_nested_parent_live_words(const struct vt_nir_rt_config *config,
+                               const BITSET_WORD *live)
+{
+   if (!getenv("VT_NIR_DEBUG_PDS_LIVENESS"))
+      return;
+
+   const uint32_t context_words =
+      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
+      VT_RT_ABI_WORD_BYTES;
+   fprintf(stderr, "ventus: nested parent PDS live words:");
+   for (uint32_t word = 0; word < context_words; word++) {
+      if (BITSET_TEST(live, word))
+         fprintf(stderr, " %u", word);
+   }
+   fputc('\n', stderr);
+}
+
+static void
+restore_nested_parent_context(nir_builder *b, const struct vt_nir_rt_config *config,
+                              nir_def **saved)
+{
+   const uint32_t context_words =
+      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
+      VT_RT_ABI_WORD_BYTES;
+   for (uint32_t word = 0; word < context_words; word++) {
+      if (!saved[word])
+         continue;
+      nir_ventus_rt_store_slot(
+         b, saved[word], vt_nir_scratchpad_addr(
+            b, config, VT_RT_LAYOUT_RAYGEN, word * VT_RT_ABI_WORD_BYTES));
+   }
+}
 
 static nir_def *
 load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
@@ -143,11 +367,18 @@ emit_trace_callbacks(nir_builder *b,
    ignore_candidate_hit(b, config);
    if (config->emit_intersection)
       config->emit_intersection(b, params, result, config->callback_data);
-   if (config->emit_any_hit) {
+   /* Report-site lowering runs any-hit immediately so a later report cannot
+    * overwrite an earlier accepted candidate.  Keep the old fallback for
+    * standalone compiler users that have not opted into deferred reports. */
+   if (config->emit_any_hit && !config->defer_intersection_reports) {
       nir_def *reported =
          nir_ieq_imm(b, load_raygen_callback_decision(b, config),
                      VT_RT_CALLBACK_ACCEPT);
-      nir_push_if(b, reported);
+      nir_def *need_software_opacity =
+         nir_ine_imm(b, vt_nir_load_candidate_hit_record_word(
+                           b, config, VT_RT_LAYOUT_RAYGEN,
+                           VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 32), 0);
+      nir_push_if(b, nir_iand(b, reported, need_software_opacity));
       /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
       accept_candidate_hit(b, config);
       config->emit_any_hit(b, params, result, config->callback_data);
@@ -174,6 +405,15 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return false;
 
    b->cursor = nir_after_instr(&intrin->instr);
+   nir_def **saved_parent_context = NULL;
+
+   if (state->trace_depth > 0) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(b->shader);
+      BITSET_WORD *live = nested_parent_live_words(impl, intrin, config);
+      debug_nested_parent_live_words(config, live);
+      saved_parent_context = save_nested_parent_context(b, config, live);
+      free(live);
+   }
 
    /* The root raygen trace is depth 0.  Traces introduced while lowering an
     * inlined callback are assigned the next fixed payload slot. */
@@ -270,8 +510,18 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    }
    nir_pop_loop(b, loop);
 
+   if (saved_parent_context) {
+      restore_nested_parent_context(b, config, saved_parent_context);
+      free(saved_parent_context);
+   }
+
+   /* Returning from a nested trace resumes its parent payload frame.  The
+    * trace itself ran at trace_depth; code following it must address the
+    * enclosing frame at trace_depth - 1. */
+   const uint32_t resume_trace_depth =
+      state->trace_depth ? state->trace_depth - 1 : 0;
    vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
-                             nir_imm_int(b, state->trace_depth));
+                             nir_imm_int(b, resume_trace_depth));
 
    nir_instr_remove(&intrin->instr);
    return true;
@@ -444,6 +694,13 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
    bool progress = false;
    bool trace_progress = false;
    for (uint32_t i = 0; i < 8; i++) {
+      /* Callback shaders have already had their ABI lowered before they are
+       * inlined.  Fold their cloned slot addresses here for the PDS liveness
+       * classifier, but do not run the ABI lowering a second time. */
+      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+      nir_index_blocks(impl);
+      nir_index_ssa_defs(impl);
+      NIR_PASS(_, shader, nir_opt_constant_folding);
       state.trace_depth = i;
       bool pass_progress =
          nir_shader_intrinsics_pass(shader, lower_trace_ray, nir_metadata_none,

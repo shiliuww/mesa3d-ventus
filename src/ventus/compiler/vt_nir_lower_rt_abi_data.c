@@ -113,10 +113,10 @@ load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
       sp->payload_base_bytes;
    nir_def *addr = vt_nir_scratchpad_addr(
       b, state->config, layout, state->base_offset + word * 4);
-   /* Shader-temp/call-data locations are payload slots.  Function temporaries
-    * without a Vulkan location remain ordinary private values and use their
-    * fixed compiler frame offset. */
-   if (state->mode != nir_var_function_temp && payload_size) {
+   /* shader_call_data is the explicit TraceRay payload argument: a child
+    * miss/closest-hit must write the caller-visible frame, not a private
+    * depth spill.  Only compiler shader temporaries are depth-indexed. */
+   if (state->mode == nir_var_shader_temp && payload_size) {
       nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
       addr = nir_iadd(b, addr,
                       nir_imul_imm(b, depth, payload_size));
@@ -136,7 +136,7 @@ store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
       sp->payload_base_bytes;
    nir_def *addr = vt_nir_scratchpad_addr(
       b, state->config, layout, state->base_offset + word * 4);
-   if (state->mode != nir_var_function_temp && payload_size) {
+   if (state->mode == nir_var_shader_temp && payload_size) {
       nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
       addr = nir_iadd(b, addr,
                       nir_imul_imm(b, depth, payload_size));
@@ -691,12 +691,6 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_FRONT_FACE,
                                              nir_ieq_imm(b, hit_kind, 0xfe));
-      vt_nir_store_candidate_hit_record_word(b, config, layout,
-                                             VT_RT_HIT_RECORD_OPAQUE,
-                                             nir_imm_false(b));
-      vt_nir_store_candidate_hit_record_word(b, config, layout,
-                                             VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST,
-                                             nir_imm_true(b));
 
       nir_def_rewrite_uses(&intrin->def, accepted);
       nir_instr_remove(&intrin->instr);
@@ -719,8 +713,12 @@ vt_nir_lower_rt_control(nir_shader *shader,
 
    bool progress = false;
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
-   uint32_t hit_attrib_base =
-      config->scratchpad[layout].hit_attrib_base_bytes;
+   const bool candidate_attributes =
+      shader->info.stage == MESA_SHADER_ANY_HIT ||
+      shader->info.stage == MESA_SHADER_INTERSECTION;
+   uint32_t hit_attrib_base = candidate_attributes ?
+      config->scratchpad[layout].hit_attrib_base_bytes :
+      config->scratchpad[layout].committed_hit_attrib_base_bytes;
 
    progress |= lower_rt_vars(shader, nir_var_ray_hit_attrib, config,
                              hit_attrib_base, false, NULL);

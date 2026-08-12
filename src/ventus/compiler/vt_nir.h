@@ -62,6 +62,7 @@ struct vt_nir_scratchpad_layout {
    uint32_t candidate_hit_record_base_bytes;
    uint32_t hit_record_base_bytes;
    uint32_t hit_attrib_base_bytes;
+   uint32_t committed_hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
    bool hit_attrib_barycentrics;
    uint32_t payload_spill_base_bytes;
@@ -85,6 +86,7 @@ struct vt_nir_rt_abi_layout {
    uint32_t hit_record_base_bytes;
    uint32_t hit_record_size_bytes;
    uint32_t hit_attrib_base_bytes;
+   uint32_t committed_hit_attrib_base_bytes;
    uint32_t hit_attrib_size_bytes;
    bool hit_attrib_barycentrics;
    /* Fixed RT header plus the linked pipeline payload.  Megakernel PDS starts

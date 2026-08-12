@@ -155,6 +155,52 @@ build_push_constant_probe(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static void
+emit_test_trace_ray(nir_builder *b)
+{
+   nir_intrinsic_instr *trace =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_trace_ray);
+   trace->src[0] = nir_src_for_ssa(nir_imm_int64(b, 0x1000));
+   trace->src[1] = nir_src_for_ssa(nir_imm_int(b, 0));
+   trace->src[2] = nir_src_for_ssa(nir_imm_int(b, 0xff));
+   trace->src[3] = nir_src_for_ssa(nir_imm_int(b, 0));
+   trace->src[4] = nir_src_for_ssa(nir_imm_int(b, 0));
+   trace->src[5] = nir_src_for_ssa(nir_imm_int(b, 0));
+   trace->src[6] = nir_src_for_ssa(nir_vec3(
+      b, nir_imm_float(b, 0.0), nir_imm_float(b, 0.0), nir_imm_float(b, 0.0)));
+   trace->src[7] = nir_src_for_ssa(nir_imm_float(b, 0.0));
+   trace->src[8] = nir_src_for_ssa(nir_vec3(
+      b, nir_imm_float(b, 0.0), nir_imm_float(b, 0.0), nir_imm_float(b, 1.0)));
+   trace->src[9] = nir_src_for_ssa(nir_imm_float(b, 1.0));
+   trace->src[10] = nir_src_for_ssa(nir_imm_int64(b, 0));
+   nir_builder_instr_insert(b, &trace->instr);
+}
+
+/* The child is followed by a parent-only branch.  Its two loads are the
+ * expected PDS memory live-out set; unrelated candidate/header words must not
+ * be copied merely because RTcore can overwrite them. */
+static void
+emit_nested_liveness_callback(nir_builder *b,
+                              const struct vt_nir_rt_trace_params *params,
+                              const struct vt_nir_rt_result *result,
+                              void *data)
+{
+   (void)params;
+   (void)result;
+
+   unsigned *remaining_children = data;
+   if (*remaining_children) {
+      (*remaining_children)--;
+      emit_test_trace_ray(b);
+   }
+   nir_def *launch_x = nir_channel(b, nir_load_ray_launch_id(b), 0);
+   nir_push_if(b, nir_ine_imm(b, launch_x, 0));
+   nir_ventus_rt_load_slot(b, 1, 32, nir_imm_int(b, 196));
+   nir_push_else(b, NULL);
+   nir_ventus_rt_load_slot(b, 1, 32, nir_imm_int(b, 200));
+   nir_pop_if(b, NULL);
+}
+
 static unsigned
 count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
 {
@@ -174,6 +220,37 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
 
             if (nir_src_is_const(intrin->src[1]) &&
                 nir_src_as_uint(intrin->src[1]) == addr)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
+static unsigned
+count_slot_ssa_restores_to_const_addr(nir_shader *shader, uint32_t addr)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+            if (store->intrinsic != nir_intrinsic_ventus_rt_store_slot ||
+                !nir_src_is_const(store->src[1]) ||
+                nir_src_as_uint(store->src[1]) != addr)
+               continue;
+
+            nir_instr *def = nir_def_instr(store->src[0].ssa);
+            if (def->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(def);
+            if (load->intrinsic == nir_intrinsic_ventus_rt_load_slot &&
+                nir_src_is_const(load->src[0]) &&
+                nir_src_as_uint(load->src[0]) == addr)
                count++;
          }
       }
@@ -223,6 +300,10 @@ main(int argc, char **argv)
    config.hit_sbt_record_stride = 96;
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *nested_liveness_raygen =
+      vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *nested_liveness_baseline =
+      vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_loop_raygen = vt_rt_load_raygen_spirv(argv[2], &options);
@@ -243,6 +324,43 @@ main(int argc, char **argv)
       build_payload_location_probe(&options);
    nir_shader *push_constant_probe = build_push_constant_probe(&options);
 
+   struct vt_nir_rt_config nested_liveness_config = config;
+   unsigned nested_liveness_children = 1;
+   nested_liveness_config.enable_monolithic_shader_callbacks = true;
+   nested_liveness_config.emit_miss = emit_nested_liveness_callback;
+   nested_liveness_config.callback_data = &nested_liveness_children;
+
+   struct vt_nir_rt_config nested_liveness_baseline_config = config;
+   unsigned nested_liveness_baseline_children = 0;
+   nested_liveness_baseline_config.enable_monolithic_shader_callbacks = true;
+   nested_liveness_baseline_config.emit_miss = emit_nested_liveness_callback;
+   nested_liveness_baseline_config.callback_data =
+      &nested_liveness_baseline_children;
+   VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(
+      nested_liveness_baseline, &nested_liveness_baseline_config));
+   VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(nested_liveness_raygen,
+                                              &nested_liveness_config));
+   NIR_PASS(_, nested_liveness_raygen, nir_opt_constant_folding);
+   /* 196 and 200 are restored from distinct parent SSA defs.  Candidate word
+    * 116 is not live after the child and therefore has no save/restore store. */
+   const unsigned baseline_restore_196 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 196);
+   const unsigned baseline_restore_200 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 200);
+   const unsigned baseline_restore_116 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 116);
+   const unsigned nested_restore_196 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 196);
+   const unsigned nested_restore_200 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 200);
+   const unsigned nested_restore_116 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 116);
+   VT_RT_CHECK(nested_restore_196 == baseline_restore_196 + 1);
+   VT_RT_CHECK(nested_restore_200 == baseline_restore_200 + 1);
+   VT_RT_CHECK(nested_restore_116 == baseline_restore_116);
+   nir_validate_shader(nested_liveness_raygen,
+                       "after nested PDS liveness lowering");
+
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(abi.control_base_bytes >=
                abi.ray_state_base_bytes + abi.ray_state_size_bytes);
@@ -253,8 +371,10 @@ main(int argc, char **argv)
                abi.candidate_hit_record_size_bytes);
    VT_RT_CHECK(abi.hit_attrib_base_bytes >=
                abi.hit_record_base_bytes + abi.hit_record_size_bytes);
-   VT_RT_CHECK(abi.payload_base_bytes >=
+   VT_RT_CHECK(abi.committed_hit_attrib_base_bytes >=
                abi.hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
+   VT_RT_CHECK(abi.payload_base_bytes >=
+               abi.committed_hit_attrib_base_bytes + abi.hit_attrib_size_bytes);
    VT_RT_CHECK(abi.payload_size_bytes == 0);
    VT_RT_CHECK(VT_RT_CONTROL_WORD_COUNT == 1);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
@@ -264,7 +384,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 4);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 5);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
    VT_RT_CHECK(abi.control_base_bytes == 112);
@@ -272,6 +392,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 116);
    VT_RT_CHECK(abi.hit_record_base_bytes == 196);
    VT_RT_CHECK(abi.hit_attrib_base_bytes == 276);
+   VT_RT_CHECK(abi.committed_hit_attrib_base_bytes == 276);
    VT_RT_CHECK(abi.payload_base_bytes == 276);
    VT_RT_CHECK(abi.region_size_bytes == 276);
    VT_RT_CHECK(abi.total_size_bytes == 276);
@@ -600,6 +721,8 @@ main(int argc, char **argv)
           manual_per_lane_scratch);
 
    ralloc_free(raygen);
+   ralloc_free(nested_liveness_raygen);
+   ralloc_free(nested_liveness_baseline);
    ralloc_free(cps_mem_ctx);
    ralloc_free(global_raygen);
    ralloc_free(global_callback_closest_hit);

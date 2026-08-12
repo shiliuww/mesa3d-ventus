@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 4
+#define VT_RT_ABI_VERSION 5
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -131,7 +131,9 @@ enum vt_rt_cps_header_word {
 #define VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES 72
 
 #define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 276
-/* The payload starts immediately after the non-barycentric hit attributes.
+/* The payload starts after candidate and committed non-barycentric hit
+ * attributes.  Intersection/any-hit write the candidate half; an accepted
+ * report snapshots it into the committed half before closest-hit runs.
  * The two triangle barycentric words live in hit-record words 9 and 10 and
  * are therefore not part of this variable-sized region. */
 #define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 0

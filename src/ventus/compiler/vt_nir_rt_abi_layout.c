@@ -27,6 +27,7 @@ vt_nir_rt_default_abi_layout(void)
    layout.hit_record_size_bytes = VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES;
 
    layout.hit_attrib_base_bytes = VT_RT_ABI_HIT_ATTRIB_BASE_BYTES;
+   layout.committed_hit_attrib_base_bytes = VT_RT_ABI_HIT_ATTRIB_BASE_BYTES;
    layout.hit_attrib_size_bytes = VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES;
    layout.hit_attrib_barycentrics = false;
 
@@ -47,13 +48,15 @@ vt_nir_rt_abi_layout_set_hit_attrib_size(
    struct vt_nir_rt_abi_layout *layout, uint32_t hit_attrib_size_bytes,
    bool hit_attrib_barycentrics)
 {
-   if (!layout || hit_attrib_size_bytes > UINT32_MAX -
-                         layout->hit_attrib_base_bytes)
+   if (!layout || hit_attrib_size_bytes >
+                      (UINT32_MAX - layout->hit_attrib_base_bytes) / 2)
       return false;
 
    layout->hit_attrib_size_bytes = hit_attrib_size_bytes;
    layout->hit_attrib_barycentrics = hit_attrib_barycentrics;
-   layout->payload_base_bytes = layout->hit_attrib_base_bytes +
+   layout->committed_hit_attrib_base_bytes =
+      layout->hit_attrib_base_bytes + hit_attrib_size_bytes;
+   layout->payload_base_bytes = layout->committed_hit_attrib_base_bytes +
                                 hit_attrib_size_bytes;
    layout->region_size_bytes = layout->payload_base_bytes;
    layout->private_base_bytes = layout->region_size_bytes;
@@ -130,6 +133,8 @@ vt_nir_rt_config_apply_abi_layout(struct vt_nir_rt_config *config,
          layout->hit_record_base_bytes;
       config->scratchpad[i].hit_attrib_base_bytes =
          layout->hit_attrib_base_bytes;
+      config->scratchpad[i].committed_hit_attrib_base_bytes =
+         layout->committed_hit_attrib_base_bytes;
       config->scratchpad[i].hit_attrib_size_bytes =
          layout->hit_attrib_size_bytes;
       config->scratchpad[i].hit_attrib_barycentrics =
@@ -176,6 +181,8 @@ vt_nir_rt_config_apply_global_cps_layout(
          layout->hit_record_base_bytes;
       config->scratchpad[i].hit_attrib_base_bytes =
          layout->hit_attrib_base_bytes;
+      config->scratchpad[i].committed_hit_attrib_base_bytes =
+         layout->committed_hit_attrib_base_bytes;
       config->scratchpad[i].hit_attrib_size_bytes =
          layout->hit_attrib_size_bytes;
       config->scratchpad[i].hit_attrib_barycentrics =

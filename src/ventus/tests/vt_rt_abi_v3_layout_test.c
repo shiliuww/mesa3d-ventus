@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  *
  * Keep the Megakernel PDS ABI test separate from the global queue/CPS tests:
- * v4 reserves a fixed RTcore header at offset zero and sizes the payload from
+ * v5 reserves a fixed RTcore header at offset zero and sizes the payload from
  * the linked Vulkan RT shader interfaces before LLVM private spilling.
  */
 
@@ -36,6 +36,30 @@ build_payload_store_shader(void)
                  nir_vec4(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 2),
                           nir_imm_int(&b, 3), nir_imm_int(&b, 4)),
                  0xf);
+   return b.shader;
+}
+
+static nir_shader *
+build_report_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_INTERSECTION,
+                                                   NULL,
+                                                   "vt_rt_report_semantics");
+   nir_report_ray_intersection(&b, 1, nir_imm_float(&b, 1.0f),
+                               nir_imm_int(&b, 0xff));
+   return b.shader;
+}
+
+static nir_shader *
+build_two_report_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_INTERSECTION,
+                                                   NULL,
+                                                   "vt_rt_two_report_semantics");
+   nir_report_ray_intersection(&b, 1, nir_imm_float(&b, 1.0f),
+                               nir_imm_int(&b, 0xff));
+   nir_report_ray_intersection(&b, 1, nir_imm_float(&b, 2.0f),
+                               nir_imm_int(&b, 0xfe));
    return b.shader;
 }
 
@@ -88,13 +112,21 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 4);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 5);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
    VT_RT_CHECK(layout.payload_base_bytes == 276);
    VT_RT_CHECK(layout.region_size_bytes == 276);
    VT_RT_CHECK(layout.private_base_bytes == 276);
    VT_RT_CHECK(layout.payload_size_bytes == 0);
    VT_RT_CHECK(layout.total_size_bytes == 276);
+
+   struct vt_nir_rt_abi_layout direct_barycentrics =
+      vt_nir_rt_default_abi_layout();
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(
+      &direct_barycentrics, 0, true));
+   /* Triangle barycentrics are read from the committed hit record. */
+   VT_RT_CHECK(direct_barycentrics.hit_attrib_size_bytes == 0);
+   VT_RT_CHECK(direct_barycentrics.payload_base_bytes == 276);
 
    uint32_t payload_size = UINT32_MAX;
    VT_RT_CHECK(vt_nir_rt_compute_pipeline_payload_size(NULL, 0,
@@ -130,15 +162,62 @@ main(void)
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].private_base_bytes == 356);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_CLOSEST_HIT].total_size_bytes == 356);
 
+   nir_shader *report_shader = build_report_shader();
+   VT_RT_CHECK(vt_nir_lower_rt_control(report_shader, &config));
+   /* reportIntersectionEXT may update only report-specific fields; it cannot
+    * overwrite RTcore-provided raw OPAQUE or effective-opacity metadata. */
+   VT_RT_CHECK(count_store_slot_to_const_addr(report_shader, 180) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(report_shader, 184) == 0);
+
+   nir_shader *two_report_shader = build_two_report_shader();
+   VT_RT_CHECK(vt_nir_lower_rt_control(two_report_shader, &config));
+   /* Every report site remains independently lowered.  Committing the accepted
+    * report and running any-hit is deliberately tested later in the pipeline,
+    * outside this stack-free ABI test. */
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_STATUS * sizeof(uint32_t)) == 2);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_HIT_T * sizeof(uint32_t)) == 2);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_HIT_KIND * sizeof(uint32_t)) == 2);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_FRONT_FACE * sizeof(uint32_t)) == 2);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_OPAQUE * sizeof(uint32_t)) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST * sizeof(uint32_t)) == 0);
+
+   nir_shader *deferred_report_shader = build_report_shader();
+   struct vt_nir_rt_config deferred_config = config;
+   deferred_config.defer_intersection_reports = true;
+   VT_RT_CHECK(!vt_nir_lower_rt_control(deferred_report_shader,
+                                        &deferred_config));
+   struct vt_rt_intrinsic_counts deferred_counts;
+   vt_rt_count_intrinsics(deferred_report_shader, &deferred_counts);
+   VT_RT_CHECK(deferred_counts.report_ray_intersection == 1);
+
+   nir_shader *deferred_two_report_shader = build_two_report_shader();
+   VT_RT_CHECK(!vt_nir_lower_rt_control(deferred_two_report_shader,
+                                        &deferred_config));
+   vt_rt_count_intrinsics(deferred_two_report_shader, &deferred_counts);
+   VT_RT_CHECK(deferred_counts.report_ray_intersection == 2);
+
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(&layout, 32, true));
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 2));
-   VT_RT_CHECK(layout.payload_spill_base_bytes == 356);
+   VT_RT_CHECK(layout.committed_hit_attrib_base_bytes == 308);
+   VT_RT_CHECK(layout.payload_spill_base_bytes == 388);
    VT_RT_CHECK(layout.payload_spill_size_bytes == 96);
-   VT_RT_CHECK(layout.private_base_bytes == 452);
-   VT_RT_CHECK(layout.total_size_bytes == 452);
+   VT_RT_CHECK(layout.private_base_bytes == 484);
+   VT_RT_CHECK(layout.total_size_bytes == 484);
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 356);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 388);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_size_bytes == 96);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].max_ray_recursion_depth == 2);
 
@@ -146,23 +225,25 @@ main(void)
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(vt_nir_lower_rt_payload(store_shader, &config));
-   /* location 2 begins at payload_base + 2 * 16 = 340. */
-   /* Payload addresses now include active_depth * P and are therefore no
-    * longer compile-time constants.  Verify the four words are still lowered
-    * to RT slot stores; the dynamic-base shape is covered by the NIR dump. */
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 340) == 0);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 344) == 0);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 348) == 0);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 352) == 0);
+   /* Explicit shader-call payload is shared with a nested trace, so location
+    * 2 remains at payload_base + 2 * 16 = 372 regardless of active depth. */
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 372) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 376) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 380) == 1);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 384) == 1);
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
 
-   printf("PASS vt_rt_abi_v4_layout header=276+hitattr payload_union=48 "
-          "payload_sparse=80 private_base=388\n");
+   printf("PASS vt_rt_abi_v5_layout header=276 payload_union=48 "
+          "payload_sparse=80 private_base=484\n");
 
    ralloc_free(raygen);
    ralloc_free(closest_hit);
    ralloc_free(sparse);
    ralloc_free(store_shader);
+   ralloc_free(report_shader);
+   ralloc_free(two_report_shader);
+   ralloc_free(deferred_report_shader);
+   ralloc_free(deferred_two_report_shader);
    glsl_type_singleton_decref();
    return 0;
 }

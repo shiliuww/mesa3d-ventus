@@ -1199,22 +1199,27 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
    nir_def *current_tmax = nir_bcsel(b, committed_valid, committed_t, ray_tmax);
    nir_def *tmin = vt_nir_load_ray_state_word(
       b, config, layout, VT_RT_SLOT_TMIN);
-   nir_def *terminated = nir_ine_imm(
+   nir_def *terminated = nir_ieq_imm(
       b, vt_nir_load_control_word(
             b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32),
       VT_RT_CALLBACK_TERMINATE);
-   nir_def *ray_ref = vt_nir_rt_global_callback_ray_ref(b);
-   nir_def *candidate_attributes = vt_nir_rt_global_load_completion_addr(
-      b, ray_ref, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
-   nir_def *committed_attributes = vt_nir_rt_global_load_completion_addr(
-      b, ray_ref, VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO);
+   const bool global_callback =
+      config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_CALLBACK;
+   nir_def *candidate_attributes = NULL;
+   nir_def *committed_attributes = NULL;
+   if (global_callback) {
+      nir_def *ray_ref = vt_nir_rt_global_callback_ray_ref(b);
+      candidate_attributes = vt_nir_rt_global_load_completion_addr(
+         b, ray_ref, VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_ATTRIBUTE_ADDR_LO);
+      committed_attributes = vt_nir_rt_global_load_completion_addr(
+         b, ray_ref, VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO);
+   }
    nir_def *in_range = nir_iand(
       b, nir_flt(b, hit_t, current_tmax), nir_fge(b, hit_t, tmin));
    nir_def *eligible = nir_iand(b, in_range, nir_inot(b, terminated));
 
-   /* Preserve the AABB metadata populated by RTcore, changing only the
-    * report-specific fields.  Its geometry is non-opaque unless the ray or
-    * the record says otherwise. */
+   /* Preserve raw AS metadata populated by RTcore, changing only the
+    * report-specific fields. */
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_STATUS,
       nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
@@ -1232,19 +1237,16 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
                 nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
                           nir_imm_int(b, VT_RT_CALLBACK_IGNORE))));
 
-   nir_def *flags = vt_nir_load_ray_state_word(
-      b, config, layout, VT_RT_SLOT_FLAGS);
-   nir_def *force_opaque = nir_ine_imm(b, nir_iand_imm(b, flags, 1), 0);
-   nir_def *force_non_opaque =
-      nir_ine_imm(b, nir_iand_imm(b, flags, 1u << 1), 0);
-   nir_def *geometry_opaque = nir_ine_imm(
+   /* RTcore derived this from the raw AS opacity, ray flags, and instance
+    * flags when it emitted the AABB candidate.  Do not recompute it here:
+    * intersection shaders cannot otherwise observe instance ForceOpaque /
+    * ForceNoOpaque consistently. */
+   nir_def *need_software_opacity_test = nir_ine_imm(
       b, vt_nir_load_candidate_hit_record_word(
-            b, config, layout, VT_RT_HIT_RECORD_OPAQUE, 32), 0);
-   nir_def *opaque = nir_ior(
-      b, force_opaque, nir_iand(b, geometry_opaque, nir_inot(b, force_non_opaque)));
+            b, config, layout, VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 32), 0);
 
    if (state->any_hit) {
-      nir_push_if(b, nir_iand(b, eligible, nir_inot(b, opaque)));
+      nir_push_if(b, nir_iand(b, eligible, need_software_opacity_test));
       vtvk_inline_rt_callback_shader(b, state->any_hit);
       nir_pop_if(b, NULL);
    }
@@ -1262,11 +1264,25 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
          b, config, layout, hit_word,
          vt_nir_load_candidate_hit_record_word(b, config, layout, hit_word, 32));
    }
-   for (uint32_t word = 0; word < 2; word++) {
-      nir_def *offset = nir_imm_intN_t(b, word * sizeof(uint32_t), 64);
-      nir_store_global(b, nir_load_global(
-                              b, 1, 32, nir_iadd(b, candidate_attributes, offset)),
-                       nir_iadd(b, committed_attributes, offset), 0x1);
+   if (global_callback) {
+      for (uint32_t word = 0; word < 2; word++) {
+         nir_def *offset = nir_imm_intN_t(b, word * sizeof(uint32_t), 64);
+         nir_store_global(b, nir_load_global(
+                                 b, 1, 32, nir_iadd(b, candidate_attributes, offset)),
+                          nir_iadd(b, committed_attributes, offset), 0x1);
+      }
+   } else {
+      const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
+      for (uint32_t word = 0; word < sp->hit_attrib_size_bytes / sizeof(uint32_t);
+           word++) {
+         nir_def *candidate_addr = vt_nir_scratchpad_addr(
+            b, config, layout, sp->hit_attrib_base_bytes + word * sizeof(uint32_t));
+         nir_def *committed_addr = vt_nir_scratchpad_addr(
+            b, config, layout,
+            sp->committed_hit_attrib_base_bytes + word * sizeof(uint32_t));
+         nir_ventus_rt_store_slot(
+            b, nir_ventus_rt_load_slot(b, 1, 32, candidate_addr), committed_addr);
+      }
    }
    nir_pop_if(b, NULL);
 
@@ -1740,10 +1756,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
 
+      config.defer_intersection_reports = true;
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&config, &rt_abi);
          config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
-         config.defer_intersection_reports = true;
       }
 
       for (uint32_t s = 0; s < pipeline->shader_count; s++) {
@@ -1757,6 +1773,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
+      rt_io_config.defer_intersection_reports = true;
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &rt_abi);
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
@@ -1839,6 +1856,19 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          rt_io_config.emit_intersection =
             cb_shaders.intersection.empty() ? NULL : vtvk_emit_rt_intersection;
          rt_io_config.callback_data = &cb_data;
+
+         for (const vtvk_rt_callback_shader_entry &intersection :
+              cb_shaders.intersection) {
+            nir_shader *matching_any_hit = NULL;
+            for (const vtvk_rt_callback_shader_entry &any_hit : cb_shaders.any_hit) {
+               if (any_hit.group_index == intersection.group_index) {
+                  matching_any_hit = any_hit.shader;
+                  break;
+               }
+            }
+            vtvk_lower_rt_intersection_reports(intersection.shader, &rt_io_config,
+                                               matching_any_hit);
+         }
 
          vtvk_rt_log_nir_stats(cb_shaders.raygen,
                                "raygen before vt_nir_lower_rt_io_monolithic");
