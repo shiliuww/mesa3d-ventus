@@ -1265,7 +1265,9 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
          vt_nir_load_candidate_hit_record_word(b, config, layout, hit_word, 32));
    }
    if (global_callback) {
-      for (uint32_t word = 0; word < 2; word++) {
+      const uint32_t hit_attrib_words =
+         config->scratchpad[layout].hit_attrib_size_bytes / sizeof(uint32_t);
+      for (uint32_t word = 0; word < hit_attrib_words; word++) {
          nir_def *offset = nir_imm_intN_t(b, word * sizeof(uint32_t), 64);
          nir_store_global(b, nir_load_global(
                                  b, 1, 32, nir_iadd(b, candidate_attributes, offset)),
