@@ -138,6 +138,9 @@ enum vt_rt_cps_header_word {
  * are therefore not part of this variable-sized region. */
 #define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 0
 
+#define VT_RT_ABI_PAYLOAD_BASE_BYTES_FOR_HIT_ATTRIB_SIZE(hit_attrib_size_bytes) \
+   (VT_RT_ABI_HIT_ATTRIB_BASE_BYTES + 2 * (hit_attrib_size_bytes))
+
 #define VT_RT_ABI_SHADER_REGION_BASE_BYTES VT_RT_ABI_HIT_ATTRIB_BASE_BYTES
 #define VT_RT_ABI_PAYLOAD_BASE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
 /* The linked RT pipeline determines P before lowering:

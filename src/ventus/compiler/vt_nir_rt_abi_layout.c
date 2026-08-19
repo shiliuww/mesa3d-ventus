@@ -56,8 +56,8 @@ vt_nir_rt_abi_layout_set_hit_attrib_size(
    layout->hit_attrib_barycentrics = hit_attrib_barycentrics;
    layout->committed_hit_attrib_base_bytes =
       layout->hit_attrib_base_bytes + hit_attrib_size_bytes;
-   layout->payload_base_bytes = layout->committed_hit_attrib_base_bytes +
-                                hit_attrib_size_bytes;
+   layout->payload_base_bytes =
+      VT_RT_ABI_PAYLOAD_BASE_BYTES_FOR_HIT_ATTRIB_SIZE(hit_attrib_size_bytes);
    layout->region_size_bytes = layout->payload_base_bytes;
    layout->private_base_bytes = layout->region_size_bytes;
    layout->payload_spill_base_bytes = layout->private_base_bytes;
@@ -89,8 +89,10 @@ vt_nir_rt_abi_layout_set_recursion_depth(
    if (!layout || max_ray_recursion_depth > UINT32_MAX)
       return false;
 
-   const uint64_t spill_size =
-      (uint64_t)layout->payload_size_bytes * max_ray_recursion_depth;
+   /* Depth zero is the active payload slot already included in
+    * region_size_bytes. Reserve only the additional nested trace slots. */
+   const uint64_t spill_size = (uint64_t)layout->payload_size_bytes *
+      (max_ray_recursion_depth ? max_ray_recursion_depth - 1 : 0);
    const uint64_t total = (uint64_t)layout->region_size_bytes + spill_size;
    if (spill_size > UINT32_MAX || total > UINT32_MAX)
       return false;

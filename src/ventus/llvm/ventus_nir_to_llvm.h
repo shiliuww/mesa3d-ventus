@@ -32,9 +32,9 @@ struct vt_nir_to_llvm_options {
     * logical launch ID from the completion plane.  It needs a ray-ref-count
     * guard, not the root raygen image-extent guard. */
    bool global_rt_compact_resume;
-   /* Megakernel PDS layout: ordinary private allocas are placed after the
-    * fixed RT header and linked pipeline payload.  Zero preserves the legacy
-    * LLVM alloca layout (used by callback/global profiles). */
+   /* Megakernel PDS layout: ordinary private allocas and backend spills are
+    * placed after the fixed RT region, linked payload, and nested payload
+    * slots.  Zero preserves the legacy LLVM layout (callback/global profiles). */
    uint32_t private_base_bytes;
 };
 

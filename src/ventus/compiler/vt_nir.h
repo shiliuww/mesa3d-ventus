@@ -68,8 +68,9 @@ struct vt_nir_scratchpad_layout {
    uint32_t payload_spill_base_bytes;
    uint32_t payload_spill_size_bytes;
    uint32_t max_ray_recursion_depth;
-   /* First byte available to compiler-owned private objects.  The RT header
-    * and linked pipeline payload occupy [base_bytes, private_base_bytes). */
+   /* First byte available to compiler-owned private objects.  The RT header,
+    * linked pipeline payload, and nested payload slots occupy
+    * [base_bytes, private_base_bytes). */
    uint32_t private_base_bytes;
    uint32_t total_size_bytes;
 };
@@ -92,7 +93,7 @@ struct vt_nir_rt_abi_layout {
    /* Fixed RT header plus the linked pipeline payload.  Megakernel PDS starts
     * at logical offset zero; ordinary LLVM private state starts after total. */
    uint32_t region_size_bytes;
-   /* First byte after the fixed header and this pipeline's payload. */
+   /* First byte after the fixed header, pipeline payload, and nested slots. */
    uint32_t private_base_bytes;
    /* Compiler-owned depth-indexed payload area.  Depth zero occupies the
     * active slot at payload_base_bytes; each subsequent ray depth gets one

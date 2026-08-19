@@ -128,6 +128,14 @@ main(void)
    VT_RT_CHECK(direct_barycentrics.hit_attrib_size_bytes == 0);
    VT_RT_CHECK(direct_barycentrics.payload_base_bytes == 276);
 
+   struct vt_nir_rt_abi_layout custom_hit_attribs =
+      vt_nir_rt_default_abi_layout();
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(
+      &custom_hit_attribs, 12, false));
+   VT_RT_CHECK(custom_hit_attribs.payload_base_bytes ==
+               VT_RT_ABI_PAYLOAD_BASE_BYTES_FOR_HIT_ATTRIB_SIZE(12));
+   VT_RT_CHECK(custom_hit_attribs.payload_base_bytes == 276 + 2 * 12);
+
    uint32_t payload_size = UINT32_MAX;
    VT_RT_CHECK(vt_nir_rt_compute_pipeline_payload_size(NULL, 0,
                                                         &payload_size));
@@ -210,15 +218,19 @@ main(void)
 
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(&layout, 32, true));
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 1));
+   /* Depth zero uses the active payload slot in region_size_bytes. */
+   VT_RT_CHECK(layout.payload_spill_size_bytes == 0);
+   VT_RT_CHECK(layout.private_base_bytes == 388);
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 2));
    VT_RT_CHECK(layout.committed_hit_attrib_base_bytes == 308);
    VT_RT_CHECK(layout.payload_spill_base_bytes == 388);
-   VT_RT_CHECK(layout.payload_spill_size_bytes == 96);
-   VT_RT_CHECK(layout.private_base_bytes == 484);
-   VT_RT_CHECK(layout.total_size_bytes == 484);
+   VT_RT_CHECK(layout.payload_spill_size_bytes == 48);
+   VT_RT_CHECK(layout.private_base_bytes == 436);
+   VT_RT_CHECK(layout.total_size_bytes == 436);
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 388);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_size_bytes == 96);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_size_bytes == 48);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].max_ray_recursion_depth == 2);
 
    nir_shader *store_shader = build_payload_store_shader();
@@ -234,7 +246,7 @@ main(void)
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
 
    printf("PASS vt_rt_abi_v5_layout header=276 payload_union=48 "
-          "payload_sparse=80 private_base=484\n");
+          "payload_sparse=80 private_base=436\n");
 
    ralloc_free(raygen);
    ralloc_free(closest_hit);

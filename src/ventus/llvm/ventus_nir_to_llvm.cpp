@@ -713,6 +713,9 @@ private:
       Function *fn =
          Function::Create(FunctionType::get(Type::getVoidTy(context), false),
                           GlobalValue::ExternalLinkage, name, module);
+      if (privateBaseBytes)
+         fn->addFnAttr("ventus-rt-private-prefix",
+                       std::to_string(privateBaseBytes));
       if (entryPointIsKernel || name == "main")
          fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
       return fn;
@@ -751,19 +754,20 @@ private:
       foreach_list_typed(nir_variable, var, node, &impl->locals)
          collectVar(var);
 
-      /* For Megakernel, reserve the fixed RT header and linked payload in the
-       * same private frame before LLVM's stack-frame lowering sees allocas.
-       * A single backing alloca gives deterministic offsets; independent
-       * allocas cannot guarantee that a padding alloca stays at offset zero. */
+      /* The backend reserves the RT prefix for every AS5 frame object,
+       * including post-IR register spills.  Keep normal NIR variables in one
+       * backing alloca, but do not duplicate that prefix here. */
       if (privateBaseBytes) {
-         uint64_t words = (uint64_t(privateBaseBytes) + 3u) / 4u;
+         uint64_t words = 0;
          for (nir_variable *var : vars)
             words += storageWords(var->type);
-         if (words > UINT32_MAX)
-            words = UINT32_MAX;
-         privateFrame = entryAlloca(ArrayType::get(i32, (unsigned)words),
-                                    "ventus.private.frame", Align(16));
-         privateFrameNextWord = (privateBaseBytes + 3u) / 4u;
+         if (words) {
+            if (words > UINT32_MAX)
+               words = UINT32_MAX;
+            privateFrame = entryAlloca(ArrayType::get(i32, (unsigned)words),
+                                       "ventus.private.frame", Align(16));
+         }
+         privateFrameNextWord = 0;
       }
 
       auto allocVar = [&](nir_variable *var) {
@@ -1141,7 +1145,7 @@ private:
       Value *geOne =
          builder.CreateICmpUGE(bits, ConstantInt::get(i32, 0x3f800000u));
       Value *tooSmall =
-         builder.CreateICmpULT(bits, ConstantInt::get(i32, 0x3b800000u));
+         builder.CreateICmpULT(bits, ConstantInt::get(i32, 0x3b000000u));
 
       Value *exp = builder.CreateAnd(builder.CreateLShr(bits, 23),
                                      ConstantInt::get(i32, 0xff));
@@ -1150,15 +1154,33 @@ private:
          ConstantInt::get(i32, 0x00800000u));
       Value *scaled = builder.CreateMul(mant, ConstantInt::get(i32, 255));
 
-      Value *shift = builder.CreateSub(ConstantInt::get(i32, 150), exp);
-      shift = builder.CreateSelect(builder.CreateICmpULT(exp,
-                                                         ConstantInt::get(i32, 119)),
-                                   ConstantInt::get(i32, 31), shift);
-      shift = builder.CreateSelect(builder.CreateICmpUGT(exp,
-                                                         ConstantInt::get(i32, 150)),
-                                   ConstantInt::get(i32, 0), shift);
-
-      Value *converted = builder.CreateLShr(scaled, shift);
+      /* Convert positive finite values below one to the nearest UNORM8
+       * representable value.  Keep this in integer space so the generated
+       * store does not depend on host floating-point conversion behavior. */
+      Value *normal = builder.CreateAnd(
+         builder.CreateICmpUGE(exp, ConstantInt::get(i32, 119)),
+         builder.CreateICmpULT(exp, ConstantInt::get(i32, 127)));
+      Value *shift = builder.CreateSelect(
+         normal, builder.CreateSub(ConstantInt::get(i32, 150), exp),
+         ConstantInt::get(i32, 1));
+      Value *truncated = builder.CreateLShr(scaled, shift);
+      Value *remainder = builder.CreateSub(
+         scaled, builder.CreateShl(truncated, shift));
+      Value *half = builder.CreateShl(
+         ConstantInt::get(i32, 1),
+         builder.CreateSub(shift, ConstantInt::get(i32, 1)));
+      Value *tie = builder.CreateICmpEQ(remainder, half);
+      Value *roundUp = builder.CreateOr(
+         builder.CreateICmpUGT(remainder, half),
+         builder.CreateAnd(tie, builder.CreateICmpNE(
+            builder.CreateAnd(truncated, ConstantInt::get(i32, 1)),
+            ConstantInt::get(i32, 0))));
+      Value *rounded = builder.CreateAdd(truncated, builder.CreateZExt(roundUp, i32));
+      Value *exp118 = builder.CreateICmpEQ(exp, ConstantInt::get(i32, 118));
+      Value *converted = builder.CreateSelect(
+         exp118,
+         builder.CreateZExt(builder.CreateICmpUGT(
+            scaled, ConstantInt::get(i32, 0x80000000u)), i32), rounded);
       converted = builder.CreateSelect(geOne, ConstantInt::get(i32, 255),
                                        converted);
       return builder.CreateSelect(builder.CreateOr(sign, tooSmall),
