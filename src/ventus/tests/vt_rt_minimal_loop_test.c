@@ -384,9 +384,21 @@ main(int argc, char **argv)
    VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
       cps_raygen, 1, linked_payload_size, 0, &resident_plan, cps_mem_ctx));
    VT_RT_CHECK(resident_plan.site_count == 1);
+   VT_RT_CHECK(resident_plan.lowered_initial_shader != NULL);
+   VT_RT_CHECK(resident_plan.resume_shader_count == 1);
+   VT_RT_CHECK(resident_plan.resume_shaders[0] != NULL);
+   VT_RT_CHECK(count_intrinsic(resident_plan.lowered_initial_shader,
+                              nir_intrinsic_rt_trace_ray) == 1);
+   VT_RT_CHECK(count_intrinsic(resident_plan.resume_shaders[0],
+                              nir_intrinsic_rt_resume) == 1);
    VT_RT_CHECK(resident_plan.sites[0].kind ==
                VT_NIR_RT_TRACE_CONTINUATION);
    VT_RT_CHECK(resident_plan.sites[0].ssa_spill_bytes == 0);
+   VT_RT_CHECK(resident_plan.sites[0].parent_pds_save_bytes == 192);
+   VT_RT_CHECK(resident_plan.sites[0].parent_payload_save_bytes ==
+               linked_payload_size);
+   VT_RT_CHECK(resident_plan.sites[0].return_data_bytes ==
+               linked_payload_size);
    VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 224);
    VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 224);
    VT_RT_CHECK((resident_plan.feature_flags &
@@ -400,14 +412,19 @@ main(int argc, char **argv)
    VT_RT_CHECK(callable_plan.sites[0].kind ==
                VT_NIR_RT_CALLABLE_CONTINUATION);
    VT_RT_CHECK(callable_plan.sites[0].ssa_spill_bytes == 16);
+   VT_RT_CHECK(callable_plan.sites[0].parent_pds_save_bytes == 0);
+   VT_RT_CHECK(callable_plan.sites[0].parent_payload_save_bytes ==
+               linked_payload_size);
+   VT_RT_CHECK(callable_plan.sites[0].return_data_bytes ==
+               linked_payload_size);
    VT_RT_CHECK(callable_plan.sites[0].frame_size_bytes == 48);
    VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 48);
    struct vt_nir_rt_resident_continuation_info wide_callable_plan = {};
    VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 48,
       &wide_callable_plan, cps_mem_ctx));
-   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 80);
-   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 80);
+   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 48);
+   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 48);
    VT_RT_CHECK(!vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 0,
       &wide_callable_plan, cps_mem_ctx));

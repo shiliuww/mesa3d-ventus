@@ -75,12 +75,9 @@ collect_resident_sites(
             return false;
          const uint32_t ssa_spill_bytes =
             stack_size - ordinary_scratch_bytes;
-         const uint32_t call_data_bytes =
-            kind == VT_NIR_RT_TRACE_CONTINUATION ?
-               payload_size_bytes : callable_data_size_bytes;
          uint32_t frame_size_bytes = 0;
          if (!resident_site_frame_size(kind, ssa_spill_bytes,
-                                       call_data_bytes,
+                                       payload_size_bytes,
                                        &frame_size_bytes))
             return false;
 
@@ -97,6 +94,14 @@ collect_resident_sites(
             .kind = kind,
             .call_index = call_index,
             .ssa_spill_bytes = ssa_spill_bytes,
+            .parent_pds_save_bytes =
+               kind == VT_NIR_RT_TRACE_CONTINUATION ?
+                  VT_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                     VT_RT_V5_TRACE_COMMITTED_BYTES : 0,
+            .parent_payload_save_bytes = payload_size_bytes,
+            .return_data_bytes =
+               kind == VT_NIR_RT_TRACE_CONTINUATION ?
+                  payload_size_bytes : callable_data_size_bytes,
             .frame_size_bytes = frame_size_bytes,
          };
          if (kind == VT_NIR_RT_TRACE_CONTINUATION) {
@@ -131,6 +136,7 @@ vt_nir_plan_rt_resident_continuations(
    nir_shader *analysis = nir_shader_clone(mem_ctx, shader);
    if (!analysis)
       return false;
+   info->lowered_initial_shader = analysis;
    const uint32_t ordinary_scratch_bytes = analysis->scratch_size;
    nir_shader **resume_shaders = NULL;
    uint32_t resume_shader_count = 0;
@@ -143,6 +149,8 @@ vt_nir_plan_rt_resident_continuations(
                                &resume_shader_count, mem_ctx))
       return true;
 
+   info->resume_shaders = resume_shaders;
+   info->resume_shader_count = resume_shader_count;
    info->site_count = resume_shader_count;
    info->sites = rzalloc_array(mem_ctx, struct vt_nir_rt_continuation_site,
                                info->site_count);

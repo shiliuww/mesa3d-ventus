@@ -426,11 +426,17 @@ struct vt_nir_rt_continuation_site {
    enum vt_nir_rt_continuation_kind kind;
    uint32_t call_index;
    uint32_t ssa_spill_bytes;
+   uint32_t parent_pds_save_bytes;
+   uint32_t parent_payload_save_bytes;
+   uint32_t return_data_bytes;
    uint32_t frame_size_bytes;
 };
 
 struct vt_nir_rt_resident_continuation_info {
+   nir_shader *lowered_initial_shader;
+   nir_shader **resume_shaders;
    struct vt_nir_rt_continuation_site *sites;
+   uint32_t resume_shader_count;
    uint32_t site_count;
    uint32_t feature_flags;
    uint32_t max_trace_frame_bytes;
@@ -442,6 +448,11 @@ bool vt_nir_lower_rt_cps(nir_shader *shader,
                          struct vt_nir_rt_cps_info *info,
                          void *mem_ctx);
 
+/* Clone the input and run Mesa's generic shader-call split/liveness lowering
+ * with the resident V5 frame alignment.  The returned initial/resume shaders
+ * contain the concrete SSA spill/reload and resume control flow; each site
+ * also carries the hot-PDS/payload save and child-return plan consumed by the
+ * later V5 frame-materialization pass.  The input shader is not modified. */
 bool vt_nir_plan_rt_resident_continuations(
    const nir_shader *shader, uint32_t max_ray_recursion_depth,
    uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
