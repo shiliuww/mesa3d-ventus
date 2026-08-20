@@ -35,6 +35,19 @@ struct vt_nir_to_llvm_options {
    /* MegaKernel private allocas start after the linked RT frame.  Zero keeps
     * the independent-allocation layout used by staged callback kernels. */
    uint32_t private_base_bytes;
+   /* Optional V4 `.ventus.resource.<kernel>` RT trailer.  This is disabled
+    * for the maintained V3/V4 compatibility path until the V5 PDS lowering
+    * is selected. */
+   bool emit_rt_resource_v4;
+   uint32_t rt_feature_flags;
+   uint32_t rt_pds_layout_id;
+   uint32_t rt_private_layout_id;
+   uint32_t rt_hot_pds_offset_per_thread;
+   uint32_t rt_hot_pds_stride_bytes;
+   uint32_t rt_continuation_offset_per_thread;
+   uint32_t rt_continuation_bytes_per_thread;
+   uint32_t rt_payload_size_bytes;
+   uint32_t rt_callable_data_size_bytes;
 };
 
 llvm::Module *vt_nir_to_llvm_translate(nir_shader **shaders,

@@ -135,6 +135,16 @@ main()
       .data_layout = "e-m:e-p:32:32-i64:64-n32-S128-A5-G1",
       .require_ssa_function_temps = true,
       .private_base_bytes = 320,
+      .emit_rt_resource_v4 = true,
+      .rt_feature_flags = 3,
+      .rt_pds_layout_id = 5,
+      .rt_private_layout_id = 5,
+      .rt_hot_pds_offset_per_thread = 128,
+      .rt_hot_pds_stride_bytes = 384,
+      .rt_continuation_offset_per_thread = 512,
+      .rt_continuation_bytes_per_thread = 256,
+      .rt_payload_size_bytes = 96,
+      .rt_callable_data_size_bytes = 0,
    };
 
    llvm::Module *module =
@@ -142,6 +152,15 @@ main()
    VT_RT_CHECK(module != nullptr);
    VT_RT_CHECK(!llvm::verifyModule(*module));
    VT_RT_CHECK(module->getDataLayout().getAllocaAddrSpace() == 5);
+   llvm::Function *entry = module->getFunction("main");
+   VT_RT_CHECK(entry != nullptr);
+   llvm::MDNode *rt_resource = entry->getMetadata("ventus.rt.resource");
+   VT_RT_CHECK(rt_resource != nullptr);
+   VT_RT_CHECK(rt_resource->getNumOperands() == 10);
+   const auto *rt_stride = llvm::mdconst::dyn_extract<llvm::ConstantInt>(
+      rt_resource->getOperand(4));
+   VT_RT_CHECK(rt_stride != nullptr);
+   VT_RT_CHECK(rt_stride->getZExtValue() == 384);
 
    bool found_phi = false;
    bool found_float_bits = false;

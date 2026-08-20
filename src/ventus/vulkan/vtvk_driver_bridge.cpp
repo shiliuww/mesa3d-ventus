@@ -27,6 +27,7 @@
 
 #include "util/log.h"
 #include "util/u_math.h"
+#include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_address.h"
 #include "ventus/common/ventus_rt_bvh.h"
 #include "ventus/common/ventus_kernel_metadata.h"
@@ -197,25 +198,6 @@ enum vtvk_driver_dva_capability {
    VTVK_DRIVER_CAP_DVA_ALLOC_GRANULE = 0xc,
 };
 
-struct vtvk_driver_kernel_resource_v3 {
-   uint32_t version;
-   uint32_t flags;
-   uint64_t vgpr_used;
-   uint64_t sgpr_used;
-   uint64_t lds_static_bytes;
-   uint64_t pds_static_bytes;
-   uint64_t lds_stack_peak_bytes;
-   uint64_t pds_stack_peak_bytes;
-};
-
-static_assert(sizeof(struct vtvk_driver_kernel_resource_v3) == 56,
-              "Ventus kernel resource V3 layout mismatch");
-
-enum vtvk_driver_kernel_resource_flags {
-   VTVK_KERNEL_RESOURCE_STACK_PEAK_UNAVAILABLE = 1u << 4,
-   VTVK_KERNEL_RESOURCE_REGISTER_USAGE_INCOMPLETE = 1u << 5,
-};
-
 struct vtvk_driver_kernel_launch_resources {
    uint64_t sgpr_usage;
    uint64_t vgpr_usage;
@@ -223,6 +205,9 @@ struct vtvk_driver_kernel_launch_resources {
    uint64_t pds_stack_size_per_thread;
    uint64_t lds_static_per_wg;
    uint64_t lds_stack_size_per_wf;
+   bool saw_entry_without_rt_contract;
+   bool has_rt_contract;
+   struct ventus_kernel_resource_v4 rt_contract;
 };
 
 static bool
@@ -295,7 +280,7 @@ vtvk_bridge_align_u64_checked(uint64_t value, uint64_t alignment,
 static bool
 vtvk_driver_read_kernel_resource(
    const char *path, const char *kernel_name,
-   struct vtvk_driver_kernel_resource_v3 *resource)
+   struct ventus_kernel_resource_v4 *resource)
 {
 #if defined(USE_LIBELF)
    static constexpr const char *prefix = ".ventus.resource.";
@@ -321,6 +306,8 @@ vtvk_driver_read_kernel_resource(
    }
 
    bool ok = false;
+   uint32_t wire_version = 0;
+   size_t expected_size = 0;
    GElf_Ehdr ehdr = {};
    size_t shstrndx = 0;
    std::vector<uint8_t> bytes;
@@ -352,14 +339,28 @@ vtvk_driver_read_kernel_resource(
       break;
    }
 
-   if (bytes.size() != sizeof(*resource)) {
-      mesa_loge("ventus-vk: kernel ELF %s has missing or invalid %s "
-                "(size=%zu, expected=%zu)",
-                path, section_name.c_str(), bytes.size(), sizeof(*resource));
+   if (bytes.size() < sizeof(uint32_t)) {
+      mesa_loge("ventus-vk: kernel ELF %s has truncated %s", path,
+                section_name.c_str());
       goto done;
    }
 
-   memcpy(resource, bytes.data(), sizeof(*resource));
+   memcpy(&wire_version, bytes.data(), sizeof(wire_version));
+   wire_version = util_le32_to_cpu(wire_version);
+   expected_size =
+      wire_version == VENTUS_KERNEL_RESOURCE_V3_VERSION ?
+         VENTUS_KERNEL_RESOURCE_V3_SIZE :
+      wire_version == VENTUS_KERNEL_RESOURCE_V4_VERSION ?
+         VENTUS_KERNEL_RESOURCE_V4_SIZE : 0;
+   if (!expected_size || bytes.size() != expected_size) {
+      mesa_loge("ventus-vk: kernel ELF %s has unsupported or invalid %s "
+                "(version=%u, size=%zu)",
+                path, section_name.c_str(), wire_version, bytes.size());
+      goto done;
+   }
+
+   memset(resource, 0, sizeof(*resource));
+   memcpy(resource, bytes.data(), expected_size);
    resource->version = util_le32_to_cpu(resource->version);
    resource->flags = util_le32_to_cpu(resource->flags);
    resource->vgpr_used = util_le64_to_cpu(resource->vgpr_used);
@@ -372,6 +373,27 @@ vtvk_driver_read_kernel_resource(
       util_le64_to_cpu(resource->lds_stack_peak_bytes);
    resource->pds_stack_peak_bytes =
       util_le64_to_cpu(resource->pds_stack_peak_bytes);
+   if (resource->version == VENTUS_KERNEL_RESOURCE_V4_VERSION) {
+      resource->rt_feature_flags =
+         util_le32_to_cpu(resource->rt_feature_flags);
+      resource->rt_pds_layout_id =
+         util_le32_to_cpu(resource->rt_pds_layout_id);
+      resource->rt_private_layout_id =
+         util_le32_to_cpu(resource->rt_private_layout_id);
+      resource->rt_hot_pds_offset_per_thread =
+         util_le32_to_cpu(resource->rt_hot_pds_offset_per_thread);
+      resource->rt_hot_pds_stride_bytes =
+         util_le32_to_cpu(resource->rt_hot_pds_stride_bytes);
+      resource->rt_continuation_offset_per_thread =
+         util_le32_to_cpu(resource->rt_continuation_offset_per_thread);
+      resource->rt_continuation_bytes_per_thread =
+         util_le32_to_cpu(resource->rt_continuation_bytes_per_thread);
+      resource->rt_payload_size_bytes =
+         util_le32_to_cpu(resource->rt_payload_size_bytes);
+      resource->rt_callable_data_size_bytes =
+         util_le32_to_cpu(resource->rt_callable_data_size_bytes);
+      resource->reserved_zero = util_le32_to_cpu(resource->reserved_zero);
+   }
    ok = true;
 
 done:
@@ -389,27 +411,43 @@ done:
 
 static bool
 vtvk_driver_normalize_kernel_resource(
-   const char *path, const struct vtvk_driver_kernel_resource_v3 *resource,
+   const char *path, const struct ventus_kernel_resource_v4 *resource,
    struct vtvk_driver_kernel_launch_resources *normalized)
 {
-   static constexpr uint32_t resource_version = 3;
    static constexpr uint64_t resource_alignment = 128;
    static constexpr uint64_t register_alignment = 4;
    static constexpr uint64_t minimum_sgpr_usage = 32;
    if (!resource || !normalized)
       return false;
-   if (resource->version != resource_version) {
+   if (resource->version != VENTUS_KERNEL_RESOURCE_V3_VERSION &&
+       resource->version != VENTUS_KERNEL_RESOURCE_V4_VERSION) {
       mesa_loge("ventus-vk: kernel ELF %s has unsupported resource version %u",
                 path, resource->version);
       return false;
    }
-   if ((resource->flags & VTVK_KERNEL_RESOURCE_STACK_PEAK_UNAVAILABLE) ||
+   if (resource->version == VENTUS_KERNEL_RESOURCE_V4_VERSION) {
+      const enum ventus_kernel_resource_v4_error validation =
+         ventus_kernel_resource_v4_validate(resource, false);
+      if (validation != VENTUS_KERNEL_RESOURCE_V4_VALID) {
+         mesa_loge("ventus-vk: kernel ELF %s has invalid V4 RT resource "
+                   "contract (error=%u)",
+                   path, (unsigned)validation);
+         return false;
+      }
+      if (ventus_kernel_resource_v4_has_rt(resource)) {
+         normalized->has_rt_contract = true;
+         normalized->rt_contract = *resource;
+      }
+   }
+   if ((resource->flags &
+        VENTUS_KERNEL_RESOURCE_STACK_PEAK_UNAVAILABLE) ||
        resource->lds_stack_peak_bytes == UINT64_MAX ||
        resource->pds_stack_peak_bytes == UINT64_MAX) {
       mesa_loge("ventus-vk: kernel ELF %s has unavailable stack peak", path);
       return false;
    }
-   if (resource->flags & VTVK_KERNEL_RESOURCE_REGISTER_USAGE_INCOMPLETE) {
+   if (resource->flags &
+       VENTUS_KERNEL_RESOURCE_REGISTER_USAGE_INCOMPLETE) {
       mesa_loge("ventus-vk: kernel ELF %s has incomplete register usage", path);
       return false;
    }
@@ -446,11 +484,35 @@ static bool
 vtvk_driver_merge_kernel_resource(
    const char *path, struct vtvk_driver_kernel_launch_resources *envelope)
 {
-   struct vtvk_driver_kernel_resource_v3 raw = {};
+   struct ventus_kernel_resource_v4 raw = {};
    struct vtvk_driver_kernel_launch_resources resource = {};
    if (!vtvk_driver_read_kernel_resource(path, "main", &raw) ||
        !vtvk_driver_normalize_kernel_resource(path, &raw, &resource))
       return false;
+
+   if (resource.has_rt_contract) {
+      if (envelope->saw_entry_without_rt_contract) {
+         mesa_loge("ventus-vk: kernel ELF %s mixes an RT V4 contract with "
+                   "entries that do not publish one", path);
+         return false;
+      }
+      if (envelope->has_rt_contract &&
+          !ventus_kernel_resource_v4_rt_equal(&envelope->rt_contract,
+                                              &resource.rt_contract)) {
+         mesa_loge("ventus-vk: kernel ELF %s has an RT V4 contract that "
+                   "does not match the pipeline", path);
+         return false;
+      }
+      envelope->has_rt_contract = true;
+      envelope->rt_contract = resource.rt_contract;
+   } else {
+      if (envelope->has_rt_contract) {
+         mesa_loge("ventus-vk: kernel ELF %s omits the RT V4 contract used "
+                   "by other pipeline entries", path);
+         return false;
+      }
+      envelope->saw_entry_without_rt_contract = true;
+   }
 
    envelope->sgpr_usage = MAX2(envelope->sgpr_usage, resource.sgpr_usage);
    envelope->vgpr_usage = MAX2(envelope->vgpr_usage, resource.vgpr_usage);

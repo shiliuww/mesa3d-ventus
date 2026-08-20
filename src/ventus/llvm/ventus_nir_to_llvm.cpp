@@ -28,6 +28,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Alignment.h"
@@ -117,6 +118,18 @@ public:
         globalRtWavefront(options && options->global_rt_wavefront),
         globalRtCompactResume(options && options->global_rt_compact_resume),
         privateBaseBytes(options ? options->private_base_bytes : 0),
+        emitRtResourceV4(options && options->emit_rt_resource_v4),
+        rtFeatureFlags(options ? options->rt_feature_flags : 0),
+        rtPdsLayoutId(options ? options->rt_pds_layout_id : 0),
+        rtPrivateLayoutId(options ? options->rt_private_layout_id : 0),
+        rtHotPdsOffset(options ? options->rt_hot_pds_offset_per_thread : 0),
+        rtHotPdsStride(options ? options->rt_hot_pds_stride_bytes : 0),
+        rtContinuationOffset(
+           options ? options->rt_continuation_offset_per_thread : 0),
+        rtContinuationBytes(
+           options ? options->rt_continuation_bytes_per_thread : 0),
+        rtPayloadBytes(options ? options->rt_payload_size_bytes : 0),
+        rtCallableDataBytes(options ? options->rt_callable_data_size_bytes : 0),
         entryPointName(options && options->entry_point_name ?
                        options->entry_point_name : ""),
         entryPointIsKernel(options && options->entry_point_is_kernel) {}
@@ -201,6 +214,16 @@ private:
    bool globalRtWavefront;
    bool globalRtCompactResume;
    uint32_t privateBaseBytes;
+   bool emitRtResourceV4;
+   uint32_t rtFeatureFlags;
+   uint32_t rtPdsLayoutId;
+   uint32_t rtPrivateLayoutId;
+   uint32_t rtHotPdsOffset;
+   uint32_t rtHotPdsStride;
+   uint32_t rtContinuationOffset;
+   uint32_t rtContinuationBytes;
+   uint32_t rtPayloadBytes;
+   uint32_t rtCallableDataBytes;
    std::string entryPointName;
    bool entryPointIsKernel;
    bool translationFailed = false;
@@ -708,8 +731,24 @@ private:
       Function *fn =
          Function::Create(FunctionType::get(Type::getVoidTy(context), false),
                           GlobalValue::ExternalLinkage, name, module);
-      if (entryPointIsKernel || name == "main")
+      if (entryPointIsKernel || name == "main") {
          fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
+         if (emitRtResourceV4) {
+            Metadata *fields[] = {
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtFeatureFlags)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtPdsLayoutId)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtPrivateLayoutId)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtHotPdsOffset)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtHotPdsStride)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtContinuationOffset)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtContinuationBytes)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtPayloadBytes)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, rtCallableDataBytes)),
+               ConstantAsMetadata::get(ConstantInt::get(i32, 0)),
+            };
+            fn->setMetadata("ventus.rt.resource", MDNode::get(context, fields));
+         }
+      }
       return fn;
    }
 

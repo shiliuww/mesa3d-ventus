@@ -15,6 +15,13 @@ vt_kernel_metadata_layout_test = executable(
   build_by_default : false,
 )
 
+vt_kernel_resource_v4_test = executable(
+  'vt_kernel_resource_v4_test',
+  'vt_kernel_resource_v4_test.c',
+  include_directories : [inc_src],
+  build_by_default : false,
+)
+
 test(
   'vt_rt_profile',
   vt_rt_profile_test,
@@ -24,6 +31,12 @@ test(
 test(
   'vt_kernel_metadata_layout',
   vt_kernel_metadata_layout_test,
+  suite : ['ventus'],
+)
+
+test(
+  'vt_kernel_resource_v4',
+  vt_kernel_resource_v4_test,
   suite : ['ventus'],
 )
 
