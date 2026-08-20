@@ -21,6 +21,90 @@ struct lower_global_root_continuation_state {
    struct set *lowered_traces;
 };
 
+/* Each TraceRay payload is a linked location range within one P-byte ABI
+ * frame.  The frame number is the static bounce depth selected while
+ * callbacks are inlined. */
+struct trace_payload_binding {
+   uint32_t slot_offset;
+   uint32_t size_bytes;
+};
+
+static uint32_t
+payload_frame_size(const struct vt_nir_scratchpad_layout *sp)
+{
+   return sp->total_size_bytes - sp->payload_spill_size_bytes -
+          sp->payload_base_bytes;
+}
+
+static bool
+trace_payload_binding(const nir_intrinsic_instr *intrin,
+                      const struct vt_nir_rt_config *config,
+                      struct trace_payload_binding *binding)
+{
+   if (!intrin || !config || !binding)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[10]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var ||
+       (var->data.mode != nir_var_shader_temp &&
+        var->data.mode != nir_var_shader_call_data) ||
+       var->data.location < 0)
+      return false;
+
+   unsigned size = 0;
+   unsigned align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   if (!size)
+      return false;
+
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   const uint32_t payload_size = payload_frame_size(sp);
+   const uint64_t location_offset =
+      (uint64_t)(uint32_t)var->data.location * VT_RT_ABI_ALIGNMENT_BYTES;
+   const uint64_t end = location_offset + ALIGN_POT(size, VT_RT_ABI_WORD_BYTES);
+   if (end > payload_size)
+      return false;
+
+   binding->slot_offset = sp->payload_base_bytes + (uint32_t)location_offset;
+   binding->size_bytes = ALIGN_POT(size, VT_RT_ABI_WORD_BYTES);
+   return true;
+}
+
+static nir_def *
+trace_payload_frame_addr(nir_builder *b,
+                         const struct vt_nir_rt_config *config,
+                         const struct trace_payload_binding *binding,
+                         uint32_t depth, uint32_t offset)
+{
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   const uint64_t frame_offset =
+      (uint64_t)binding->slot_offset +
+      (uint64_t)depth * payload_frame_size(sp) + offset;
+   assert(frame_offset <= UINT32_MAX);
+   return vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
+                                 (uint32_t)frame_offset);
+}
+
+static void
+handoff_trace_payload_frame(nir_builder *b,
+                            const struct vt_nir_rt_config *config,
+                            const struct trace_payload_binding *binding,
+                            uint32_t source_depth, uint32_t destination_depth)
+{
+   for (uint32_t offset = 0; offset < binding->size_bytes;
+        offset += VT_RT_ABI_WORD_BYTES) {
+      nir_def *value = nir_ventus_rt_load_slot(
+         b, 1, 32, trace_payload_frame_addr(b, config, binding,
+                                             source_depth, offset));
+      nir_ventus_rt_store_slot(
+         b, value, trace_payload_frame_addr(b, config, binding,
+                                             destination_depth, offset));
+   }
+}
+
 /* A nested monolithic trace overwrites RTcore's sole hardware-visible PDS
  * context.  Preserve only parent words read after the child returns.  The
  * saved values are NIR SSA defs, not another PDS frame: a later nested trace
@@ -420,6 +504,16 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
                              nir_imm_int(b, state->trace_depth));
 
+   struct trace_payload_binding payload_binding;
+   const bool has_payload_binding =
+      trace_payload_binding(intrin, config, &payload_binding);
+   nir_def *payload = intrin->src[10].ssa;
+   if (has_payload_binding) {
+      payload = nir_u2u64(
+         b, trace_payload_frame_addr(b, config, &payload_binding,
+                                     state->trace_depth, 0));
+   }
+
    struct vt_nir_rt_trace_params params = {
       .accel_struct = intrin->src[0].ssa,
       .flags = intrin->src[1].ssa,
@@ -437,8 +531,15 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .tmin = intrin->src[7].ssa,
       .direction = intrin->src[8].ssa,
       .tmax = intrin->src[9].ssa,
-      .payload = intrin->src[10].ssa,
+      .payload = payload,
    };
+   /* The root ray already owns frame zero.  A nested trace receives the
+    * caller's inout payload in its distinct depth frame, so no stale private
+    * alloca participates in the ABI. */
+   if (has_payload_binding && state->trace_depth > 0)
+      handoff_trace_payload_frame(b, config, &payload_binding,
+                                  state->trace_depth - 1,
+                                  state->trace_depth);
 
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
@@ -509,6 +610,11 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
    }
    nir_pop_loop(b, loop);
+
+   if (has_payload_binding && state->trace_depth > 0)
+      handoff_trace_payload_frame(b, config, &payload_binding,
+                                  state->trace_depth,
+                                  state->trace_depth - 1);
 
    if (saved_parent_context) {
       restore_nested_parent_context(b, config, saved_parent_context);

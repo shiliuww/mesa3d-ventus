@@ -764,8 +764,12 @@ private:
          if (words) {
             if (words > UINT32_MAX)
                words = UINT32_MAX;
+            /* The RT backing frame is per-lane PDS storage.  It must carry
+             * AS5 in IR: leaving the alloca in AS0 lets a GEP be materialized
+             * in an X register and a later scalar lw/sw mistakes its PDS
+             * offset for a normal CPU address. */
             privateFrame = entryAlloca(ArrayType::get(i32, (unsigned)words),
-                                       "ventus.private.frame", Align(16));
+                                       "ventus.private.frame", Align(16), 5);
          }
          privateFrameNextWord = 0;
       }
@@ -861,12 +865,14 @@ private:
       return v;
    }
 
-   AllocaInst *entryAlloca(Type *type, StringRef name, Align align)
+   AllocaInst *entryAlloca(Type *type, StringRef name, Align align,
+                           unsigned addressSpace = 0)
    {
       Function *fn = builder.GetInsertBlock()->getParent();
       IRBuilder<> entryBuilder(&fn->getEntryBlock(),
                                fn->getEntryBlock().getFirstInsertionPt());
-      AllocaInst *alloca = entryBuilder.CreateAlloca(type, nullptr, name);
+      AllocaInst *alloca =
+         entryBuilder.CreateAlloca(type, addressSpace, nullptr, name);
       alloca->setAlignment(align);
       return alloca;
    }

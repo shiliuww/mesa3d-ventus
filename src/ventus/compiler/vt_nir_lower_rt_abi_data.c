@@ -9,6 +9,7 @@
 #include "nir/nir_deref.h"
 
 #include <limits.h>
+#include <stdlib.h>
 
 #define VT_RT_MAX_PAYLOAD_LOCATIONS 32
 
@@ -23,6 +24,63 @@ struct vt_payload_location_map {
    struct vt_payload_location entries[VT_RT_MAX_PAYLOAD_LOCATIONS];
    uint32_t count;
 };
+
+/* nir_lower_vars_to_explicit_types assigns driver locations for ordinary
+ * private storage and clears data.location.  A trace_ray dereference remains
+ * in the callback until it is inlined into raygen, so retain the Vulkan
+ * payload location on that variable for the later per-depth-frame binding and
+ * Header payload-pointer emission.  The actual load/store dereferences are
+ * still lowered before this metadata is restored. */
+struct vt_payload_var_location {
+   nir_variable *var;
+   int location;
+};
+
+static struct vt_payload_var_location *
+save_payload_var_locations(nir_shader *shader, uint32_t *count)
+{
+   *count = 0;
+   nir_foreach_variable_in_shader(var, shader) {
+      if ((var->data.mode == nir_var_shader_temp ||
+           var->data.mode == nir_var_shader_call_data) &&
+          var->data.explicit_location && var->data.location >= 0)
+         (*count)++;
+   }
+
+   if (!*count)
+      return NULL;
+
+   struct vt_payload_var_location *locations =
+      calloc(*count, sizeof(*locations));
+   if (!locations) {
+      *count = 0;
+      return NULL;
+   }
+
+   uint32_t index = 0;
+   nir_foreach_variable_in_shader(var, shader) {
+      if ((var->data.mode != nir_var_shader_temp &&
+           var->data.mode != nir_var_shader_call_data) ||
+          !var->data.explicit_location || var->data.location < 0)
+         continue;
+      locations[index++] = (struct vt_payload_var_location) {
+         .var = var,
+         .location = var->data.location,
+      };
+   }
+   assert(index == *count);
+   return locations;
+}
+
+static void
+restore_payload_var_locations(const struct vt_payload_var_location *locations,
+                              uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      locations[i].var->data.location = locations[i].location;
+      locations[i].var->data.explicit_location = true;
+   }
+}
 
 struct vt_lower_rt_var_state {
    const struct vt_nir_rt_config *config;
@@ -103,7 +161,7 @@ store_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
 
 static nir_def *
 load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
-                 uint32_t word)
+                 uint32_t word, bool depth_indexed)
 {
    enum vt_rt_shader_layout layout = current_layout(b);
    const struct vt_nir_scratchpad_layout *sp =
@@ -113,10 +171,11 @@ load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
       sp->payload_base_bytes;
    nir_def *addr = vt_nir_scratchpad_addr(
       b, state->config, layout, state->base_offset + word * 4);
-   /* shader_call_data is the explicit TraceRay payload argument: a child
-    * miss/closest-hit must write the caller-visible frame, not a private
-    * depth spill.  Only compiler shader temporaries are depth-indexed. */
-   if (state->mode == nir_var_shader_temp && payload_size) {
+   /* Megakernel payload interface variables use a distinct P-byte frame for
+    * every static TraceRay depth.  This makes the PDS location
+    * payload_base + depth * P + location * 16 the sole payload storage; no
+    * private-pointer mirror is involved. */
+   if (depth_indexed && payload_size) {
       nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
       addr = nir_iadd(b, addr,
                       nir_imul_imm(b, depth, payload_size));
@@ -126,7 +185,7 @@ load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
 
 static void
 store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
-                  uint32_t word, nir_def *value)
+                  uint32_t word, nir_def *value, bool depth_indexed)
 {
    enum vt_rt_shader_layout layout = current_layout(b);
    const struct vt_nir_scratchpad_layout *sp =
@@ -136,7 +195,7 @@ store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
       sp->payload_base_bytes;
    nir_def *addr = vt_nir_scratchpad_addr(
       b, state->config, layout, state->base_offset + word * 4);
-   if (state->mode == nir_var_shader_temp && payload_size) {
+   if (depth_indexed && payload_size) {
       nir_def *depth = vt_nir_load_active_level(b, state->config, layout);
       addr = nir_iadd(b, addr,
                       nir_imul_imm(b, depth, payload_size));
@@ -323,6 +382,13 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
    uint32_t location =
       rt_var_driver_location(state, var) +
       nir_deref_instr_get_const_offset(deref, glsl_get_natural_size_align_bytes);
+   const bool compiler_private =
+      state->mode == nir_var_shader_temp && !var->data.explicit_location;
+   const bool megakernel_payload =
+      state->config->execution_model == VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP &&
+      (state->mode == nir_var_shader_call_data ||
+       (state->mode == nir_var_shader_temp && var->data.explicit_location));
+   const bool depth_indexed = compiler_private || megakernel_payload;
 
    const bool barycentrics = is_barycentric_hit_attribute(state, var, location);
    const bool candidate = b->shader->info.stage == MESA_SHADER_ANY_HIT ||
@@ -374,21 +440,25 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
 
          if (bit_size == 64) {
             components[comp] =
-               nir_pack_64_2x32_split(b, load_rt_var_word(b, state, word),
-                                      load_rt_var_word(b, state, word + 1));
+               nir_pack_64_2x32_split(b,
+                  load_rt_var_word(b, state, word, depth_indexed),
+                  load_rt_var_word(b, state, word + 1, depth_indexed));
          } else if (bit_size == 32) {
-            components[comp] = load_rt_var_word(b, state, word);
+            components[comp] = load_rt_var_word(b, state, word, depth_indexed);
          } else if (bit_size == 16) {
             components[comp] =
                nir_channel(b, nir_unpack_32_2x16(b,
-                  load_rt_var_word(b, state, word)), comp_offset / 2);
+                  load_rt_var_word(b, state, word, depth_indexed)),
+                           comp_offset / 2);
          } else if (bit_size == 8) {
             components[comp] =
                nir_channel(b, nir_unpack_bits(b,
-                  load_rt_var_word(b, state, word), 8), comp_offset);
+                  load_rt_var_word(b, state, word, depth_indexed), 8),
+                           comp_offset);
          } else {
             assert(bit_size == 1);
-            components[comp] = nir_i2b(b, load_rt_var_word(b, state, word));
+            components[comp] = nir_i2b(b, load_rt_var_word(b, state, word,
+                                                              depth_indexed));
          }
       }
 
@@ -406,34 +476,41 @@ lower_rt_var_deref(nir_builder *b, nir_instr *instr, void *data)
 
          if (bit_size == 64) {
             store_rt_var_word(b, state, word,
-                              nir_unpack_64_2x32_split_x(b, component));
+                              nir_unpack_64_2x32_split_x(b, component),
+                              depth_indexed);
             store_rt_var_word(b, state, word + 1,
-                              nir_unpack_64_2x32_split_y(b, component));
+                              nir_unpack_64_2x32_split_y(b, component),
+                              depth_indexed);
          } else if (bit_size == 32) {
-            store_rt_var_word(b, state, word, component);
+            store_rt_var_word(b, state, word, component, depth_indexed);
          } else if (bit_size == 16) {
             nir_def *prev =
-               nir_unpack_32_2x16(b, load_rt_var_word(b, state, word));
+               nir_unpack_32_2x16(b, load_rt_var_word(b, state, word,
+                                                      depth_indexed));
             nir_def *components[2];
             for (uint32_t i = 0; i < 2; i++) {
                components[i] = i == comp_offset / 2 ? component :
                                nir_channel(b, prev, i);
             }
             store_rt_var_word(b, state, word,
-                              nir_pack_32_2x16(b, nir_vec(b, components, 2)));
+                              nir_pack_32_2x16(b, nir_vec(b, components, 2)),
+                              depth_indexed);
          } else if (bit_size == 8) {
             nir_def *prev =
-               nir_unpack_bits(b, load_rt_var_word(b, state, word), 8);
+               nir_unpack_bits(b, load_rt_var_word(b, state, word,
+                                                   depth_indexed), 8);
             nir_def *components[4];
             for (uint32_t i = 0; i < 4; i++) {
                components[i] = i == comp_offset ? component :
                                nir_channel(b, prev, i);
             }
             store_rt_var_word(b, state, word,
-                              nir_pack_32_4x8(b, nir_vec(b, components, 4)));
+                              nir_pack_32_4x8(b, nir_vec(b, components, 4)),
+                              depth_indexed);
          } else {
             assert(bit_size == 1);
-            store_rt_var_word(b, state, word, nir_b2i32(b, component));
+            store_rt_var_word(b, state, word, nir_b2i32(b, component),
+                              depth_indexed);
          }
       }
    }
@@ -490,6 +567,9 @@ vt_nir_lower_rt_payload(nir_shader *shader,
       nir_var_function_temp | nir_var_shader_call_data | nir_var_shader_temp;
    struct vt_payload_location_map payload_locations =
       build_payload_location_map(shader, payload_modes);
+   uint32_t saved_location_count = 0;
+   struct vt_payload_var_location *saved_locations =
+      save_payload_var_locations(shader, &saved_location_count);
 
    bool progress = false;
    /* Global CPS frames preserve ray payload state without allocating any PDS.
@@ -505,6 +585,8 @@ vt_nir_lower_rt_payload(nir_shader *shader,
                              payload_base, true, &payload_locations);
    progress |= lower_rt_vars(shader, nir_var_shader_call_data, config,
                              payload_base, false, &payload_locations);
+   restore_payload_var_locations(saved_locations, saved_location_count);
+   free(saved_locations);
    return progress;
 }
 

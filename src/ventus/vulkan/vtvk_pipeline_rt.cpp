@@ -1,6 +1,7 @@
 #include "vtvk_pipeline.h"
 
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -890,6 +891,24 @@ vtvk_rt_unique_payload_location_for_var(
    return -1;
 }
 
+static int
+vtvk_rt_allocate_payload_location(
+   const std::vector<vtvk_rt_payload_location_candidate> &candidates)
+{
+   for (int location = 0; location < INT_MAX; location++) {
+      bool used = false;
+      for (const auto &candidate : candidates) {
+         if (candidate.location == location) {
+            used = true;
+            break;
+         }
+      }
+      if (!used)
+         return location;
+   }
+   return -1;
+}
+
 static void
 vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
                                         uint32_t shader_count)
@@ -1009,8 +1028,31 @@ vtvk_rt_infer_missing_payload_locations(nir_shader **shaders,
 
          int location =
             vtvk_rt_unique_payload_location_for_var(var, candidates);
-         if (location < 0)
-            continue;
+         if (location < 0) {
+            /* Some legacy shader generators omitted Location decorations on
+             * RayPayloadKHR variables.  Once a pipeline contains an
+             * explicitly located payload, the old single-interface fallback
+             * cannot cover these remaining globals.  Give every unmatched
+             * interface a stable private location; later variables with the
+             * same unique name/shape resolve to this candidate, so a
+             * closest-hit TraceRay and its miss shader share one slot.
+             *
+             * This is a linked megakernel implementation detail: the Vulkan
+             * payload operand itself remains the caller PDS address written
+             * to the RT header. */
+            location = vtvk_rt_allocate_payload_location(candidates);
+            if (location < 0)
+               continue;
+
+            unsigned size = 0;
+            unsigned align = 0;
+            glsl_get_natural_size_align_bytes(var->type, &size, &align);
+            candidates.push_back({location, size, align, var->name});
+            if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+               mesa_logi("ventus-vk: assigned missing RT payload location %d for %s",
+                         location, var->name ? var->name : "<unnamed>");
+            }
+         }
 
          var->data.location = location;
          var->data.explicit_location = true;
@@ -1734,7 +1776,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
    if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE"))
-      mesa_logi("ventus-vk: RT ABI hitattr=%u bary=%u payload=%u depth=%u spill=%u total=%u",
+      mesa_logi("ventus-vk: RT ABI hitattr=%u bary=%u payload=%u depth=%u nested_frames=%u total=%u",
                 rt_abi.hit_attrib_size_bytes,
                 rt_abi.hit_attrib_barycentrics ? 1 : 0,
                 rt_abi.payload_size_bytes, rt_abi.max_ray_recursion_depth,
@@ -1905,7 +1947,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
-   /* The fixed RT ABI may reserve parent-payload spill slots that are not
+   /* The fixed RT ABI may reserve nested payload frames that are not
     * represented by ordinary NIR shader scratch after callback inlining.
     * Keep the dispatch/PDS frame at least as large as the linked ABI region
     * and its fixed-depth spill area. */
@@ -1922,8 +1964,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          "e-m:e-p:32:32-i64:64-n32-S128",
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
-      /* Megakernel private state follows the fixed RT header and the
-       * pipeline-specific payload.  The staged/global legacy path keeps its
+      /* Megakernel private state follows the fixed RT header and all
+       * pipeline-specific payload frames.  The staged/global legacy path keeps its
        * own CPS storage and must not inherit this PDS prefix. */
       .private_base_bytes = global_wavefront ? 0 : rt_abi.private_base_bytes,
    };

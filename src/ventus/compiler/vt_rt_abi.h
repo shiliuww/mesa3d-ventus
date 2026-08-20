@@ -144,7 +144,10 @@ enum vt_rt_cps_header_word {
 #define VT_RT_ABI_SHADER_REGION_BASE_BYTES VT_RT_ABI_HIT_ATTRIB_BASE_BYTES
 #define VT_RT_ABI_PAYLOAD_BASE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
 /* The linked RT pipeline determines P before lowering:
- * ALIGN16(max(location * 16 + natural_size)). */
+ * ALIGN16(max(location * 16 + natural_size)).  Megakernel payload storage is
+ * D consecutive frames: frame d is [payload_base + d * P,
+ * payload_base + (d + 1) * P).  The fixed Header ends at payload_base; P and
+ * D are pipeline properties, not fixed RTcore Header constants. */
 #define VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES 0
 #define VT_RT_ABI_REGION_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
 #define VT_RT_ABI_FIXED_HEADER_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES

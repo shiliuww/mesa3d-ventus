@@ -235,15 +235,17 @@ main(void)
 
    nir_shader *store_shader = build_payload_store_shader();
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_payload_size(&layout, 48));
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 2));
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(vt_nir_lower_rt_payload(store_shader, &config));
-   /* Explicit shader-call payload is shared with a nested trace, so location
-    * 2 remains at payload_base + 2 * 16 = 372 regardless of active depth. */
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 372) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 376) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 380) == 1);
-   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 384) == 1);
+   /* Interface payload uses payload_base + active_depth * P + location * 16,
+    * so these stores must not collapse to the depth-zero addresses 372..384. */
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 372) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 376) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 380) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(store_shader, 384) == 0);
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
+   VT_RT_CHECK(vt_rt_shader_has_imul_any(store_shader));
 
    printf("PASS vt_rt_abi_v5_layout header=276 payload_union=48 "
           "payload_sparse=80 private_base=436\n");

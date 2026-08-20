@@ -89,8 +89,8 @@ vt_nir_rt_abi_layout_set_recursion_depth(
    if (!layout || max_ray_recursion_depth > UINT32_MAX)
       return false;
 
-   /* Depth zero is the active payload slot already included in
-    * region_size_bytes. Reserve only the additional nested trace slots. */
+   /* Depth zero is the first P-byte payload frame already included in
+    * region_size_bytes. Reserve only the additional D-1 nested frames. */
    const uint64_t spill_size = (uint64_t)layout->payload_size_bytes *
       (max_ray_recursion_depth ? max_ray_recursion_depth - 1 : 0);
    const uint64_t total = (uint64_t)layout->region_size_bytes + spill_size;

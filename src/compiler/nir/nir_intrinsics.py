@@ -791,8 +791,6 @@ intrinsic("ventus_rt_enqueue", src_comp=[1])
 intrinsic("ventus_rt_load_slot", src_comp=[1], dest_comp=0,
           bit_sizes=[8, 16, 32, 64])
 intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
-
-
 # Atomic counters
 #
 # The *_deref variants take an atomic_uint nir_variable, while the other,

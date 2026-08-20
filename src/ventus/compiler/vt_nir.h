@@ -68,8 +68,8 @@ struct vt_nir_scratchpad_layout {
    uint32_t payload_spill_base_bytes;
    uint32_t payload_spill_size_bytes;
    uint32_t max_ray_recursion_depth;
-   /* First byte available to compiler-owned private objects.  The RT header,
-    * linked pipeline payload, and nested payload slots occupy
+   /* First byte available to compiler-owned private objects.  The RT header
+    * and all linked pipeline payload frames occupy
     * [base_bytes, private_base_bytes). */
    uint32_t private_base_bytes;
    uint32_t total_size_bytes;
@@ -95,9 +95,9 @@ struct vt_nir_rt_abi_layout {
    uint32_t region_size_bytes;
    /* First byte after the fixed header, pipeline payload, and nested slots. */
    uint32_t private_base_bytes;
-   /* Compiler-owned depth-indexed payload area.  Depth zero occupies the
-    * active slot at payload_base_bytes; each subsequent ray depth gets one
-    * fixed-size P-byte slot immediately after it. */
+   /* Depth-indexed pipeline payload frames.  Depth zero occupies
+    * [payload_base_bytes, payload_spill_base_bytes); each subsequent ray
+    * depth gets one fixed-size P-byte frame immediately after it. */
    uint32_t payload_spill_base_bytes;
    uint32_t payload_spill_size_bytes;
    uint32_t max_ray_recursion_depth;
