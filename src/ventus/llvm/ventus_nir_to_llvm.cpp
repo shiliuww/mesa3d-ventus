@@ -2064,6 +2064,15 @@ private:
          Function *fn = declare("llvm.riscv.ventus.rt.traverse.i32", i32, {i32});
          return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
       }
+      case nir_intrinsic_ventus_rt_traverse_v5: {
+         if (noopRtIntrinsics)
+            return ConstantInt::get(i32, 0);
+         Function *fn = declare("llvm.riscv.ventus.rt.traverse.v5.i32", i32,
+                                {i32, i32});
+         return builder.CreateCall(fn,
+                                   {asInt32(value(intrin->src[0])),
+                                    asInt32(value(intrin->src[1]))});
+      }
       case nir_intrinsic_ventus_rt_release: {
          if (noopRtIntrinsics)
             return nullptr;

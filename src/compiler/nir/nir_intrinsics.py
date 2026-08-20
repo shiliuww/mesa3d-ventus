@@ -778,6 +778,8 @@ intrinsic("ventus_rt_worker_id", dest_comp=1, bit_sizes=[32])
 # names an entry in the RTcore-owned ray_ref list for this kernel dispatch.
 intrinsic("ventus_rt_dispatch_index", dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
+intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
+          bit_sizes=[32])
 intrinsic("ventus_rt_release", src_comp=[1])
 # Global-wavefront producer doorbell.  The source is the lane's global submit
 # mailbox address; it is valid only after the producer has published VALID.

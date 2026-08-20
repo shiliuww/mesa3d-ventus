@@ -122,6 +122,17 @@ build_storage_image_shader(const nir_shader_compiler_options *options,
    return b.shader;
 }
 
+static nir_shader *
+build_rt_traverse_v5_shader(const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_RAYGEN, options, "vt_rt_traverse_v5");
+   nir_def *status = nir_ventus_rt_traverse_v5(
+      &b, nir_imm_int(&b, 0x1000), nir_imm_int(&b, 0x8000));
+   nir_ventus_rt_store_slot(&b, status, nir_imm_int(&b, 0));
+   return b.shader;
+}
+
 int
 main()
 {
@@ -196,6 +207,21 @@ main()
    VT_RT_CHECK(found_phi);
    VT_RT_CHECK(found_float_bits);
    VT_RT_CHECK(found_reserved_private_prefix);
+
+   delete module;
+   ralloc_free(shader);
+
+   shader = build_rt_traverse_v5_shader(&nir_options);
+   shaders[0] = shader;
+   module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+   VT_RT_CHECK(module != nullptr);
+   VT_RT_CHECK(!llvm::verifyModule(*module));
+
+   llvm::Function *traverse_v5 =
+      module->getFunction("llvm.riscv.ventus.rt.traverse.v5.i32");
+   VT_RT_CHECK(traverse_v5 != nullptr);
+   VT_RT_CHECK(traverse_v5->arg_size() == 2);
+   VT_RT_CHECK(!traverse_v5->use_empty());
 
    delete module;
    ralloc_free(shader);
