@@ -284,6 +284,112 @@ vt_nir_rt_compute_pipeline_payload_size(nir_shader **shaders,
    return true;
 }
 
+static bool
+include_call_data_variable(const nir_variable *var, uint64_t *end)
+{
+   if (!var || !end || !var->data.explicit_location ||
+       var->data.location < 0 ||
+       var->data.location >= VT_RT_MAX_PAYLOAD_LOCATIONS)
+      return false;
+
+   unsigned size = 0;
+   unsigned alignment = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &alignment);
+   const uint64_t var_end =
+      (uint64_t)var->data.location * VT_RT_ABI_ALIGNMENT_BYTES + size;
+   if (var_end > UINT32_MAX)
+      return false;
+   *end = MAX2(*end, var_end);
+   return true;
+}
+
+static nir_variable *
+call_data_variable(nir_src *src)
+{
+   if (!src || !nir_src_is_deref(*src))
+      return NULL;
+   nir_deref_instr *deref = nir_src_as_deref(*src);
+   return deref ? nir_deref_instr_get_variable(deref) : NULL;
+}
+
+bool
+vt_nir_rt_compute_pipeline_call_data_sizes(
+   nir_shader **shaders, unsigned shader_count,
+   uint32_t *payload_size_bytes, uint32_t *callable_data_size_bytes)
+{
+   if (!payload_size_bytes || !callable_data_size_bytes)
+      return false;
+
+   bool payload_locations[VT_RT_MAX_PAYLOAD_LOCATIONS] = {false};
+   bool callable_locations[VT_RT_MAX_PAYLOAD_LOCATIONS] = {false};
+   uint64_t payload_end = 0;
+   uint64_t callable_end = 0;
+
+   for (unsigned s = 0; s < shader_count; s++) {
+      nir_shader *shader = shaders ? shaders[s] : NULL;
+      if (!shader)
+         continue;
+
+      nir_foreach_function_impl(impl, shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+               nir_variable *var = NULL;
+               bool *locations = NULL;
+               uint64_t *end = NULL;
+               if (intrin->intrinsic == nir_intrinsic_trace_ray) {
+                  var = call_data_variable(&intrin->src[10]);
+                  locations = payload_locations;
+                  end = &payload_end;
+               } else if (intrin->intrinsic ==
+                             nir_intrinsic_execute_callable) {
+                  var = call_data_variable(&intrin->src[1]);
+                  locations = callable_locations;
+                  end = &callable_end;
+               } else {
+                  continue;
+               }
+
+               if (!include_call_data_variable(var, end))
+                  return false;
+               locations[var->data.location] = true;
+            }
+         }
+      }
+   }
+
+   for (unsigned s = 0; s < shader_count; s++) {
+      nir_shader *shader = shaders ? shaders[s] : NULL;
+      if (!shader)
+         continue;
+      nir_foreach_variable_in_shader(var, shader) {
+         if ((var->data.mode != nir_var_shader_temp &&
+              var->data.mode != nir_var_shader_call_data) ||
+             !var->data.explicit_location || var->data.location < 0 ||
+             var->data.location >= VT_RT_MAX_PAYLOAD_LOCATIONS)
+            continue;
+         const unsigned location = (unsigned)var->data.location;
+         if (payload_locations[location] &&
+             !include_call_data_variable(var, &payload_end))
+            return false;
+         if (callable_locations[location] &&
+             !include_call_data_variable(var, &callable_end))
+            return false;
+      }
+   }
+
+   if (payload_end > UINT32_MAX - (VT_RT_ABI_ALIGNMENT_BYTES - 1) ||
+       callable_end > UINT32_MAX - (VT_RT_ABI_ALIGNMENT_BYTES - 1))
+      return false;
+   *payload_size_bytes = ALIGN_POT((uint32_t)payload_end,
+                                   VT_RT_ABI_ALIGNMENT_BYTES);
+   *callable_data_size_bytes = ALIGN_POT((uint32_t)callable_end,
+                                         VT_RT_ABI_ALIGNMENT_BYTES);
+   return true;
+}
+
 static uint32_t
 rt_var_driver_location(const struct vt_lower_rt_var_state *state,
                        nir_variable *var)

@@ -61,7 +61,7 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxFragmentInputComponents = 128;
    p->maxFragmentOutputAttachments = 8;
    p->maxFragmentCombinedOutputResources = 8;
-   p->maxComputeSharedMemorySize = 32768;
+   p->maxComputeSharedMemorySize = VTVK_MAX_COMPUTE_SHARED_MEMORY_SIZE;
    p->maxComputeWorkGroupCount[0] = 65535;
    p->maxComputeWorkGroupCount[1] = 65535;
    p->maxComputeWorkGroupCount[2] = 65535;

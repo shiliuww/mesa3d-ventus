@@ -72,6 +72,18 @@ struct ventus_kernel_resource_v4 {
    uint32_t reserved_zero;
 };
 
+/* Inputs whose values are established by whole-pipeline RT analysis.  Layout
+ * identities, the hot-PDS stride, the V4 version, and reserved_zero are fixed
+ * by the V5 contract and are therefore not caller-controlled. */
+struct ventus_kernel_resource_v5_build_info {
+   uint32_t feature_flags;
+   uint32_t hot_pds_offset_per_thread;
+   uint32_t continuation_offset_per_thread;
+   uint32_t continuation_bytes_per_thread;
+   uint32_t payload_size_bytes;
+   uint32_t callable_data_size_bytes;
+};
+
 enum ventus_kernel_resource_v4_error {
    VENTUS_KERNEL_RESOURCE_V4_VALID = 0,
    VENTUS_KERNEL_RESOURCE_V4_BAD_VERSION,
@@ -84,6 +96,8 @@ enum ventus_kernel_resource_v4_error {
    VENTUS_KERNEL_RESOURCE_V4_BAD_PAYLOAD,
    VENTUS_KERNEL_RESOURCE_V4_BAD_CALLABLE_DATA,
    VENTUS_KERNEL_RESOURCE_V4_BAD_EXTENT,
+   VENTUS_KERNEL_RESOURCE_V4_BAD_ARGUMENT,
+   VENTUS_KERNEL_RESOURCE_V4_RT_MISMATCH,
 };
 
 static inline bool
@@ -188,6 +202,99 @@ ventus_kernel_resource_v4_rt_equal(
           lhs->rt_callable_data_size_bytes ==
              rhs->rt_callable_data_size_bytes &&
           lhs->reserved_zero == rhs->reserved_zero;
+}
+
+/* Promote the unchanged V3 prefix to a V4 non-RT record.  V3 remains a valid
+ * wire format for non-RT kernels; this helper is for producers that need one
+ * in-memory V4 representation without inferring any RT capability. */
+static inline enum ventus_kernel_resource_v4_error
+ventus_kernel_resource_v4_from_v3(
+   const struct ventus_kernel_resource_v3 *base,
+   struct ventus_kernel_resource_v4 *resource)
+{
+   if (!base || !resource)
+      return VENTUS_KERNEL_RESOURCE_V4_BAD_ARGUMENT;
+   if (base->version != VENTUS_KERNEL_RESOURCE_V3_VERSION)
+      return VENTUS_KERNEL_RESOURCE_V4_BAD_VERSION;
+
+   struct ventus_kernel_resource_v4 candidate = {0};
+   candidate.version = VENTUS_KERNEL_RESOURCE_V4_VERSION;
+   candidate.flags = base->flags;
+   candidate.vgpr_used = base->vgpr_used;
+   candidate.sgpr_used = base->sgpr_used;
+   candidate.lds_static_bytes = base->lds_static_bytes;
+   candidate.pds_static_bytes = base->pds_static_bytes;
+   candidate.lds_stack_peak_bytes = base->lds_stack_peak_bytes;
+   candidate.pds_stack_peak_bytes = base->pds_stack_peak_bytes;
+
+   const enum ventus_kernel_resource_v4_error error =
+      ventus_kernel_resource_v4_validate(&candidate, false);
+   if (error == VENTUS_KERNEL_RESOURCE_V4_VALID)
+      *resource = candidate;
+   return error;
+}
+
+/* Build a complete V4 record for a V5 RT kernel.  The output is transactional:
+ * validation failure leaves *resource unchanged, so callers cannot publish a
+ * partially initialized resource section. */
+static inline enum ventus_kernel_resource_v4_error
+ventus_kernel_resource_v4_build_v5(
+   const struct ventus_kernel_resource_v3 *base,
+   const struct ventus_kernel_resource_v5_build_info *info,
+   struct ventus_kernel_resource_v4 *resource)
+{
+   if (!base || !info || !resource)
+      return VENTUS_KERNEL_RESOURCE_V4_BAD_ARGUMENT;
+
+   struct ventus_kernel_resource_v4 candidate;
+   enum ventus_kernel_resource_v4_error error =
+      ventus_kernel_resource_v4_from_v3(base, &candidate);
+   if (error != VENTUS_KERNEL_RESOURCE_V4_VALID)
+      return error;
+
+   candidate.rt_feature_flags = info->feature_flags;
+   candidate.rt_pds_layout_id = VENTUS_RT_PDS_LAYOUT_V5;
+   candidate.rt_private_layout_id = VENTUS_RT_PRIVATE_LAYOUT_V5;
+   candidate.rt_hot_pds_offset_per_thread =
+      info->hot_pds_offset_per_thread;
+   candidate.rt_hot_pds_stride_bytes = VENTUS_RT_HOT_PDS_STRIDE_V5;
+   candidate.rt_continuation_offset_per_thread =
+      info->continuation_offset_per_thread;
+   candidate.rt_continuation_bytes_per_thread =
+      info->continuation_bytes_per_thread;
+   candidate.rt_payload_size_bytes = info->payload_size_bytes;
+   candidate.rt_callable_data_size_bytes = info->callable_data_size_bytes;
+   candidate.reserved_zero = 0;
+
+   error = ventus_kernel_resource_v4_validate(&candidate, true);
+   if (error == VENTUS_KERNEL_RESOURCE_V4_VALID)
+      *resource = candidate;
+   return error;
+}
+
+/* Validate both final records before comparing their RT trailers.  Generic
+ * register and stack requirements may still be enveloped independently, but
+ * all reachable entries in one RT pipeline must publish one identical RT
+ * contract. */
+static inline enum ventus_kernel_resource_v4_error
+ventus_kernel_resource_v4_validate_rt_compatible(
+   const struct ventus_kernel_resource_v4 *lhs,
+   const struct ventus_kernel_resource_v4 *rhs, bool require_rt)
+{
+   if (!lhs || !rhs)
+      return VENTUS_KERNEL_RESOURCE_V4_BAD_ARGUMENT;
+
+   enum ventus_kernel_resource_v4_error error =
+      ventus_kernel_resource_v4_validate(lhs, require_rt);
+   if (error != VENTUS_KERNEL_RESOURCE_V4_VALID)
+      return error;
+   error = ventus_kernel_resource_v4_validate(rhs, require_rt);
+   if (error != VENTUS_KERNEL_RESOURCE_V4_VALID)
+      return error;
+
+   return ventus_kernel_resource_v4_rt_equal(lhs, rhs) ?
+      VENTUS_KERNEL_RESOURCE_V4_VALID :
+      VENTUS_KERNEL_RESOURCE_V4_RT_MISMATCH;
 }
 
 #if defined(__cplusplus)

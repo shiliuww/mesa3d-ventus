@@ -4,6 +4,26 @@
  */
 
 #include "vt_rt_test_common.h"
+#include "ventus/common/ventus_kernel_resource.h"
+#include "ventus/common/ventus_rt_v5.h"
+
+static nir_shader *
+build_resident_callable_probe(const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_RAYGEN, options, "vt_resident_callable_probe");
+   nir_def *live = nir_ventus_rt_load_slot(
+      &b, 1, 32, nir_imm_int(&b, VENTUS_RT_V5_PDS_CALL_DATA_BASE));
+   nir_intrinsic_instr *call = nir_intrinsic_instr_create(
+      b.shader, nir_intrinsic_execute_callable);
+   call->src[0] = nir_src_for_ssa(nir_imm_int(&b, 0));
+   call->src[1] = nir_src_for_ssa(nir_imm_int(&b, 0));
+   nir_builder_instr_insert(&b, &call->instr);
+   nir_ventus_rt_store_slot(
+      &b, nir_iadd_imm(&b, live, 1),
+      nir_imm_int(&b, VENTUS_RT_V5_PDS_CALL_DATA_BASE));
+   return b.shader;
+}
 
 static nir_shader *
 build_abi_probe_closest_hit(const nir_shader_compiler_options *options)
@@ -360,6 +380,41 @@ main(int argc, char **argv)
    VT_RT_CHECK(before.trace_ray == 1);
 
    void *cps_mem_ctx = ralloc_context(NULL);
+   struct vt_nir_rt_resident_continuation_info resident_plan = {};
+   VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
+      cps_raygen, 1, linked_payload_size, 0, &resident_plan, cps_mem_ctx));
+   VT_RT_CHECK(resident_plan.site_count == 1);
+   VT_RT_CHECK(resident_plan.sites[0].kind ==
+               VT_NIR_RT_TRACE_CONTINUATION);
+   VT_RT_CHECK(resident_plan.sites[0].ssa_spill_bytes == 0);
+   VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 224);
+   VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 224);
+   VT_RT_CHECK((resident_plan.feature_flags &
+                VENTUS_RT_RESOURCE_USES_TRACE_CONTINUATION) != 0);
+   nir_shader *callable_probe = build_resident_callable_probe(&options);
+   struct vt_nir_rt_resident_continuation_info callable_plan = {};
+   VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
+      callable_probe, 1, linked_payload_size, linked_payload_size,
+      &callable_plan, cps_mem_ctx));
+   VT_RT_CHECK(callable_plan.site_count == 1);
+   VT_RT_CHECK(callable_plan.sites[0].kind ==
+               VT_NIR_RT_CALLABLE_CONTINUATION);
+   VT_RT_CHECK(callable_plan.sites[0].ssa_spill_bytes == 16);
+   VT_RT_CHECK(callable_plan.sites[0].frame_size_bytes == 48);
+   VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 48);
+   struct vt_nir_rt_resident_continuation_info wide_callable_plan = {};
+   VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
+      callable_probe, 1, linked_payload_size, 48,
+      &wide_callable_plan, cps_mem_ctx));
+   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 80);
+   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 80);
+   VT_RT_CHECK(!vt_nir_plan_rt_resident_continuations(
+      callable_probe, 1, linked_payload_size, 0,
+      &wide_callable_plan, cps_mem_ctx));
+   VT_RT_CHECK(!vt_nir_plan_rt_resident_continuations(
+      cps_raygen, 0, linked_payload_size, 0,
+      &wide_callable_plan, cps_mem_ctx));
+   ralloc_free(callable_probe);
    fprintf(stderr, "stage cps-terminal\n");
    struct vt_nir_rt_cps_info cps = {};
    VT_RT_CHECK(vt_nir_lower_rt_cps(cps_raygen, &cps, cps_mem_ctx));

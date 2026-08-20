@@ -39,6 +39,31 @@ build_payload_store_shader(void)
    return b.shader;
 }
 
+static nir_shader *
+build_split_call_data_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_RAYGEN, NULL, "vt_rt_split_call_data");
+   nir_variable *payload = nir_variable_create(
+      b.shader, nir_var_shader_temp, glsl_uvec4_type(), "ray_payload");
+   payload->data.explicit_location = true;
+   payload->data.location = 1;
+   nir_variable *call_data = nir_variable_create(
+      b.shader, nir_var_shader_temp, glsl_vec2_type(), "callable_data");
+   call_data->data.explicit_location = true;
+   call_data->data.location = 3;
+
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *zero64 = nir_imm_int64(&b, 0);
+   nir_def *zero3 = nir_replicate(&b, zero, 3);
+   nir_trace_ray(&b, zero64, zero, zero, zero, zero, zero,
+                 zero3, zero, zero3, zero,
+                 &nir_build_deref_var(&b, payload)->def);
+   nir_execute_callable(&b, zero,
+                        &nir_build_deref_var(&b, call_data)->def);
+   return b.shader;
+}
+
 static unsigned
 count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
 {
@@ -112,6 +137,19 @@ main(void)
                                                         &payload_size));
    VT_RT_CHECK(payload_size == 48);
 
+   nir_shader *split_call_data = build_split_call_data_shader();
+   nir_shader *callable_input =
+      build_payload_shader(MESA_SHADER_CALLABLE, nir_var_shader_call_data,
+                           glsl_uvec4_type(), 3, "callable_input");
+   nir_shader *split_pipeline[] = {split_call_data, closest_hit,
+                                   callable_input};
+   uint32_t split_payload_size = 0;
+   uint32_t callable_data_size = 0;
+   VT_RT_CHECK(vt_nir_rt_compute_pipeline_call_data_sizes(
+      split_pipeline, 3, &split_payload_size, &callable_data_size));
+   VT_RT_CHECK(split_payload_size == 32);
+   VT_RT_CHECK(callable_data_size == 64);
+
    nir_shader *sparse =
       build_payload_shader(MESA_SHADER_MISS, nir_var_shader_call_data,
                            glsl_uvec4_type(), 4, "sparse_payload");
@@ -157,6 +195,8 @@ main(void)
    ralloc_free(closest_hit);
    ralloc_free(sparse);
    ralloc_free(store_shader);
+   ralloc_free(split_call_data);
+   ralloc_free(callable_input);
    glsl_type_singleton_decref();
    return 0;
 }

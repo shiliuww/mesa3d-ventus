@@ -57,6 +57,12 @@ struct vtvk_pipeline {
    uint32_t per_lane_scratch_size;
    uint32_t hit_attribute_size_bytes;
    uint32_t continuation_frame_size;
+   uint32_t rt_payload_size_bytes;
+   uint32_t rt_callable_data_size_bytes;
+   uint32_t rt_v5_feature_flags;
+   uint32_t rt_v5_max_trace_frame_bytes;
+   uint32_t rt_v5_max_callable_frame_bytes;
+   uint32_t rt_v5_continuation_stack_bytes;
    uint32_t max_ray_recursion_depth;
    VkVentusRtExecutionProfile rt_execution_profile;
    VkVentusRtStageRole rt_stage_role;

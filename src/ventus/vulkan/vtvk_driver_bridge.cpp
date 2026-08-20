@@ -1384,8 +1384,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
 
    if (!wavefront_global && resource_envelope.has_rt_contract) {
       struct ventus_rt_v5_private_placement placement = {};
-      if (!ventus_rt_v5_private_placement(kernel_lds_size, 1, UINT32_MAX,
-                                           &placement) ||
+      if (!ventus_rt_v5_private_placement(
+             kernel_lds_size, 1, VTVK_MAX_COMPUTE_SHARED_MEMORY_SIZE,
+             &placement) ||
           placement.region_offset > UINT32_MAX ||
           placement.total_bytes > UINT32_MAX) {
          mesa_loge("ventus-vk: V5 traversal-private LDS placement exceeds "
