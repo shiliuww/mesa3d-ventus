@@ -56,10 +56,10 @@ struct vtvk_rt_dispatch_args {
    uint32_t global_ray_ref_count;
    uint32_t global_ray_ref_generation;
    uint32_t global_completion_field_stride;
-   uint32_t reserved_global;
+   uint32_t rt_private_region_offset;
    uint64_t push_constants_addr;
    uint32_t push_constants_size;
-   uint32_t reserved_push_constants;
+   uint32_t rt_private_total_bytes;
 };
 
 struct vtvk_rt_descriptor_record {

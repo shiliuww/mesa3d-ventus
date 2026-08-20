@@ -1655,6 +1655,15 @@ private:
             return builder.CreateFDiv(ConstantFP::get(f32, 1.0),
                                       asFloat(src(0, i)));
          });
+      case nir_op_fisfinite:
+      case nir_op_fisfinite32:
+         return boolResult(&alu->def, [&](unsigned i) {
+            Value *bits = builder.CreateBitCast(asFloat(src(0, i)), i32);
+            Value *exponent = builder.CreateAnd(
+               bits, ConstantInt::get(i32, 0x7f800000u));
+            return builder.CreateICmpNE(
+               exponent, ConstantInt::get(i32, 0x7f800000u));
+         });
       case nir_op_ffma:
       case nir_op_ffma_weak:
       case nir_op_fmad:
@@ -2038,6 +2047,12 @@ private:
          Value *ptr = value(intrin->src[0]);
          if (ptr->getType()->isPointerTy())
             storeLocalValue(ptr, value(intrin->src[1]));
+         return nullptr;
+      }
+      case nir_intrinsic_barrier: {
+         const nir_variable_mode modes = nir_intrinsic_memory_modes(intrin);
+         if (modes & (nir_var_mem_shared | nir_var_mem_global))
+            builder.CreateFence(AtomicOrdering::SequentiallyConsistent);
          return nullptr;
       }
       case nir_intrinsic_load_shared: {

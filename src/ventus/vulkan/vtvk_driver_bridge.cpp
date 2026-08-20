@@ -30,6 +30,7 @@
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_address.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "ventus/common/ventus_rt_v5.h"
 #include "ventus/common/ventus_kernel_metadata.h"
 #include "ventus/compiler/vt_nir.h"
 #include "vtvk_memory.h"
@@ -74,12 +75,18 @@ static_assert(offsetof(struct vtvk_rt_dispatch_args, global_ray_ref_list_base) =
 static_assert(offsetof(struct vtvk_rt_dispatch_args, global_completion_field_stride) ==
               VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE,
               "RT global completion stride argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, rt_private_region_offset) ==
+              VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET,
+              "RT private region offset argument ABI mismatch");
 static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constants_addr) ==
               VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR,
               "RT push-constant address argument ABI mismatch");
 static_assert(offsetof(struct vtvk_rt_dispatch_args, push_constants_size) ==
               VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE,
               "RT push-constant size argument ABI mismatch");
+static_assert(offsetof(struct vtvk_rt_dispatch_args, rt_private_total_bytes) ==
+              VT_NIR_RT_DISPATCH_ARG_PRIVATE_TOTAL_BYTES,
+              "RT private total bytes argument ABI mismatch");
 static_assert(sizeof(struct vtvk_rt_dispatch_args) ==
               VT_NIR_RT_DISPATCH_ARG_SIZE,
               "RT dispatch argument ABI size mismatch");
@@ -1373,6 +1380,23 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                               &kernel_lds_size)) {
       mesa_loge("ventus-vk: RT LDS resource envelope overflow");
       goto out;
+   }
+
+   if (!wavefront_global && resource_envelope.has_rt_contract) {
+      struct ventus_rt_v5_private_placement placement = {};
+      if (!ventus_rt_v5_private_placement(kernel_lds_size, 1, UINT32_MAX,
+                                           &placement) ||
+          placement.region_offset > UINT32_MAX ||
+          placement.total_bytes > UINT32_MAX) {
+         mesa_loge("ventus-vk: V5 traversal-private LDS placement exceeds "
+                   "the dispatch contract");
+         goto out;
+      }
+      kernel_lds_size = placement.num_lds;
+      args.rt_private_region_offset =
+         static_cast<uint32_t>(placement.region_offset);
+      args.rt_private_total_bytes =
+         static_cast<uint32_t>(placement.total_bytes);
    }
 
    if (wavefront_global && kernel_path && kernel_path[0]) {

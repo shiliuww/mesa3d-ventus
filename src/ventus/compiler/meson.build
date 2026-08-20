@@ -1,5 +1,6 @@
 libventus_nir_files = files(
   'vt_nir_build_traversal.c',
+  'vt_nir_rt_v5.c',
   'vt_nir_canonicalize_rt.c',
   'vt_nir_lower_descriptors.c',
   'vt_nir_lower_rt_abi_data.c',

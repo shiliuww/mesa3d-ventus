@@ -124,6 +124,12 @@ struct vt_nir_rt_result {
    nir_def *shader_record_ptr;
 };
 
+struct vt_nir_rt_v5_submit_result {
+   nir_def *compact_result;
+   nir_def *private_state_address;
+   nir_def *traverse_admitted;
+};
+
 struct vt_nir_rt_global_queue_args {
    /* Global address of a RayQueueHeader followed by field-major planes.
     * It remains u64 in the NIR/dispatch ABI; an RV32 execution submission is
@@ -331,6 +337,18 @@ vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_trace_params *params,
                        const struct vt_nir_rt_config *config);
 
+nir_def *vt_nir_rt_v5_private_address(nir_builder *b,
+                                      nir_def *cta_shared_base,
+                                      nir_def *private_region_offset,
+                                      nir_def *warp_index_in_cta,
+                                      nir_def *lane_id);
+
+struct vt_nir_rt_v5_submit_result
+vt_nir_build_traversal_v5_submit(nir_builder *b,
+                                 const struct vt_nir_rt_trace_params *params,
+                                 nir_def *pds_address,
+                                 nir_def *private_state_address);
+
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
 
@@ -476,9 +494,12 @@ enum vt_nir_rt_dispatch_arg {
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_COUNT = 256,
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_RAY_REF_GENERATION = 260,
    VT_NIR_RT_DISPATCH_ARG_GLOBAL_COMPLETION_FIELD_STRIDE = 264,
+   /* MegaKernel V5 traversal-private LDS placement. */
+   VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET = 268,
    /* Immutable Vulkan push-constant snapshot shared by all RT ELFs. */
    VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_ADDR = 272,
    VT_NIR_RT_DISPATCH_ARG_PUSH_CONSTANTS_SIZE = 280,
+   VT_NIR_RT_DISPATCH_ARG_PRIVATE_TOTAL_BYTES = 284,
    VT_NIR_RT_DISPATCH_ARG_SIZE = 288,
 };
 

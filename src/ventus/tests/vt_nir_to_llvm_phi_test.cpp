@@ -10,6 +10,7 @@
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 
+#include "ventus/compiler/vt_nir.h"
 #include "ventus/compiler/vt_rt_descriptor_abi.h"
 #include "ventus/llvm/ventus_nir_to_llvm.h"
 
@@ -127,9 +128,30 @@ build_rt_traverse_v5_shader(const nir_shader_compiler_options *options)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_RAYGEN, options, "vt_rt_traverse_v5");
-   nir_def *status = nir_ventus_rt_traverse_v5(
-      &b, nir_imm_int(&b, 0x1000), nir_imm_int(&b, 0x8000));
-   nir_ventus_rt_store_slot(&b, status, nir_imm_int(&b, 0));
+   const struct vt_nir_rt_trace_params params = {
+      .accel_struct = nir_imm_int64(&b, 0x10000),
+      .flags = nir_imm_int(&b, 0),
+      .cull_mask = nir_imm_int(&b, 0xff),
+      .sbt_offset = nir_imm_int(&b, 0),
+      .sbt_stride = nir_imm_int(&b, 0),
+      .miss_index = nir_imm_int(&b, 0),
+      .origin = nir_vec3(&b, nir_imm_float(&b, 0.0f),
+                         nir_imm_float(&b, 0.0f),
+                         nir_imm_float(&b, 0.0f)),
+      .tmin = nir_imm_float(&b, 0.001f),
+      .direction = nir_vec3(&b, nir_imm_float(&b, 0.0f),
+                            nir_imm_float(&b, 0.0f),
+                            nir_imm_float(&b, -1.0f)),
+      .tmax = nir_imm_float(&b, 1000.0f),
+      .payload = nir_imm_int(&b, 0),
+   };
+   nir_def *private_address = vt_nir_rt_v5_private_address(
+      &b, nir_imm_int(&b, 0), nir_imm_int(&b, 0x180),
+      nir_imm_int(&b, 1), nir_imm_int(&b, 31));
+   const struct vt_nir_rt_v5_submit_result result =
+      vt_nir_build_traversal_v5_submit(
+         &b, &params, nir_imm_int(&b, 0x1000), private_address);
+   nir_ventus_rt_store_slot(&b, result.compact_result, nir_imm_int(&b, 0));
    return b.shader;
 }
 
@@ -222,6 +244,29 @@ main()
    VT_RT_CHECK(traverse_v5 != nullptr);
    VT_RT_CHECK(traverse_v5->arg_size() == 2);
    VT_RT_CHECK(!traverse_v5->use_empty());
+
+   bool found_v5_fence = false;
+   unsigned v5_shared_store_count = 0;
+   unsigned v5_pds_store_count = 0;
+   for (llvm::Function &function : *module) {
+      for (llvm::BasicBlock &block : function) {
+         for (llvm::Instruction &instruction : block) {
+            found_v5_fence |= llvm::isa<llvm::FenceInst>(&instruction);
+            auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+            if (!store)
+               continue;
+            const unsigned address_space =
+               store->getPointerAddressSpace();
+            v5_shared_store_count += address_space == 3;
+            v5_pds_store_count += address_space == 5;
+         }
+      }
+   }
+   VT_RT_CHECK(found_v5_fence);
+   VT_RT_CHECK(v5_shared_store_count == 17);
+   /* The helper emits 24 PDS words; the translator also publishes three
+    * launch-ID words and the test stores the compact result. */
+   VT_RT_CHECK(v5_pds_store_count == 28);
 
    delete module;
    ralloc_free(shader);

@@ -22,6 +22,13 @@ vt_kernel_resource_v4_test = executable(
   build_by_default : false,
 )
 
+vt_rt_v5_contract_test = executable(
+  'vt_rt_v5_contract_test',
+  'vt_rt_v5_contract_test.c',
+  include_directories : [inc_src],
+  build_by_default : false,
+)
+
 test(
   'vt_rt_profile',
   vt_rt_profile_test,
@@ -37,6 +44,12 @@ test(
 test(
   'vt_kernel_resource_v4',
   vt_kernel_resource_v4_test,
+  suite : ['ventus'],
+)
+
+test(
+  'vt_rt_v5_contract',
+  vt_rt_v5_contract_test,
   suite : ['ventus'],
 )
 
@@ -125,6 +138,7 @@ if prog_glslang.found()
     'vt_nir_to_llvm_phi_test',
     [
       'vt_nir_to_llvm_phi_test.cpp',
+      libventus_nir_files,
       libventus_llvm_files,
     ],
     include_directories : [inc_include, inc_src],
