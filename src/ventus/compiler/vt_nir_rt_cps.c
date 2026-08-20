@@ -16,6 +16,20 @@
 #define VT_RT_V5_TRACE_COMMITTED_BYTES 96u
 
 static bool
+remove_nonresident_call_for_analysis(nir_builder *b,
+                                     nir_intrinsic_instr *intrin, void *data)
+{
+   (void)data;
+   if (intrin->intrinsic != nir_intrinsic_report_ray_intersection)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def_rewrite_uses(&intrin->def, nir_imm_false(b));
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
 align_u32(uint32_t value, uint32_t alignment, uint32_t *result)
 {
    uint64_t aligned = 0;
@@ -137,6 +151,8 @@ vt_nir_plan_rt_resident_continuations(
    if (!analysis)
       return false;
    info->lowered_initial_shader = analysis;
+   NIR_PASS(_, analysis, nir_shader_intrinsics_pass,
+            remove_nonresident_call_for_analysis, nir_metadata_none, NULL);
    const uint32_t ordinary_scratch_bytes = analysis->scratch_size;
    nir_shader **resume_shaders = NULL;
    uint32_t resume_shader_count = 0;
