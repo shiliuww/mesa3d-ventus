@@ -224,37 +224,35 @@ resident_copy_words(nir_builder *b, nir_def *src, uint32_t src_offset,
    }
 }
 
-static void
-finalize_v5_candidate_callback(nir_builder *b,
-                               const struct vt_nir_rt_config *config,
-                               nir_def *pds_address,
-                               nir_def *procedural)
+void
+vt_nir_rt_v5_publish_candidate_commit(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   nir_def *pds_address, nir_def *procedural)
 {
-   nir_def *decision = load_raygen_callback_decision(b, config);
-   nir_def *accepted = nir_ior(
-      b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
-      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE));
-   nir_def *terminated =
-      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE);
-   nir_def *candidate_words[VENTUS_RT_V5_TRACE_COMMITTED_BYTES / 4];
+   nir_def *candidate_metadata = NULL;
 
-   for (uint32_t word = 0; word < ARRAY_SIZE(candidate_words); word++) {
-      candidate_words[word] = resident_global_load_u32(
-         b, pds_address,
-         VENTUS_RT_V5_PDS_CALLBACK_BASE + word * sizeof(uint32_t));
+   /* Keep the 96-byte copy compact enough for large MegaKernel loops while
+    * retaining the metadata-last publication rule. */
+   for (uint32_t offset = 0;
+        offset < VENTUS_RT_V5_TRACE_COMMITTED_BYTES; offset += 16) {
+      nir_def *candidate = nir_load_global(
+         b, 4, 32,
+         nir_iadd_imm(b, nir_u2u64(b, pds_address),
+                      VENTUS_RT_V5_PDS_CALLBACK_BASE + offset),
+         .align_mul = 16);
+      uint32_t write_mask = 0xf;
+      if (offset == 16) {
+         candidate_metadata = nir_channel(b, candidate, 2);
+         write_mask &= ~(1u << 2);
+      }
+      nir_store_global(
+         b, candidate,
+         nir_iadd_imm(b, nir_u2u64(b, pds_address),
+                      VENTUS_RT_V5_PDS_COMMITTED_BASE + offset),
+         .write_mask = write_mask, .align_mul = 16);
    }
+   assert(candidate_metadata);
 
-   nir_push_if(b, accepted);
-   for (uint32_t word = 0; word < ARRAY_SIZE(candidate_words); word++) {
-      const uint32_t offset = word * sizeof(uint32_t);
-      if (offset == VENTUS_RT_V5_HIT_METADATA)
-         continue;
-      resident_global_store_u32(
-         b, pds_address, VENTUS_RT_V5_PDS_COMMITTED_BASE + offset,
-         candidate_words[word]);
-   }
-
-   const uint32_t metadata_word = VENTUS_RT_V5_HIT_METADATA / 4;
    const uint32_t metadata_replace_mask =
       VENTUS_RT_V5_HIT_METADATA_GEOMETRY_MASK |
       (0x3fu << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_COUNT_SHIFT) |
@@ -265,7 +263,7 @@ finalize_v5_candidate_callback(nir_builder *b,
       config->scratchpad[VT_RT_LAYOUT_INTERSECTION].hit_attrib_size_bytes,
       32u);
    nir_def *base_metadata = nir_iand_imm(
-      b, candidate_words[metadata_word], ~metadata_replace_mask);
+      b, candidate_metadata, ~metadata_replace_mask);
    nir_def *triangle_metadata = nir_ior(
       b, base_metadata,
       nir_imm_int(
@@ -287,25 +285,63 @@ finalize_v5_candidate_callback(nir_builder *b,
       b, pds_address,
       VENTUS_RT_V5_PDS_COMMITTED_BASE + VENTUS_RT_V5_HIT_METADATA,
       nir_bcsel(b, procedural, procedural_metadata, triangle_metadata));
+}
+
+static void
+finalize_v5_candidate_callback(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               nir_def *pds_address,
+                               nir_def *procedural)
+{
+   nir_def *staging = resident_global_load_u32(
+      b, pds_address, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING);
+   nir_def *accepted = nir_ine_imm(
+      b, nir_iand_imm(b, staging, VENTUS_RT_V5_SHADER_RETURN_ACCEPT), 0);
+   nir_def *terminated = nir_ine_imm(
+      b, nir_iand_imm(b, staging, VENTUS_RT_V5_SHADER_RETURN_TERMINATE), 0);
+   nir_def *procedural_committed =
+      config->use_v5_independent_candidate_entries ?
+         nir_ine_imm(
+            b, nir_iand_imm(
+                  b, staging, VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED), 0) :
+         nir_imm_false(b);
+   nir_def *updated = nir_ior(b, accepted, procedural_committed);
+   nir_def *needs_commit = nir_iand(
+      b, accepted, nir_inot(b, procedural_committed));
+
+   nir_push_if(b, needs_commit);
+   vt_nir_rt_v5_publish_candidate_commit(
+      b, config, pds_address, procedural);
    nir_pop_if(b, NULL);
+
+   nir_def *committed_t = resident_global_load_u32(
+      b, pds_address,
+      VENTUS_RT_V5_PDS_COMMITTED_BASE + VENTUS_RT_V5_HIT_T);
 
    /* S3 changes ownership only after the complete formal committed image is
     * visible.  The effect word is written last and consumed by RTcore. */
-   for (uint32_t offset = 8; offset < 32; offset += sizeof(uint32_t)) {
-      resident_global_store_u32(
-         b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE + offset,
-         nir_imm_int(b, 0));
-   }
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_store_global(
+      b, nir_replicate(b, zero, 4),
+      nir_iadd_imm(b, nir_u2u64(b, pds_address),
+                   VENTUS_RT_V5_PDS_CALLBACK_BASE + 8),
+      .write_mask = 0xf, .align_mul = 4);
+   nir_store_global(
+      b, nir_replicate(b, zero, 2),
+      nir_iadd_imm(b, nir_u2u64(b, pds_address),
+                   VENTUS_RT_V5_PDS_CALLBACK_BASE + 24),
+      .write_mask = 0x3, .align_mul = 8);
    resident_global_store_u32(
       b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE + 4,
-      nir_bcsel(b, accepted, candidate_words[0], nir_imm_int(b, 0)));
+      nir_bcsel(b, updated, committed_t, nir_imm_int(b, 0)));
    resident_global_store_u32(
       b, pds_address, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
       nir_imm_int(b, 0));
    resident_global_store_u32(
       b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE,
-      nir_ior(b, nir_b2i32(b, accepted),
-              nir_ishl_imm(b, nir_b2i32(b, terminated), 1)));
+      nir_ior(b, nir_b2i32(b, updated),
+              nir_ishl_imm(
+                 b, nir_b2i32(b, nir_iand(b, updated, terminated)), 1)));
 }
 
 static void

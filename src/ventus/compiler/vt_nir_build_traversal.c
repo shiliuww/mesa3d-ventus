@@ -240,6 +240,7 @@ vt_nir_rt_default_config(void)
    struct vt_nir_rt_config config = {
       .execution_model = VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP,
       .use_v5_pds = false,
+      .use_v5_independent_candidate_entries = false,
       .scratchpad = {
          [VT_RT_LAYOUT_RAYGEN] = {
             .base_bytes = 0,
@@ -516,6 +517,9 @@ vt_nir_store_control_word(nir_builder *b,
                           nir_def *value)
 {
    if (config->use_v5_pds) {
+      nir_def *preserved = nir_iand_imm(
+         b, v5_load_u32(b, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING),
+         VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED);
       nir_def *is_accept =
          nir_ieq_imm(b, nir_u2u32(b, value), VT_RT_CALLBACK_ACCEPT);
       nir_def *is_terminate =
@@ -528,7 +532,7 @@ vt_nir_store_control_word(nir_builder *b,
                    nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_ACCEPT),
                    nir_imm_int(b, 0)));
       v5_store_u32(b, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
-                   effect);
+                   nir_ior(b, preserved, effect));
       return;
    }
    if (value->bit_size == 1)

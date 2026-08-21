@@ -73,6 +73,9 @@ enum ventus_rt_v5_hit_attribute_format {
 
 #define VENTUS_RT_V5_SHADER_RETURN_ACCEPT (1u << 0)
 #define VENTUS_RT_V5_SHADER_RETURN_TERMINATE (1u << 1)
+/* Compiler-private accumulator used while one intersection invocation issues
+ * multiple reports.  It never appears in the public S3 shader-return view. */
+#define VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED (1u << 2)
 
 enum ventus_rt_v5_private_offset {
    VENTUS_RT_V5_PRIVATE_FRONTIER_0 = 0x00,

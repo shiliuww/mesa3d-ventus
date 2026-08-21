@@ -840,7 +840,7 @@ struct vtvk_rt_callback_shaders {
 
 struct vtvk_rt_pipeline_callback_data {
    const vtvk_rt_callback_shaders *shaders;
-   bool independent_terminal_entries;
+   bool independent_entries;
 };
 
 struct vtvk_rt_payload_location_candidate {
@@ -1354,6 +1354,10 @@ vtvk_rt_entry_symbol_prefix(mesa_shader_stage stage)
       return "miss";
    case MESA_SHADER_CLOSEST_HIT:
       return "closest_hit";
+   case MESA_SHADER_ANY_HIT:
+      return "any_hit";
+   case MESA_SHADER_INTERSECTION:
+      return "intersection";
    case MESA_SHADER_CALLABLE:
       return "callable";
    default:
@@ -2003,6 +2007,151 @@ vtvk_emit_rt_callback_shader_with_index(
    }
 }
 
+struct vtvk_rt_v5_intersection_report_lower_data {
+   const struct vt_nir_rt_config *config;
+   const std::vector<vtvk_rt_callback_shader_entry> *any_hit;
+};
+
+/* An independent intersection entry must preserve the Vulkan-visible order
+ * of reportIntersection calls.  Every accepted report invokes its matching
+ * any-hit entry synchronously and updates S6 before the intersection shader
+ * continues, so a later report observes the new nearest t. */
+static bool
+vtvk_lower_rt_v5_intersection_report_entry(nir_builder *b,
+                                            nir_intrinsic_instr *intrin,
+                                            void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_report_ray_intersection)
+      return false;
+
+   const vtvk_rt_v5_intersection_report_lower_data *state =
+      static_cast<const vtvk_rt_v5_intersection_report_lower_data *>(data);
+   const struct vt_nir_rt_config *config = state->config;
+   const enum vt_rt_shader_layout layout = VT_RT_LAYOUT_INTERSECTION;
+   b->cursor = nir_before_instr(&intrin->instr);
+
+   nir_def *pds = nir_u2u64(
+      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
+   nir_def *staging = vtvk_rt_global_load_u32(
+      b, pds, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING);
+   nir_def *already_terminated = nir_ine_imm(
+      b, nir_iand_imm(b, staging,
+                      VENTUS_RT_V5_SHADER_RETURN_TERMINATE), 0);
+   nir_def *committed_valid = nir_ieq_imm(
+      b, vt_nir_load_hit_record_word(
+            b, config, layout, VT_RT_HIT_RECORD_STATUS, 32),
+      VT_RT_HIT_RECORD_STATUS_VALID);
+   nir_def *committed_t = vt_nir_load_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
+   nir_def *ray_tmax = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_TMAX);
+   nir_def *current_tmax = nir_bcsel(
+      b, committed_valid, committed_t, ray_tmax);
+   nir_def *tmin = vt_nir_load_ray_state_word(
+      b, config, layout, VT_RT_SLOT_TMIN);
+   nir_def *hit_t = intrin->src[0].ssa;
+   nir_def *hit_kind = intrin->src[1].ssa;
+   nir_def *in_range = nir_iand(
+      b, nir_fisfinite(b, hit_t),
+      nir_iand(b, nir_fge(b, hit_t, tmin),
+               nir_fge(b, current_tmax, hit_t)));
+   nir_def *eligible = nir_iand(b, in_range, nir_inot(b, already_terminated));
+
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_T, hit_t);
+   vt_nir_store_candidate_hit_record_word(
+      b, config, layout, VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
+   vt_nir_store_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
+      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                nir_imm_int(b, VT_RT_CALLBACK_IGNORE)));
+
+   nir_def *procedural_any_hit = vt_nir_load_candidate_hit_record_word(
+      b, config, layout,
+      VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 1);
+   nir_push_if(b, nir_iand(b, eligible, procedural_any_hit));
+   nir_def *frame = nir_ventus_rt_entry_frame_address(b);
+   nir_def *record_ptr = nir_load_global(
+      b, 1, 64,
+      nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
+      .align_mul = 8);
+   nir_def *group_index =
+      vtvk_load_rt_shader_record_group_index(b, record_ptr);
+   if (state->any_hit && !state->any_hit->empty()) {
+      vtvk_emit_rt_callback_shader_with_index(
+         b, *state->any_hit, group_index, record_ptr, true);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_def *decision = vt_nir_load_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32);
+   nir_def *accepted = nir_iand(
+      b, eligible,
+      nir_ior(b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
+              nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE)));
+   nir_def *terminated =
+      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE);
+   nir_def *has_terminated = nir_ior(b, already_terminated, terminated);
+
+   nir_push_if(b, accepted);
+   vt_nir_rt_v5_publish_candidate_commit(
+      b, config, pds, nir_imm_true(b));
+   nir_pop_if(b, NULL);
+
+   nir_def *previous_commit = nir_ine_imm(
+      b, nir_iand_imm(b, staging,
+                      VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED), 0);
+   nir_def *has_commit = nir_ior(b, previous_commit, accepted);
+   vtvk_rt_global_store_u32(
+      b, pds, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
+      nir_ior(
+         b,
+         nir_bcsel(
+            b, has_commit,
+            nir_imm_int(b, VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED),
+            nir_imm_int(b, 0)),
+         nir_bcsel(
+            b, has_terminated,
+            nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_TERMINATE),
+            nir_imm_int(b, 0))));
+
+   nir_def_rewrite_uses(&intrin->def, accepted);
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
+vtvk_lower_rt_v5_intersection_entry_reports(
+   std::vector<vtvk_rt_callback_shader_entry> &intersection,
+   const std::vector<vtvk_rt_callback_shader_entry> &any_hit,
+   const struct vt_nir_rt_config *config)
+{
+   for (size_t i = 0; i < intersection.size(); i++) {
+      nir_shader *shader = intersection[i].shader;
+      bool already_lowered = false;
+      for (size_t j = 0; j < i; j++) {
+         if (intersection[j].shader == shader) {
+            already_lowered = true;
+            break;
+         }
+      }
+      if (already_lowered)
+         continue;
+
+      const vtvk_rt_v5_intersection_report_lower_data data = {
+         .config = config,
+         .any_hit = &any_hit,
+      };
+      nir_shader_intrinsics_pass(
+         shader, vtvk_lower_rt_v5_intersection_report_entry,
+         nir_metadata_control_flow, (void *)&data);
+      if (vtvk_rt_shader_has_intrinsic(
+             shader, nir_intrinsic_report_ray_intersection))
+         return false;
+   }
+   return true;
+}
+
 static void
 vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
                   const struct vt_nir_rt_result *result, void *data)
@@ -2019,7 +2168,7 @@ vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
    index = nir_channel(b, index, 0);
    vtvk_emit_rt_callback_shader_with_index(
       b, cb->shaders->miss, index, record_ptr,
-      cb->independent_terminal_entries);
+      cb->independent_entries);
 }
 
 static void
@@ -2039,7 +2188,7 @@ vtvk_emit_rt_closest_hit(nir_builder *b,
       vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
    vtvk_emit_rt_callback_shader_with_index(
       b, cb->shaders->closest_hit, index, result->hit_shader_record_ptr,
-      cb->independent_terminal_entries);
+      cb->independent_entries);
 }
 
 static void
@@ -2056,7 +2205,9 @@ vtvk_emit_rt_any_hit(nir_builder *b, const struct vt_nir_rt_trace_params *params
 
    nir_def *index =
       vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
-   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->any_hit, index);
+   vtvk_emit_rt_callback_shader_with_index(
+      b, cb->shaders->any_hit, index, result->hit_shader_record_ptr,
+      cb->independent_entries);
 }
 
 static void
@@ -2073,8 +2224,9 @@ vtvk_emit_rt_intersection(nir_builder *b, const struct vt_nir_rt_trace_params *p
 
    nir_def *index =
       vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
-   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->intersection,
-                                             index);
+   vtvk_emit_rt_callback_shader_with_index(
+      b, cb->shaders->intersection, index, result->hit_shader_record_ptr,
+      cb->independent_entries);
 }
 static bool
 vtvk_rt_stage_supported(mesa_shader_stage stage)
@@ -2388,13 +2540,14 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                    &cb_shaders);
    vtvk_rt_pipeline_callback_data cb_data = {
       .shaders = &cb_shaders,
-      .independent_terminal_entries = single_elf_multi_entry,
+      .independent_entries = single_elf_multi_entry,
    };
    std::vector<nir_shader *> linked_entry_shaders;
    std::vector<const char *> linked_entry_symbols;
    std::vector<vtvk_rt_callback_shader_entry> linked_entries;
    bool uses_callable_entry = false;
    bool uses_terminal_entry = false;
+   bool uses_candidate_entry = false;
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -2428,13 +2581,21 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
              &linked_entry_shaders, &linked_entry_symbols) ||
           !vtvk_prepare_rt_independent_entries(
              cb_shaders.closest_hit, pipeline->nir_mem_ctx,
+             &linked_entry_shaders, &linked_entry_symbols) ||
+          !vtvk_prepare_rt_independent_entries(
+             cb_shaders.any_hit, pipeline->nir_mem_ctx,
+             &linked_entry_shaders, &linked_entry_symbols) ||
+          !vtvk_prepare_rt_independent_entries(
+             cb_shaders.intersection, pipeline->nir_mem_ctx,
              &linked_entry_shaders, &linked_entry_symbols)) {
-         mesa_loge("ventus-vk: independent terminal-entry preparation failed");
+         mesa_loge("ventus-vk: independent RT-entry preparation failed");
          vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       }
       uses_terminal_entry = !cb_shaders.miss.empty() ||
                             !cb_shaders.closest_hit.empty();
+      uses_candidate_entry = !cb_shaders.any_hit.empty() ||
+                             !cb_shaders.intersection.empty();
       linked_entries.insert(linked_entries.end(), cb_shaders.callable.begin(),
                             cb_shaders.callable.end());
       linked_entries.insert(linked_entries.end(), cb_shaders.miss.begin(),
@@ -2442,6 +2603,11 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       linked_entries.insert(linked_entries.end(),
                             cb_shaders.closest_hit.begin(),
                             cb_shaders.closest_hit.end());
+      linked_entries.insert(linked_entries.end(), cb_shaders.any_hit.begin(),
+                            cb_shaders.any_hit.end());
+      linked_entries.insert(linked_entries.end(),
+                            cb_shaders.intersection.begin(),
+                            cb_shaders.intersection.end());
    } else if (!vtvk_lower_rt_callable_invocations(
                  pipeline->shaders, pipeline->shader_count,
                  cb_shaders.callable)) {
@@ -2496,6 +2662,14 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
       config.use_v5_pds = v5_megakernel;
 
+      if (single_elf_multi_entry &&
+          !vtvk_lower_rt_v5_intersection_entry_reports(
+             cb_shaders.intersection, cb_shaders.any_hit, &config)) {
+         mesa_loge("ventus-vk: independent intersection report lowering failed");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&config, &rt_abi);
          config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
@@ -2526,7 +2700,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          resident_continuation.max_callable_frame_bytes;
       pipeline->rt_v5_continuation_stack_bytes =
          resident_continuation.stack_bytes_per_thread;
-      if (uses_callable_entry || uses_terminal_entry) {
+      if (uses_callable_entry || uses_terminal_entry || uses_candidate_entry) {
          pipeline->rt_v5_entry_frame_offset =
             pipeline->rt_v5_continuation_stack_bytes;
          pipeline->rt_v5_continuation_stack_bytes = ALIGN_POT(
@@ -2638,6 +2812,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       } else {
          rt_io_config.enable_monolithic_shader_callbacks = true;
          rt_io_config.use_v5_resident_continuations = v5_megakernel;
+         rt_io_config.use_v5_independent_candidate_entries =
+            single_elf_multi_entry && uses_candidate_entry;
          rt_io_config.v5_continuation_scratch_bytes =
             resident_continuation.scratch_bytes_per_thread;
          rt_io_config.v5_continuation_state_frame_stride_bytes =
@@ -2755,7 +2931,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       .entry_point_count = single_elf_multi_entry ?
          (unsigned)linked_entry_symbols.size() : 0,
       .rt_entry_frame_offset_per_thread =
-         (uses_callable_entry || uses_terminal_entry) ?
+         (uses_callable_entry || uses_terminal_entry || uses_candidate_entry) ?
             pipeline->rt_v5_entry_frame_offset : 0,
    };
 

@@ -21,28 +21,39 @@ main(void)
    assert(VENTUS_RT_V5_COMPILER_CALLBACK_STAGING == 0x058);
    assert(VENTUS_RT_V5_COMPILER_CALLBACK_STAGING <
           VENTUS_RT_V5_PDS_CALLBACK_BASE);
+   assert((VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED &
+           (VENTUS_RT_V5_SHADER_RETURN_ACCEPT |
+            VENTUS_RT_V5_SHADER_RETURN_TERMINATE)) == 0);
    assert(VENTUS_RT_V5_PDS_CALLBACK_BASE == 0x060);
    assert(VENTUS_RT_V5_PDS_COMMITTED_BASE == 0x0c0);
    assert(VENTUS_RT_V5_PDS_CALL_DATA_BASE == 0x120);
    assert(ventus_rt_v5_compact_result(VENTUS_RT_V5_RETURN_MISS) ==
           0x80000001u);
 
-   const uint32_t entry_refs[] = {3, 4, 5};
-   const uint64_t entry_targets[] = {0x800000a4, 0, 0x80000220};
-   const uint32_t entry_stages[] = {13, 13, 14};
+   const uint32_t entry_refs[] = {3, 4, 5, 5, 5};
+   const uint64_t entry_targets[] = {
+      0x800000a4, 0, 0x80000220, 0x80000330, 0x80000440,
+   };
+   const uint32_t entry_stages[] = {13, 13, 14, 9, 12};
    uint64_t entry_target = 0;
    assert(ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, entry_stages, 3, 13, 3, &entry_target));
+      entry_refs, entry_targets, entry_stages, 5, 13, 3, &entry_target));
    assert(entry_target == 0x800000a4);
    assert(!ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, entry_stages, 3, 13, 4, &entry_target));
+      entry_refs, entry_targets, entry_stages, 5, 13, 4, &entry_target));
    assert(entry_target == 0);
    assert(!ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, entry_stages, 3, 13, 5, &entry_target));
+      entry_refs, entry_targets, entry_stages, 5, 13, 5, &entry_target));
    assert(entry_target == 0);
    assert(!ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, entry_stages, 3, 13, 9, &entry_target));
+      entry_refs, entry_targets, entry_stages, 5, 13, 9, &entry_target));
    assert(entry_target == 0);
+   assert(ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, entry_stages, 5, 9, 5, &entry_target));
+   assert(entry_target == 0x80000330);
+   assert(ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, entry_stages, 5, 12, 5, &entry_target));
+   assert(entry_target == 0x80000440);
 
    uint64_t address = 0;
    assert(ventus_rt_v5_private_address(0, 0x180, 0, 0, &address));

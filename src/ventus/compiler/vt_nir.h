@@ -163,6 +163,7 @@ struct vt_nir_rt_config {
    enum vt_rt_execution_model execution_model;
    bool use_v5_pds;
    bool use_v5_resident_continuations;
+   bool use_v5_independent_candidate_entries;
    uint32_t v5_continuation_scratch_bytes;
    uint32_t v5_continuation_state_frame_stride_bytes;
    uint32_t v5_payload_size_bytes;
@@ -360,6 +361,12 @@ vt_nir_build_traversal_v5_submit(nir_builder *b,
 nir_def *vt_nir_build_traversal_v5_resume(nir_builder *b,
                                           nir_def *pds_address,
                                           nir_def *private_state_address);
+
+/* Publish the current V5 S3 candidate as the formal S6 committed record.
+ * The caller owns range/any-hit admission and publication ordering. */
+void vt_nir_rt_v5_publish_candidate_commit(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   nir_def *pds_address, nir_def *procedural);
 
 nir_def *vt_nir_build_hit_shader_record_ptr(
    nir_builder *b, const struct vt_nir_rt_config *config,
