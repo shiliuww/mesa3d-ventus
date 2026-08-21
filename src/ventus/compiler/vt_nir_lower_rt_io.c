@@ -225,6 +225,90 @@ resident_copy_words(nir_builder *b, nir_def *src, uint32_t src_offset,
 }
 
 static void
+finalize_v5_candidate_callback(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               nir_def *pds_address,
+                               nir_def *procedural)
+{
+   nir_def *decision = load_raygen_callback_decision(b, config);
+   nir_def *accepted = nir_ior(
+      b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
+      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE));
+   nir_def *terminated =
+      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE);
+   nir_def *candidate_words[VENTUS_RT_V5_TRACE_COMMITTED_BYTES / 4];
+
+   for (uint32_t word = 0; word < ARRAY_SIZE(candidate_words); word++) {
+      candidate_words[word] = resident_global_load_u32(
+         b, pds_address,
+         VENTUS_RT_V5_PDS_CALLBACK_BASE + word * sizeof(uint32_t));
+   }
+
+   nir_push_if(b, accepted);
+   for (uint32_t word = 0; word < ARRAY_SIZE(candidate_words); word++) {
+      const uint32_t offset = word * sizeof(uint32_t);
+      if (offset == VENTUS_RT_V5_HIT_METADATA)
+         continue;
+      resident_global_store_u32(
+         b, pds_address, VENTUS_RT_V5_PDS_COMMITTED_BASE + offset,
+         candidate_words[word]);
+   }
+
+   const uint32_t metadata_word = VENTUS_RT_V5_HIT_METADATA / 4;
+   const uint32_t metadata_replace_mask =
+      VENTUS_RT_V5_HIT_METADATA_GEOMETRY_MASK |
+      (0x3fu << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_COUNT_SHIFT) |
+      (0xffu << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_FORMAT_SHIFT) |
+      VENTUS_RT_V5_HIT_METADATA_PROCEDURAL_ANY_HIT |
+      VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID;
+   const uint32_t procedural_attribute_bytes = MIN2(
+      config->scratchpad[VT_RT_LAYOUT_INTERSECTION].hit_attrib_size_bytes,
+      32u);
+   nir_def *base_metadata = nir_iand_imm(
+      b, candidate_words[metadata_word], ~metadata_replace_mask);
+   nir_def *triangle_metadata = nir_ior(
+      b, base_metadata,
+      nir_imm_int(
+         b, VENTUS_RT_V5_HIT_GEOMETRY_TRIANGLE |
+               (8u << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_COUNT_SHIFT) |
+               (VENTUS_RT_V5_HIT_ATTRIBUTE_BARYCENTRIC_FP32X2
+                << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_FORMAT_SHIFT) |
+               VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID));
+   nir_def *procedural_metadata = nir_ior(
+      b, base_metadata,
+      nir_imm_int(
+         b, VENTUS_RT_V5_HIT_GEOMETRY_PROCEDURAL_AABB |
+               (procedural_attribute_bytes
+                << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_COUNT_SHIFT) |
+               (VENTUS_RT_V5_HIT_ATTRIBUTE_OPAQUE_BYTES
+                << VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_FORMAT_SHIFT) |
+               VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID));
+   resident_global_store_u32(
+      b, pds_address,
+      VENTUS_RT_V5_PDS_COMMITTED_BASE + VENTUS_RT_V5_HIT_METADATA,
+      nir_bcsel(b, procedural, procedural_metadata, triangle_metadata));
+   nir_pop_if(b, NULL);
+
+   /* S3 changes ownership only after the complete formal committed image is
+    * visible.  The effect word is written last and consumed by RTcore. */
+   for (uint32_t offset = 8; offset < 32; offset += sizeof(uint32_t)) {
+      resident_global_store_u32(
+         b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE + offset,
+         nir_imm_int(b, 0));
+   }
+   resident_global_store_u32(
+      b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE + 4,
+      nir_bcsel(b, accepted, candidate_words[0], nir_imm_int(b, 0)));
+   resident_global_store_u32(
+      b, pds_address, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
+      nir_imm_int(b, 0));
+   resident_global_store_u32(
+      b, pds_address, VENTUS_RT_V5_PDS_CALLBACK_BASE,
+      nir_ior(b, nir_b2i32(b, accepted),
+              nir_ishl_imm(b, nir_b2i32(b, terminated), 1)));
+}
+
+static void
 resident_save_parent_pds(nir_builder *b,
                          const struct vt_nir_rt_config *config,
                          nir_def *pds, nir_def *frame)
@@ -394,12 +478,23 @@ lower_trace_ray_v5(nir_builder *b, nir_intrinsic_instr *intrin,
                       nir_imm_int64(b, 0))),
       };
 
+      nir_push_if(b, candidate);
+      resident_global_store_u32(
+         b, pds_address, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
+         nir_imm_int(b, 0));
+      nir_pop_if(b, NULL);
+
       emit_trace_callbacks(b, config, params, &result,
                            resident ? nir_imm_false(b) : complete_hit,
                            resident ? nir_imm_false(b) : complete_miss,
                            candidate_non_opaque,
                            candidate_procedural, dynamic_skip_closest_hit,
                            constant_skip_closest_hit);
+
+      nir_push_if(b, candidate);
+      finalize_v5_candidate_callback(
+         b, config, pds_address, candidate_procedural);
+      nir_pop_if(b, NULL);
 
       nir_push_if(b, terminal);
       nir_jump(b, nir_jump_break);

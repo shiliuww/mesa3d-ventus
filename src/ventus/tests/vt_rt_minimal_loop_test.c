@@ -274,6 +274,24 @@ count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
 }
 
 static unsigned
+count_alu_op(nir_shader *shader, nir_op op)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == op)
+               count++;
+         }
+      }
+   }
+
+   return count;
+}
+
+static unsigned
 count_variables(nir_shader *shader, nir_variable_mode mode)
 {
    unsigned count = 0;
@@ -308,6 +326,7 @@ main(int argc, char **argv)
       build_abi_probe_closest_hit(&options);
    nir_shader *any_hit = build_abi_probe_any_hit(&options);
    nir_shader *intersection = build_abi_probe_intersection(&options);
+   nir_shader *v5_intersection = build_abi_probe_intersection(&options);
    nir_shader *deferred_intersection =
       build_abi_probe_intersection(&options);
    nir_shader *terminating_any_hit =
@@ -553,6 +572,18 @@ main(int argc, char **argv)
                   v5_raygen,
                   VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET) == 1);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(v5_raygen));
+
+   struct vt_nir_rt_config v5_callback_config = v5_config;
+   VT_RT_CHECK(vt_nir_lower_rt_abi(v5_intersection,
+                                   &v5_callback_config));
+   nir_validate_shader(v5_intersection,
+                       "after Ventus V5 intersection callback lowering");
+   VT_RT_CHECK(count_intrinsic(
+                  v5_intersection,
+                  nir_intrinsic_report_ray_intersection) == 0);
+   VT_RT_CHECK(count_alu_op(v5_intersection, nir_op_fisfinite) == 1);
+   VT_RT_CHECK(count_alu_op(v5_intersection, nir_op_fge) >= 2);
+   VT_RT_CHECK(count_alu_op(v5_intersection, nir_op_flt) == 0);
 
    struct vt_nir_rt_config resident_config = vt_nir_rt_default_config();
    vt_nir_rt_config_apply_abi_layout(&resident_config, &abi);

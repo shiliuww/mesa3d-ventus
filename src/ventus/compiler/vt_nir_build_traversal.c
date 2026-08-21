@@ -493,7 +493,7 @@ vt_nir_load_control_word(nir_builder *b,
 {
    if (config->use_v5_pds) {
       nir_def *effect =
-         v5_load_u32(b, VENTUS_RT_V5_PDS_CALLBACK_BASE);
+         v5_load_u32(b, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING);
       nir_def *terminate = nir_ine_imm(
          b, nir_iand_imm(b, effect, VENTUS_RT_V5_SHADER_RETURN_TERMINATE), 0);
       nir_def *accept = nir_ine_imm(
@@ -527,7 +527,8 @@ vt_nir_store_control_word(nir_builder *b,
          nir_bcsel(b, is_accept,
                    nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_ACCEPT),
                    nir_imm_int(b, 0)));
-      v5_store_u32(b, VENTUS_RT_V5_PDS_CALLBACK_BASE, effect);
+      v5_store_u32(b, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
+                   effect);
       return;
    }
    if (value->bit_size == 1)

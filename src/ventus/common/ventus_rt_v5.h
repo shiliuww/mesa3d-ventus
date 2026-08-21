@@ -21,6 +21,10 @@
 #define VENTUS_RT_V5_CALL_DATA_OFFSET 0x120u
 #define VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES 96u
 
+/* Compiler-private callback decision staging.  This word is zero at every
+ * RTcore publication/resume boundary and is not part of the V5 public ABI. */
+#define VENTUS_RT_V5_COMPILER_CALLBACK_STAGING 0x058u
+
 enum ventus_rt_v5_pds_offset {
    VENTUS_RT_V5_PDS_TRAVERSABLE_REFERENCE = 0x000,
    VENTUS_RT_V5_PDS_RAY_FLAGS = 0x008,

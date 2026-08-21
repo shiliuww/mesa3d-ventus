@@ -996,9 +996,10 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_def *hit_kind = intrin->src[1].ssa;
       nir_def *current_tmax = load_committed_tmax(b, config, layout);
       nir_def *tmin = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
-      nir_def *accepted =
-         nir_iand(b, nir_flt(b, hit_t, current_tmax),
-                  nir_fge(b, hit_t, tmin));
+      nir_def *accepted = nir_iand(
+         b, nir_fisfinite(b, hit_t),
+         nir_iand(b, nir_fge(b, hit_t, tmin),
+                  nir_fge(b, current_tmax, hit_t)));
 
       vt_nir_store_control_word(
          b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
