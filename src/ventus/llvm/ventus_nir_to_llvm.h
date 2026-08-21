@@ -48,6 +48,14 @@ struct vt_nir_to_llvm_options {
    uint32_t rt_continuation_bytes_per_thread;
    uint32_t rt_payload_size_bytes;
    uint32_t rt_callable_data_size_bytes;
+   /* Optional per-shader symbols when one module contains independently
+    * addressable RT entries.  The array is parallel to the shader array
+    * passed to vt_nir_to_llvm_translate(). */
+   const char *const *entry_point_names;
+   unsigned entry_point_count;
+   /* Byte offset from the end of the hot PDS to the compiler-private
+    * resident callable frame. */
+   uint32_t rt_callable_frame_offset_per_thread;
 };
 
 llvm::Module *vt_nir_to_llvm_translate(nir_shader **shaders,

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "util/log.h"
+#include "ventus/common/ventus_rt_v5.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
 #include "vtvk_driver_bridge.h"
@@ -114,6 +115,47 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
 }
 
 static bool
+vtvk_validate_callable_sbt_entries(
+   const struct vtvk_pipeline *pipeline,
+   const VkStridedDeviceAddressRegionKHR *region)
+{
+   if (!pipeline || !pipeline->rt_single_elf_multi_entry ||
+       pipeline->rt_shader_entry_count == 0)
+      return true;
+
+   if (!region || !region->deviceAddress || region->stride < 32 ||
+       region->size < 32 || region->size % region->stride != 0) {
+      mesa_loge("ventus-vk: independent callable SBT has an invalid region");
+      return false;
+   }
+
+   const uint8_t *records = static_cast<const uint8_t *>(
+      vtvk_buffer_host_ptr_from_addr(region->deviceAddress, region->size));
+   if (!records) {
+      mesa_loge("ventus-vk: independent callable SBT is not host-visible");
+      return false;
+   }
+
+   for (VkDeviceSize offset = 0; offset < region->size;
+        offset += region->stride) {
+      uint32_t entry_ref = 0;
+      memcpy(&entry_ref, records + offset + 4, sizeof(entry_ref));
+
+      uint64_t target = 0;
+      if (!ventus_rt_v5_shader_entry_target(
+             pipeline->rt_shader_entry_refs,
+             pipeline->rt_shader_entry_targets,
+             pipeline->rt_shader_entry_count, entry_ref, &target)) {
+         mesa_loge("ventus-vk: callable SBT entry_ref=%u at record=%" PRIu64
+                   " is not part of the bound pipeline",
+                   entry_ref, (uint64_t)(offset / region->stride));
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
 vtvk_execute_trace_rays(
    struct vtvk_cmd_buffer *cmd,
    const struct vtvk_rt_recorded_command *record,
@@ -182,6 +224,9 @@ vtvk_execute_trace_rays(
                 storage_image_data, camera_data);
       return false;
    }
+   if (!vtvk_validate_callable_sbt_entries(
+          pipeline, pCallableShaderBindingTable))
+      return false;
 
    if (!logged) {
       logged = true;

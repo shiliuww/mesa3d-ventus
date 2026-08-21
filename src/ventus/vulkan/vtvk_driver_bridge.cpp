@@ -1965,14 +1965,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                 resource_envelope.pds_stack_size_per_thread,
                 vtvk_rt_lanes_per_warp, &pds_layout) ||
              pds_layout.total_bytes_per_wg > pds_image.size()) {
-            mesa_loge("ventus-vk: V5 compiler-stack PDS bias exceeds the "
+            mesa_loge("ventus-vk: V5 compiler-stack PDS layout exceeds the "
                       "resident backing allocation");
             goto out;
          }
          pds_csr_base_addr = pds_layout.csr_base;
          mesa_logi("ventus-vk: V5 PDS backing=0x%" PRIx64
                    " compiler-stack/wg=%" PRIu64
-                   " hot-base=0x%" PRIx64,
+                   " csr-base=0x%" PRIx64,
                    pds_dev_addr, pds_layout.compiler_stack_bytes_per_wg,
                    pds_csr_base_addr);
       }

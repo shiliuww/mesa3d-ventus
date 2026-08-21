@@ -131,11 +131,16 @@ public:
            options ? options->rt_continuation_bytes_per_thread : 0),
         rtPayloadBytes(options ? options->rt_payload_size_bytes : 0),
         rtCallableDataBytes(options ? options->rt_callable_data_size_bytes : 0),
+        rtCallableFrameOffset(
+           options ? options->rt_callable_frame_offset_per_thread : 0),
         entryPointName(options && options->entry_point_name ?
                        options->entry_point_name : ""),
-        entryPointIsKernel(options && options->entry_point_is_kernel) {}
+        entryPointIsKernel(options && options->entry_point_is_kernel),
+        entryPointNames(options ? options->entry_point_names : nullptr),
+        entryPointCount(options ? options->entry_point_count : 0) {}
 
-   bool translate(nir_shader *shader, bool requireSsaFunctionTemps)
+   bool translate(nir_shader *shader, unsigned shaderIndex,
+                  bool requireSsaFunctionTemps)
    {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);
       if (!impl)
@@ -154,7 +159,7 @@ public:
 
       resetFunctionState();
 
-      Function *fn = createEntry(shader);
+      Function *fn = createEntry(shader, shaderIndex);
       BasicBlock *entry = BasicBlock::Create(context, "entry", fn);
       builder.SetInsertPoint(entry);
 
@@ -225,8 +230,11 @@ private:
    uint32_t rtContinuationBytes;
    uint32_t rtPayloadBytes;
    uint32_t rtCallableDataBytes;
+   uint32_t rtCallableFrameOffset;
    std::string entryPointName;
    bool entryPointIsKernel;
+   const char *const *entryPointNames;
+   unsigned entryPointCount;
    bool translationFailed = false;
 
    std::unordered_map<const nir_def *, Value *> defs;
@@ -759,10 +767,13 @@ private:
          builder.CreateRetVoid();
    }
 
-   Function *createEntry(nir_shader *shader)
+   Function *createEntry(nir_shader *shader, unsigned shaderIndex)
    {
       std::string name = "vt_" + stage_name(shader->info.stage);
-      if (!entryPointName.empty())
+      if (entryPointNames && shaderIndex < entryPointCount &&
+          entryPointNames[shaderIndex] && entryPointNames[shaderIndex][0])
+         name = entryPointNames[shaderIndex];
+      else if (!entryPointName.empty())
          name = entryPointName;
       else if (shader->info.stage == MESA_SHADER_RAYGEN)
          name = "main";
@@ -2165,6 +2176,40 @@ private:
       case nir_intrinsic_ventus_rt_hot_pds_address: {
          return rtHotPdsAddress(value(intrin->src[0]));
       }
+      case nir_intrinsic_ventus_rt_callable_frame_address: {
+         return builder.CreateZExt(
+            rtHotPdsAddress(ConstantInt::get(
+               i32, VENTUS_RT_V5_PDS_SIZE_BYTES + rtCallableFrameOffset)),
+            i64);
+      }
+      case nir_intrinsic_ventus_rt_call_shader_entry: {
+         if (!nir_src_is_const(intrin->src[0])) {
+            fprintf(stderr,
+                    "ventus-nir-to-llvm: shader entry index is not constant\n");
+            translationFailed = true;
+            return nullptr;
+         }
+         const uint32_t entryIndex = nir_src_as_uint(intrin->src[0]);
+         if (!entryPointNames || entryIndex >= entryPointCount ||
+             !entryPointNames[entryIndex]) {
+            fprintf(stderr,
+                    "ventus-nir-to-llvm: shader entry index %u is invalid\n",
+                    entryIndex);
+            translationFailed = true;
+            return nullptr;
+         }
+         Function *target = module.getFunction(entryPointNames[entryIndex]);
+         if (!target || target->arg_size() != 0) {
+            fprintf(stderr,
+                    "ventus-nir-to-llvm: shader entry %s is unavailable\n",
+                    entryPointNames[entryIndex]);
+            translationFailed = true;
+            return nullptr;
+         }
+         CallInst *call = builder.CreateCall(target);
+         call->setCallingConv(target->getCallingConv());
+         return nullptr;
+      }
       case nir_intrinsic_ventus_rt_release: {
          if (noopRtIntrinsics)
             return nullptr;
@@ -2500,7 +2545,7 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
    VentusNirToLlvm translator(context, *module, options);
    for (unsigned i = 0; i < shader_count; ++i) {
       if (shaders[i] && !translator.translate(
-                            shaders[i],
+                            shaders[i], i,
                             options && options->require_ssa_function_temps)) {
          delete module;
          return nullptr;

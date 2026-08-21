@@ -120,6 +120,25 @@ ventus_rt_v5_compact_result(enum ventus_rt_v5_return_reason reason)
 }
 
 static inline bool
+ventus_rt_v5_shader_entry_target(const uint32_t *entry_refs,
+                                 const uint64_t *entry_targets,
+                                 uint32_t entry_count, uint32_t entry_ref,
+                                 uint64_t *target)
+{
+   if (!entry_refs || !entry_targets || !target)
+      return false;
+
+   *target = 0;
+   for (uint32_t i = 0; i < entry_count; i++) {
+      if (entry_refs[i] == entry_ref && entry_targets[i] != 0) {
+         *target = entry_targets[i];
+         return true;
+      }
+   }
+   return false;
+}
+
+static inline bool
 ventus_rt_v5_align_u64(uint64_t value, uint64_t alignment,
                        uint64_t *result)
 {
@@ -206,16 +225,20 @@ ventus_rt_v5_pds_backing_layout(
    const uint64_t stack_bytes =
       compiler_stack_bytes_per_lane * lane_count;
    const uint64_t static_bytes = static_bytes_per_lane * lane_count;
-   if (stack_bytes > UINT64_MAX - static_bytes ||
-       allocation_base > UINT64_MAX - stack_bytes)
+   if (stack_bytes > UINT64_MAX - static_bytes)
+      return false;
+
+   const uint64_t total_bytes = static_bytes + stack_bytes;
+   if (allocation_base > UINT64_MAX - total_bytes)
       return false;
 
    layout->compiler_stack_bytes_per_wg = stack_bytes;
    layout->static_bytes_per_wg = static_bytes;
-   layout->total_bytes_per_wg = stack_bytes + static_bytes;
-   /* Compiler private spills use negative logical offsets from CSR_PDS;
-    * canonical V5 hot-PDS addresses grow upward from the same boundary. */
-   layout->csr_base = allocation_base + stack_bytes;
+   layout->total_bytes_per_wg = total_bytes;
+   /* Ventus private-memory offsets grow from the compiler/static prefix into
+    * the spill area.  Keep CSR_PDS at the allocation base so both RT PDS
+    * accesses and compiler-generated private spills use that convention. */
+   layout->csr_base = allocation_base;
    return true;
 }
 

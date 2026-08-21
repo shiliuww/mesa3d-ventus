@@ -63,6 +63,11 @@ struct vtvk_pipeline {
    uint32_t rt_v5_max_trace_frame_bytes;
    uint32_t rt_v5_max_callable_frame_bytes;
    uint32_t rt_v5_continuation_stack_bytes;
+   uint32_t rt_v5_callable_frame_offset;
+   uint32_t *rt_shader_entry_refs;
+   uint64_t *rt_shader_entry_targets;
+   uint32_t *rt_shader_entry_groups;
+   uint32_t rt_shader_entry_count;
    uint32_t max_ray_recursion_depth;
    VkVentusRtExecutionProfile rt_execution_profile;
    VkVentusRtStageRole rt_stage_role;
@@ -70,6 +75,7 @@ struct vtvk_pipeline {
    uint32_t rt_state_descriptor_binding;
    bool rt_uses_rv64;
    bool retain_generated_artifacts;
+   bool rt_single_elf_multi_entry;
    struct vt_nir_pipeline_scratch_info scratch_info;
 
    llvm::Module *llvm_module;

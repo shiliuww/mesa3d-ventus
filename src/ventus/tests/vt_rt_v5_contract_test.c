@@ -24,6 +24,19 @@ main(void)
    assert(ventus_rt_v5_compact_result(VENTUS_RT_V5_RETURN_MISS) ==
           0x80000001u);
 
+   const uint32_t entry_refs[] = {3, 4, 5};
+   const uint64_t entry_targets[] = {0x800000a4, 0, 0x80000220};
+   uint64_t entry_target = 0;
+   assert(ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, 3, 3, &entry_target));
+   assert(entry_target == 0x800000a4);
+   assert(!ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, 3, 4, &entry_target));
+   assert(entry_target == 0);
+   assert(!ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, 3, 9, &entry_target));
+   assert(entry_target == 0);
+
    uint64_t address = 0;
    assert(ventus_rt_v5_private_address(0, 0x180, 0, 0, &address));
    assert(address == 0x180);
@@ -50,7 +63,7 @@ main(void)
    assert(pds_layout.compiler_stack_bytes_per_wg == 8192);
    assert(pds_layout.static_bytes_per_wg == 12288);
    assert(pds_layout.total_bytes_per_wg == 20480);
-   assert(pds_layout.csr_base == 0x90012000);
+   assert(pds_layout.csr_base == 0x90010000);
    assert(ventus_rt_v5_pds_backing_layout(0x1000, 384, 0, 32,
                                            &pds_layout));
    assert(pds_layout.csr_base == 0x1000);

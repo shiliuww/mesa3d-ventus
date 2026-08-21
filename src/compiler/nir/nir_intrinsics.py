@@ -782,6 +782,14 @@ intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
           bit_sizes=[32])
 intrinsic("ventus_rt_hot_pds_address", src_comp=[1], dest_comp=1,
           bit_sizes=[32])
+# Compiler-private address of the bounded resident callable frame.  The
+# pipeline linker fixes its per-thread offset after trace-continuation sizing;
+# it is not part of the public PDS or RTcore ABI.
+intrinsic("ventus_rt_callable_frame_address", dest_comp=1, bit_sizes=[64])
+# Direct call to an independently emitted shader entry in the same pipeline
+# code image.  src[0] is a compile-time executable index; surrounding NIR
+# control flow performs per-lane entry_ref grouping.
+intrinsic("ventus_rt_call_shader_entry", src_comp=[1])
 # Compiler-private token paired with ventus_rt_continuation_return.  It stays
 # adjacent to a TraceRayEXT call until generic call lowering assigns call_idx.
 intrinsic("ventus_rt_continuation_begin", src_comp=[1])
