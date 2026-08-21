@@ -54,8 +54,8 @@ struct vt_nir_to_llvm_options {
    const char *const *entry_point_names;
    unsigned entry_point_count;
    /* Byte offset from the end of the hot PDS to the compiler-private
-    * resident callable frame. */
-   uint32_t rt_callable_frame_offset_per_thread;
+    * resident RT entry frame. */
+   uint32_t rt_entry_frame_offset_per_thread;
 };
 
 llvm::Module *vt_nir_to_llvm_translate(nir_shader **shaders,

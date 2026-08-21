@@ -26,15 +26,19 @@ main(void)
 
    const uint32_t entry_refs[] = {3, 4, 5};
    const uint64_t entry_targets[] = {0x800000a4, 0, 0x80000220};
+   const uint32_t entry_stages[] = {13, 13, 14};
    uint64_t entry_target = 0;
    assert(ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, 3, 3, &entry_target));
+      entry_refs, entry_targets, entry_stages, 3, 13, 3, &entry_target));
    assert(entry_target == 0x800000a4);
    assert(!ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, 3, 4, &entry_target));
+      entry_refs, entry_targets, entry_stages, 3, 13, 4, &entry_target));
    assert(entry_target == 0);
    assert(!ventus_rt_v5_shader_entry_target(
-      entry_refs, entry_targets, 3, 9, &entry_target));
+      entry_refs, entry_targets, entry_stages, 3, 13, 5, &entry_target));
+   assert(entry_target == 0);
+   assert(!ventus_rt_v5_shader_entry_target(
+      entry_refs, entry_targets, entry_stages, 3, 13, 9, &entry_target));
    assert(entry_target == 0);
 
    uint64_t address = 0;

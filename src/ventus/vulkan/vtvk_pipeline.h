@@ -63,10 +63,10 @@ struct vtvk_pipeline {
    uint32_t rt_v5_max_trace_frame_bytes;
    uint32_t rt_v5_max_callable_frame_bytes;
    uint32_t rt_v5_continuation_stack_bytes;
-   uint32_t rt_v5_callable_frame_offset;
+   uint32_t rt_v5_entry_frame_offset;
    uint32_t *rt_shader_entry_refs;
    uint64_t *rt_shader_entry_targets;
-   uint32_t *rt_shader_entry_groups;
+   uint32_t *rt_shader_entry_stages;
    uint32_t rt_shader_entry_count;
    uint32_t max_ray_recursion_depth;
    VkVentusRtExecutionProfile rt_execution_profile;

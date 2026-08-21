@@ -55,7 +55,7 @@ vtvk_pipeline_destroy(struct vk_device *device,
    free(pipeline->callback_kernel_stages);
    free(pipeline->rt_shader_entry_refs);
    free(pipeline->rt_shader_entry_targets);
-   free(pipeline->rt_shader_entry_groups);
+   free(pipeline->rt_shader_entry_stages);
    ralloc_free(pipeline->nir_mem_ctx);
    vk_free2(&device->alloc, pAllocator, pipeline->shaders);
    vk_free2(&device->alloc, pAllocator, pipeline->group_handles);

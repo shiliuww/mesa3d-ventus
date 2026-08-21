@@ -115,24 +115,37 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
 }
 
 static bool
-vtvk_validate_callable_sbt_entries(
+vtvk_validate_sbt_entries(
    const struct vtvk_pipeline *pipeline,
-   const VkStridedDeviceAddressRegionKHR *region)
+   const VkStridedDeviceAddressRegionKHR *region,
+   mesa_shader_stage expected_stage, const char *stage_name)
 {
-   if (!pipeline || !pipeline->rt_single_elf_multi_entry ||
-       pipeline->rt_shader_entry_count == 0)
+   if (!pipeline || !pipeline->rt_single_elf_multi_entry)
+      return true;
+
+   bool has_stage_entries = false;
+   for (uint32_t i = 0; i < pipeline->rt_shader_entry_count; i++) {
+      if (pipeline->rt_shader_entry_stages[i] ==
+          static_cast<uint32_t>(expected_stage)) {
+         has_stage_entries = true;
+         break;
+      }
+   }
+   if (!has_stage_entries)
       return true;
 
    if (!region || !region->deviceAddress || region->stride < 32 ||
        region->size < 32 || region->size % region->stride != 0) {
-      mesa_loge("ventus-vk: independent callable SBT has an invalid region");
+      mesa_loge("ventus-vk: independent %s SBT has an invalid region",
+                stage_name);
       return false;
    }
 
    const uint8_t *records = static_cast<const uint8_t *>(
       vtvk_buffer_host_ptr_from_addr(region->deviceAddress, region->size));
    if (!records) {
-      mesa_loge("ventus-vk: independent callable SBT is not host-visible");
+      mesa_loge("ventus-vk: independent %s SBT is not host-visible",
+                stage_name);
       return false;
    }
 
@@ -145,10 +158,13 @@ vtvk_validate_callable_sbt_entries(
       if (!ventus_rt_v5_shader_entry_target(
              pipeline->rt_shader_entry_refs,
              pipeline->rt_shader_entry_targets,
-             pipeline->rt_shader_entry_count, entry_ref, &target)) {
-         mesa_loge("ventus-vk: callable SBT entry_ref=%u at record=%" PRIu64
-                   " is not part of the bound pipeline",
-                   entry_ref, (uint64_t)(offset / region->stride));
+             pipeline->rt_shader_entry_stages,
+             pipeline->rt_shader_entry_count, expected_stage, entry_ref,
+             &target)) {
+         mesa_loge("ventus-vk: %s SBT entry_ref=%u at record=%" PRIu64
+                   " has no matching bound-pipeline entry",
+                   stage_name, entry_ref,
+                   (uint64_t)(offset / region->stride));
          return false;
       }
    }
@@ -224,8 +240,11 @@ vtvk_execute_trace_rays(
                 storage_image_data, camera_data);
       return false;
    }
-   if (!vtvk_validate_callable_sbt_entries(
-          pipeline, pCallableShaderBindingTable))
+   if (!vtvk_validate_sbt_entries(
+          pipeline, pMissShaderBindingTable, MESA_SHADER_MISS, "miss") ||
+       !vtvk_validate_sbt_entries(
+          pipeline, pCallableShaderBindingTable, MESA_SHADER_CALLABLE,
+          "callable"))
       return false;
 
    if (!logged) {

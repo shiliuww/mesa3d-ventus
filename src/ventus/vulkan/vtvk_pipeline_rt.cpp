@@ -777,9 +777,9 @@ struct vtvk_rt_callback_shader_entry {
 enum {
    VTVK_RT_CALLABLE_PARENT_DATA_BYTES =
       VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES,
-   VTVK_RT_CALLABLE_RECORD_PTR_OFFSET =
+   VTVK_RT_ENTRY_RECORD_PTR_OFFSET =
       VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES,
-   VTVK_RT_CALLABLE_FRAME_BYTES = 128,
+   VTVK_RT_ENTRY_FRAME_BYTES = 128,
 };
 
 static bool
@@ -799,11 +799,11 @@ vtvk_resolve_rt_shader_entries(
       (uint32_t *)calloc(count, sizeof(*pipeline->rt_shader_entry_refs));
    pipeline->rt_shader_entry_targets =
       (uint64_t *)calloc(count, sizeof(*pipeline->rt_shader_entry_targets));
-   pipeline->rt_shader_entry_groups =
-      (uint32_t *)calloc(count, sizeof(*pipeline->rt_shader_entry_groups));
+   pipeline->rt_shader_entry_stages =
+      (uint32_t *)calloc(count, sizeof(*pipeline->rt_shader_entry_stages));
    if (count && (!pipeline->rt_shader_entry_refs ||
                  !pipeline->rt_shader_entry_targets ||
-                 !pipeline->rt_shader_entry_groups))
+                 !pipeline->rt_shader_entry_stages))
       return false;
 
    pipeline->rt_shader_entry_count = count;
@@ -819,10 +819,11 @@ vtvk_resolve_rt_shader_entries(
        * byte 4.  Treat it as an opaque entry_ref; only this table attaches a
        * code address to it. */
       pipeline->rt_shader_entry_refs[i] = entry.group_index;
-      pipeline->rt_shader_entry_groups[i] = entry.group_index;
+      pipeline->rt_shader_entry_stages[i] = entry.stage;
       pipeline->rt_shader_entry_targets[i] = target;
-      mesa_logi("ventus-vk: RT entry_ref=%u group=%u symbol=%s target=0x%" PRIx64,
-                entry.group_index, entry.group_index,
+      mesa_logi("ventus-vk: RT entry_ref=%u stage=%u group=%u symbol=%s "
+                "target=0x%" PRIx64,
+                entry.group_index, entry.stage, entry.group_index,
                 entry.executable_symbol, target);
    }
    return true;
@@ -839,6 +840,7 @@ struct vtvk_rt_callback_shaders {
 
 struct vtvk_rt_pipeline_callback_data {
    const vtvk_rt_callback_shaders *shaders;
+   bool independent_terminal_entries;
 };
 
 struct vtvk_rt_payload_location_candidate {
@@ -1325,22 +1327,81 @@ vtvk_prepare_rt_callable_shader_record_ptr(
 }
 
 static bool
-vtvk_lower_rt_callable_entry_shader_record_ptr(nir_builder *b,
-                                                nir_intrinsic_instr *intrin,
-                                                void *data)
+vtvk_lower_rt_entry_shader_record_ptr(nir_builder *b,
+                                      nir_intrinsic_instr *intrin,
+                                      void *data)
 {
    (void)data;
    if (intrin->intrinsic != nir_intrinsic_load_shader_record_ptr)
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *frame = nir_ventus_rt_callable_frame_address(b);
+   nir_def *frame = nir_ventus_rt_entry_frame_address(b);
    nir_def *record_ptr = nir_load_global(
       b, 1, 64,
-      nir_iadd_imm(b, frame, VTVK_RT_CALLABLE_RECORD_PTR_OFFSET),
+      nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
       .align_mul = 8);
    nir_def_rewrite_uses(&intrin->def, record_ptr);
    nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static const char *
+vtvk_rt_entry_symbol_prefix(mesa_shader_stage stage)
+{
+   switch (stage) {
+   case MESA_SHADER_MISS:
+      return "miss";
+   case MESA_SHADER_CLOSEST_HIT:
+      return "closest_hit";
+   case MESA_SHADER_CALLABLE:
+      return "callable";
+   default:
+      return nullptr;
+   }
+}
+
+static bool
+vtvk_prepare_rt_independent_entries(
+   std::vector<vtvk_rt_callback_shader_entry> &entries,
+   void *mem_ctx, std::vector<nir_shader *> *entry_shaders,
+   std::vector<const char *> *entry_symbols)
+{
+   for (size_t i = 0; i < entries.size(); i++) {
+      vtvk_rt_callback_shader_entry &entry = entries[i];
+      for (size_t j = 0; j < i; j++) {
+         if (entries[j].shader == entry.shader) {
+            entry.executable_index = entries[j].executable_index;
+            entry.executable_symbol = entries[j].executable_symbol;
+            break;
+         }
+      }
+      if (entry.executable_index != UINT32_MAX)
+         continue;
+
+      const char *prefix = vtvk_rt_entry_symbol_prefix(entry.stage);
+      if (!prefix)
+         return false;
+      const char *symbol = ralloc_asprintf(
+         mem_ctx, "vt_%s_g%u", prefix, entry.group_index);
+      if (!symbol)
+         return false;
+      entry.executable_index = entry_shaders->size();
+      entry.executable_symbol = symbol;
+      entry_shaders->push_back(entry.shader);
+      entry_symbols->push_back(symbol);
+
+      vtvk_localize_rt_callback_halts(entry.shader);
+      NIR_PASS(_, entry.shader, nir_shader_intrinsics_pass,
+               vtvk_lower_rt_entry_shader_record_ptr,
+               nir_metadata_none, NULL);
+      if (vtvk_rt_shader_has_intrinsic(
+             entry.shader, nir_intrinsic_load_shader_record_ptr)) {
+         mesa_loge("ventus-vk: failed to bind shader record data for "
+                   "independent entry %s", symbol);
+         return false;
+      }
+   }
    return true;
 }
 
@@ -1350,8 +1411,7 @@ vtvk_prepare_rt_callable_entries(
    void *mem_ctx, std::vector<nir_shader *> *entry_shaders,
    std::vector<const char *> *entry_symbols)
 {
-   for (size_t i = 0; i < callables.size(); i++) {
-      vtvk_rt_callback_shader_entry &entry = callables[i];
+   for (const vtvk_rt_callback_shader_entry &entry : callables) {
       if (vtvk_rt_shader_has_intrinsic(
              entry.shader, nir_intrinsic_execute_callable)) {
          mesa_loge("ventus-vk: nested callable shader invocation is not "
@@ -1364,37 +1424,9 @@ vtvk_prepare_rt_callable_entries(
                    "supported");
          return false;
       }
-
-      for (size_t j = 0; j < i; j++) {
-         if (callables[j].shader == entry.shader) {
-            entry.executable_index = callables[j].executable_index;
-            entry.executable_symbol = callables[j].executable_symbol;
-            break;
-         }
-      }
-      if (entry.executable_index != UINT32_MAX)
-         continue;
-
-      const char *symbol = ralloc_asprintf(
-         mem_ctx, "vt_callable_g%u", entry.group_index);
-      if (!symbol)
-         return false;
-      entry.executable_index = entry_shaders->size();
-      entry.executable_symbol = symbol;
-      entry_shaders->push_back(entry.shader);
-      entry_symbols->push_back(symbol);
-
-      NIR_PASS(_, entry.shader, nir_shader_intrinsics_pass,
-               vtvk_lower_rt_callable_entry_shader_record_ptr,
-               nir_metadata_none, NULL);
-      if (vtvk_rt_shader_has_intrinsic(
-             entry.shader, nir_intrinsic_load_shader_record_ptr)) {
-         mesa_loge("ventus-vk: failed to bind callable shader record data "
-                   "for independent entry %s", symbol);
-         return false;
-      }
    }
-   return true;
+   return vtvk_prepare_rt_independent_entries(
+      callables, mem_ctx, entry_shaders, entry_symbols);
 }
 
 static nir_def *
@@ -1496,14 +1528,14 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
    }
 
    nir_push_if(b, valid_entry);
-   nir_def *frame = nir_ventus_rt_callable_frame_address(b);
+   nir_def *frame = nir_ventus_rt_entry_frame_address(b);
    nir_def *pds = nir_u2u64(
       b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
    vtvk_rt_copy_callable_words(
       b, pds, frame, VTVK_RT_CALLABLE_PARENT_DATA_BYTES);
    nir_store_global(
       b, nir_iadd_imm(b, record, 32),
-      nir_iadd_imm(b, frame, VTVK_RT_CALLABLE_RECORD_PTR_OFFSET),
+      nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
       .write_mask = 0x1, .align_mul = 8);
 
    nir_def *call_data = nir_load_var(b, payload);
@@ -1948,6 +1980,30 @@ vtvk_load_rt_shader_record_group_index(nir_builder *b, nir_def *shader_record_pt
 }
 
 static void
+vtvk_emit_rt_callback_shader_with_index(
+   nir_builder *b,
+   const std::vector<vtvk_rt_callback_shader_entry> &entries,
+   nir_def *index, nir_def *record_ptr, bool independent_entry)
+{
+   if (!independent_entry) {
+      vtvk_inline_rt_callback_shader_with_index(b, entries, index);
+      return;
+   }
+
+   nir_def *frame = nir_ventus_rt_entry_frame_address(b);
+   nir_store_global(
+      b, record_ptr,
+      nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
+      .write_mask = 0x1, .align_mul = 8);
+   for (const vtvk_rt_callback_shader_entry &entry : entries) {
+      nir_push_if(b, nir_ieq_imm(b, index, entry.group_index));
+      nir_ventus_rt_call_shader_entry(
+         b, nir_imm_int(b, entry.executable_index));
+      nir_pop_if(b, NULL);
+   }
+}
+
+static void
 vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
                   const struct vt_nir_rt_result *result, void *data)
 {
@@ -1961,7 +2017,9 @@ vtvk_emit_rt_miss(nir_builder *b, const struct vt_nir_rt_trace_params *params,
       return;
 
    index = nir_channel(b, index, 0);
-   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->miss, index);
+   vtvk_emit_rt_callback_shader_with_index(
+      b, cb->shaders->miss, index, record_ptr,
+      cb->independent_terminal_entries);
 }
 
 static void
@@ -1979,8 +2037,9 @@ vtvk_emit_rt_closest_hit(nir_builder *b,
 
    nir_def *index =
       vtvk_load_rt_shader_record_group_index(b, result->hit_shader_record_ptr);
-   vtvk_inline_rt_callback_shader_with_index(b, cb->shaders->closest_hit,
-                                             index);
+   vtvk_emit_rt_callback_shader_with_index(
+      b, cb->shaders->closest_hit, index, result->hit_shader_record_ptr,
+      cb->independent_terminal_entries);
 }
 
 static void
@@ -2329,10 +2388,13 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                    &cb_shaders);
    vtvk_rt_pipeline_callback_data cb_data = {
       .shaders = &cb_shaders,
+      .independent_terminal_entries = single_elf_multi_entry,
    };
    std::vector<nir_shader *> linked_entry_shaders;
    std::vector<const char *> linked_entry_symbols;
+   std::vector<vtvk_rt_callback_shader_entry> linked_entries;
    bool uses_callable_entry = false;
+   bool uses_terminal_entry = false;
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -2361,6 +2423,25 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       }
+      if (!vtvk_prepare_rt_independent_entries(
+             cb_shaders.miss, pipeline->nir_mem_ctx,
+             &linked_entry_shaders, &linked_entry_symbols) ||
+          !vtvk_prepare_rt_independent_entries(
+             cb_shaders.closest_hit, pipeline->nir_mem_ctx,
+             &linked_entry_shaders, &linked_entry_symbols)) {
+         mesa_loge("ventus-vk: independent terminal-entry preparation failed");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+      uses_terminal_entry = !cb_shaders.miss.empty() ||
+                            !cb_shaders.closest_hit.empty();
+      linked_entries.insert(linked_entries.end(), cb_shaders.callable.begin(),
+                            cb_shaders.callable.end());
+      linked_entries.insert(linked_entries.end(), cb_shaders.miss.begin(),
+                            cb_shaders.miss.end());
+      linked_entries.insert(linked_entries.end(),
+                            cb_shaders.closest_hit.begin(),
+                            cb_shaders.closest_hit.end());
    } else if (!vtvk_lower_rt_callable_invocations(
                  pipeline->shaders, pipeline->shader_count,
                  cb_shaders.callable)) {
@@ -2445,17 +2526,19 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          resident_continuation.max_callable_frame_bytes;
       pipeline->rt_v5_continuation_stack_bytes =
          resident_continuation.stack_bytes_per_thread;
-      if (uses_callable_entry) {
-         pipeline->rt_v5_callable_frame_offset =
+      if (uses_callable_entry || uses_terminal_entry) {
+         pipeline->rt_v5_entry_frame_offset =
             pipeline->rt_v5_continuation_stack_bytes;
          pipeline->rt_v5_continuation_stack_bytes = ALIGN_POT(
             pipeline->rt_v5_continuation_stack_bytes +
-               VTVK_RT_CALLABLE_FRAME_BYTES,
+               VTVK_RT_ENTRY_FRAME_BYTES,
             VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES);
+      }
+      if (uses_callable_entry) {
          pipeline->rt_v5_feature_flags |=
             VENTUS_RT_RESOURCE_USES_CALLABLE_CONTINUATION;
          pipeline->rt_v5_max_callable_frame_bytes =
-            VTVK_RT_CALLABLE_FRAME_BYTES;
+            VTVK_RT_ENTRY_FRAME_BYTES;
       }
    }
 
@@ -2671,8 +2754,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          linked_entry_symbols.data() : NULL,
       .entry_point_count = single_elf_multi_entry ?
          (unsigned)linked_entry_symbols.size() : 0,
-      .rt_callable_frame_offset_per_thread =
-         uses_callable_entry ? pipeline->rt_v5_callable_frame_offset : 0,
+      .rt_entry_frame_offset_per_thread =
+         (uses_callable_entry || uses_terminal_entry) ?
+            pipeline->rt_v5_entry_frame_offset : 0,
    };
 
    pipeline->llvm_module =
@@ -2687,7 +2771,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }
-   if (!vtvk_resolve_rt_shader_entries(pipeline, cb_shaders.callable)) {
+   if (!vtvk_resolve_rt_shader_entries(pipeline, linked_entries)) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
    }

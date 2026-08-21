@@ -122,15 +122,18 @@ ventus_rt_v5_compact_result(enum ventus_rt_v5_return_reason reason)
 static inline bool
 ventus_rt_v5_shader_entry_target(const uint32_t *entry_refs,
                                  const uint64_t *entry_targets,
-                                 uint32_t entry_count, uint32_t entry_ref,
+                                 const uint32_t *entry_stages,
+                                 uint32_t entry_count, uint32_t entry_stage,
+                                 uint32_t entry_ref,
                                  uint64_t *target)
 {
-   if (!entry_refs || !entry_targets || !target)
+   if (!entry_refs || !entry_targets || !entry_stages || !target)
       return false;
 
    *target = 0;
    for (uint32_t i = 0; i < entry_count; i++) {
-      if (entry_refs[i] == entry_ref && entry_targets[i] != 0) {
+      if (entry_stages[i] == entry_stage && entry_refs[i] == entry_ref &&
+          entry_targets[i] != 0) {
          *target = entry_targets[i];
          return true;
       }
@@ -235,9 +238,9 @@ ventus_rt_v5_pds_backing_layout(
    layout->compiler_stack_bytes_per_wg = stack_bytes;
    layout->static_bytes_per_wg = static_bytes;
    layout->total_bytes_per_wg = total_bytes;
-   /* Ventus private-memory offsets grow from the compiler/static prefix into
-    * the spill area.  Keep CSR_PDS at the allocation base so both RT PDS
-    * accesses and compiler-generated private spills use that convention. */
+   /* The compiler reserves the static RT prefix before its call-frame area.
+    * Keep CSR_PDS at the allocation base so hot-PDS and compiler-generated
+    * private/call-frame accesses share the emitted layout. */
    layout->csr_base = allocation_base;
    return true;
 }

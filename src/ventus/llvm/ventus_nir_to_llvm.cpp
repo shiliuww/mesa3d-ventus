@@ -131,8 +131,8 @@ public:
            options ? options->rt_continuation_bytes_per_thread : 0),
         rtPayloadBytes(options ? options->rt_payload_size_bytes : 0),
         rtCallableDataBytes(options ? options->rt_callable_data_size_bytes : 0),
-        rtCallableFrameOffset(
-           options ? options->rt_callable_frame_offset_per_thread : 0),
+        rtEntryFrameOffset(
+           options ? options->rt_entry_frame_offset_per_thread : 0),
         entryPointName(options && options->entry_point_name ?
                        options->entry_point_name : ""),
         entryPointIsKernel(options && options->entry_point_is_kernel),
@@ -230,7 +230,7 @@ private:
    uint32_t rtContinuationBytes;
    uint32_t rtPayloadBytes;
    uint32_t rtCallableDataBytes;
-   uint32_t rtCallableFrameOffset;
+   uint32_t rtEntryFrameOffset;
    std::string entryPointName;
    bool entryPointIsKernel;
    const char *const *entryPointNames;
@@ -2176,10 +2176,10 @@ private:
       case nir_intrinsic_ventus_rt_hot_pds_address: {
          return rtHotPdsAddress(value(intrin->src[0]));
       }
-      case nir_intrinsic_ventus_rt_callable_frame_address: {
+      case nir_intrinsic_ventus_rt_entry_frame_address: {
          return builder.CreateZExt(
             rtHotPdsAddress(ConstantInt::get(
-               i32, VENTUS_RT_V5_PDS_SIZE_BYTES + rtCallableFrameOffset)),
+               i32, VENTUS_RT_V5_PDS_SIZE_BYTES + rtEntryFrameOffset)),
             i64);
       }
       case nir_intrinsic_ventus_rt_call_shader_entry: {
