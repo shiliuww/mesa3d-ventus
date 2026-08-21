@@ -265,7 +265,7 @@ main()
    bool found_v5_pds_csr = false;
    bool found_v5_lds_csr = false;
    bool found_v5_thread_id = false;
-   bool found_v5_pds_stride = false;
+   bool found_v5_pds_static_stride = false;
    unsigned v5_global_pds_store_count = 0;
    unsigned v5_shared_store_count = 0;
    unsigned v5_canonical_shared_store_count = 0;
@@ -288,8 +288,8 @@ main()
                for (const llvm::Use &operand : binary->operands()) {
                   const auto *constant =
                      llvm::dyn_cast<llvm::ConstantInt>(operand.get());
-                  found_v5_pds_stride |=
-                     constant && constant->getZExtValue() == 384;
+                  found_v5_pds_static_stride |=
+                     constant && constant->getZExtValue() == 768;
                }
             }
             auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
@@ -329,7 +329,7 @@ main()
    VT_RT_CHECK(found_v5_pds_csr);
    VT_RT_CHECK(found_v5_lds_csr);
    VT_RT_CHECK(found_v5_thread_id);
-   VT_RT_CHECK(found_v5_pds_stride);
+   VT_RT_CHECK(found_v5_pds_static_stride);
    VT_RT_CHECK(v5_global_pds_store_count == 24);
    VT_RT_CHECK(v5_shared_store_count == 17);
    VT_RT_CHECK(v5_canonical_shared_store_count == v5_shared_store_count);

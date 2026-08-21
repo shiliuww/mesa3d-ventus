@@ -162,6 +162,10 @@ typedef void (*vt_nir_rt_emit_shader_cb)(nir_builder *b,
 struct vt_nir_rt_config {
    enum vt_rt_execution_model execution_model;
    bool use_v5_pds;
+   bool use_v5_resident_continuations;
+   uint32_t v5_continuation_scratch_bytes;
+   uint32_t v5_continuation_state_frame_stride_bytes;
+   uint32_t v5_payload_size_bytes;
    struct vt_nir_scratchpad_layout scratchpad[VT_RT_LAYOUT_COUNT];
    uint64_t hit_sbt_base_addr;
    uint32_t hit_sbt_record_stride;
@@ -450,11 +454,14 @@ struct vt_nir_rt_resident_continuation_info {
    nir_shader *lowered_initial_shader;
    nir_shader **resume_shaders;
    struct vt_nir_rt_continuation_site *sites;
+   uint32_t *token_to_call;
    uint32_t resume_shader_count;
    uint32_t site_count;
    uint32_t feature_flags;
    uint32_t max_trace_frame_bytes;
    uint32_t max_callable_frame_bytes;
+   uint32_t scratch_bytes_per_thread;
+   uint32_t state_frame_stride_bytes;
    uint32_t stack_bytes_per_thread;
 };
 
@@ -471,6 +478,25 @@ bool vt_nir_plan_rt_resident_continuations(
    const nir_shader *shader, uint32_t max_ray_recursion_depth,
    uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
    struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx);
+
+/* Append V5 terminal callback continuations while TraceRayEXT still carries
+ * its dereferenced payload variable.  The inserted compiler-private return
+ * marker records the exact payload subrange returned by each child trace. */
+bool vt_nir_prepare_rt_resident_continuations(
+   nir_shader *shader, const struct vt_nir_rt_config *config);
+
+/* Lower resident trace calls in place.  Mesa's shader-call liveness pass
+ * provides selective SSA spill/reload while preserving the original CFG. */
+bool vt_nir_lower_rt_resident_continuations(
+   nir_shader *shader, uint32_t max_ray_recursion_depth,
+   uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
+   struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx);
+
+/* Bind compiler-private scratch and parent-PDS frames to the per-thread V5
+ * continuation range and remove all resident-continuation pseudo intrinsics. */
+bool vt_nir_materialize_rt_resident_continuations(
+   nir_shader *shader, const struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_resident_continuation_info *info);
 
 enum vt_nir_rt_canonicalize_status {
    VT_NIR_RT_CANONICALIZE_SUCCESS = 0,

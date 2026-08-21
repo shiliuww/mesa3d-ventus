@@ -281,6 +281,27 @@ vtvk_rt_lower_abi_with_probe(nir_shader *shader,
       return;
    }
 
+   if (config->use_v5_pds &&
+       shader->info.stage == MESA_SHADER_RAYGEN) {
+      /* Resident terminal callbacks are already inlined here.  Their
+       * stage-specific call-data and hit-attribute variables are temporarily
+       * invalid in a raygen shader until the complete ABI batch consumes
+       * both classes, so do not validate between the individual subpasses. */
+      vt_nir_lower_rt_payload(shader, config);
+      vt_nir_lower_rt_hit_record(shader, config);
+      vt_nir_lower_rt_control(shader, config);
+      vt_nir_lower_shader_record_ptr(shader, config);
+      vt_nir_lower_shader_scratch(shader, config);
+      nir_remove_dead_variables(shader,
+                                nir_var_shader_temp |
+                                   nir_var_shader_call_data |
+                                   nir_var_ray_hit_attrib,
+                                NULL);
+      vtvk_rt_finalize_abi(shader, config);
+      vtvk_rt_log_nir_stats(shader, "after resident V5 RT ABI lowering");
+      return;
+   }
+
    vtvk_rt_log_nir_stats(shader, "before vt_nir_lower_rt_payload");
    NIR_PASS(_, shader, vt_nir_lower_rt_payload, config);
    vtvk_rt_log_nir_stats(shader, "after vt_nir_lower_rt_payload");
@@ -1953,14 +1974,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
-   if (v5_megakernel && pipeline->max_ray_recursion_depth > 1) {
-      mesa_loge("ventus-vk: V5 MegaKernel recursion depth %u requires the "
-                "production continuation package (current limit is 1)",
-                pipeline->max_ray_recursion_depth);
-      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-   }
-
    pipeline->shaders =
       (nir_shader **)vk_zalloc2(&device->vk.alloc, pAllocator,
                                 sizeof(nir_shader *) * info->stageCount, 8,
@@ -1990,6 +2003,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_rt_callback_shaders cb_shaders = {};
    vtvk_collect_rt_callback_shaders(info, pipeline->shaders, pipeline->shader_count,
                                    &cb_shaders);
+   vtvk_rt_pipeline_callback_data cb_data = {
+      .shaders = &cb_shaders,
+   };
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -2006,48 +2022,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    }
    pipeline->rt_payload_size_bytes = ray_payload_size;
    pipeline->rt_callable_data_size_bytes = callable_data_size;
-
-   if (ray_payload_size <= VENTUS_RT_MAX_PAYLOAD_BYTES_V5 &&
-       callable_data_size <= VENTUS_RT_MAX_CALLABLE_DATA_BYTES_V5) {
-      for (uint32_t s = 0; s < pipeline->shader_count; s++) {
-         void *plan_mem_ctx = ralloc_context(nullptr);
-         struct vt_nir_rt_resident_continuation_info resident = {};
-         const bool planned = plan_mem_ctx &&
-            vt_nir_plan_rt_resident_continuations(
-                pipeline->shaders[s], pipeline->max_ray_recursion_depth,
-                ray_payload_size, callable_data_size, &resident,
-                plan_mem_ctx);
-         if (!planned) {
-            ralloc_free(plan_mem_ctx);
-            mesa_loge("ventus-vk: RT resident continuation planning failed "
-                      "for stage %u", s);
-            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-         }
-         pipeline->rt_v5_feature_flags |= resident.feature_flags;
-         pipeline->rt_v5_max_trace_frame_bytes =
-            MAX2(pipeline->rt_v5_max_trace_frame_bytes,
-                 resident.max_trace_frame_bytes);
-         pipeline->rt_v5_max_callable_frame_bytes =
-            MAX2(pipeline->rt_v5_max_callable_frame_bytes,
-                 resident.max_callable_frame_bytes);
-         ralloc_free(plan_mem_ctx);
-      }
-
-      uint64_t resident_stack =
-         (uint64_t)pipeline->rt_v5_max_trace_frame_bytes *
-            pipeline->max_ray_recursion_depth +
-         pipeline->rt_v5_max_callable_frame_bytes;
-      if (resident_stack > UINT32_MAX) {
-         mesa_loge("ventus-vk: RT resident continuation envelope overflows "
-                   "the V5 resource contract");
-         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-      }
-      pipeline->rt_v5_continuation_stack_bytes =
-         ALIGN_POT((uint32_t)resident_stack,
-                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES);
-   }
 
    if (!vtvk_lower_rt_callable_invocations(
           pipeline->shaders, pipeline->shader_count, cb_shaders.callable)) {
@@ -2074,16 +2048,23 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
 
-   if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
-      mesa_logi("ventus-vk: RT ABI v4 hitattr=%u bary=%u payload-union=%u "
-                "ray-payload=%u callable-data=%u depth=%u spill=%u "
-                "private-base=%u V5-continuation=%u",
-                rt_abi.hit_attrib_size_bytes,
-                rt_abi.hit_attrib_barycentrics ? 1 : 0,
-                rt_abi.payload_size_bytes, ray_payload_size,
-                callable_data_size, rt_abi.max_ray_recursion_depth,
-                rt_abi.payload_spill_size_bytes, rt_abi.private_base_bytes,
-                pipeline->rt_v5_continuation_stack_bytes);
+   struct vt_nir_rt_resident_continuation_info resident_continuation = {};
+   if (v5_megakernel) {
+      struct vt_nir_rt_config resident_config = vt_nir_rt_default_config();
+      vt_nir_rt_config_apply_abi_layout(&resident_config, &rt_abi);
+      resident_config.use_v5_pds = true;
+      resident_config.enable_monolithic_shader_callbacks = true;
+      resident_config.emit_miss =
+         cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
+      resident_config.emit_closest_hit =
+         cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
+      resident_config.callback_data = &cb_data;
+      if (!vt_nir_prepare_rt_resident_continuations(
+             cb_shaders.raygen, &resident_config)) {
+         mesa_loge("ventus-vk: V5 resident trace continuation preparation failed");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
    }
 
    const bool global_wavefront =
@@ -2109,6 +2090,36 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
    }
 
+   if (v5_megakernel) {
+      if (!vt_nir_lower_rt_resident_continuations(
+             cb_shaders.raygen, pipeline->max_ray_recursion_depth,
+             ray_payload_size, callable_data_size, &resident_continuation,
+             pipeline->nir_mem_ctx)) {
+         mesa_loge("ventus-vk: V5 resident trace continuation lowering failed");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+      pipeline->rt_v5_feature_flags = resident_continuation.feature_flags;
+      pipeline->rt_v5_max_trace_frame_bytes =
+         resident_continuation.max_trace_frame_bytes;
+      pipeline->rt_v5_max_callable_frame_bytes =
+         resident_continuation.max_callable_frame_bytes;
+      pipeline->rt_v5_continuation_stack_bytes =
+         resident_continuation.stack_bytes_per_thread;
+   }
+
+   if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+      mesa_logi("ventus-vk: RT ABI v4 hitattr=%u bary=%u payload-union=%u "
+                "ray-payload=%u callable-data=%u depth=%u spill=%u "
+                "private-base=%u V5-continuation=%u",
+                rt_abi.hit_attrib_size_bytes,
+                rt_abi.hit_attrib_barycentrics ? 1 : 0,
+                rt_abi.payload_size_bytes, ray_payload_size,
+                callable_data_size, rt_abi.max_ray_recursion_depth,
+                rt_abi.payload_spill_size_bytes, rt_abi.private_base_bytes,
+                pipeline->rt_v5_continuation_stack_bytes);
+   }
+
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
@@ -2118,9 +2129,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
       }
 
-      vtvk_rt_pipeline_callback_data cb_data = {
-         .shaders = &cb_shaders,
-      };
       if (global_wavefront) {
          /* Keep the terminal SBT dispatch in the root continuation.  CPS
           * sees the original TraceRayEXT, then resumes into the dynamically
@@ -2195,9 +2203,17 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                "raygen after global wavefront producer");
       } else {
          rt_io_config.enable_monolithic_shader_callbacks = true;
-         rt_io_config.emit_miss = cb_shaders.miss.empty() ? NULL : vtvk_emit_rt_miss;
+         rt_io_config.use_v5_resident_continuations = v5_megakernel;
+         rt_io_config.v5_continuation_scratch_bytes =
+            resident_continuation.scratch_bytes_per_thread;
+         rt_io_config.v5_continuation_state_frame_stride_bytes =
+            resident_continuation.state_frame_stride_bytes;
+         rt_io_config.v5_payload_size_bytes = ray_payload_size;
+         rt_io_config.emit_miss = v5_megakernel || cb_shaders.miss.empty() ?
+            NULL : vtvk_emit_rt_miss;
          rt_io_config.emit_closest_hit =
-            cb_shaders.closest_hit.empty() ? NULL : vtvk_emit_rt_closest_hit;
+            v5_megakernel || cb_shaders.closest_hit.empty() ?
+               NULL : vtvk_emit_rt_closest_hit;
          rt_io_config.emit_any_hit =
             cb_shaders.any_hit.empty() ? NULL : vtvk_emit_rt_any_hit;
          rt_io_config.emit_intersection =
@@ -2208,6 +2224,14 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                "raygen before vt_nir_lower_rt_io_monolithic");
          NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
                   &rt_io_config);
+         if (v5_megakernel &&
+             !vt_nir_materialize_rt_resident_continuations(
+                cb_shaders.raygen, &rt_io_config,
+                &resident_continuation)) {
+            mesa_loge("ventus-vk: V5 resident continuation materialization failed");
+            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+            return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+         }
          vtvk_rt_log_nir_stats(cb_shaders.raygen,
                                "raygen after vt_nir_lower_rt_io_monolithic");
       }
@@ -2251,11 +2275,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
       .private_base_bytes = global_wavefront ? 0 :
-         (v5_megakernel ? VENTUS_RT_V5_PDS_SIZE_BYTES :
+         (v5_megakernel ? VENTUS_RT_V5_PDS_SIZE_BYTES +
+                             pipeline->rt_v5_continuation_stack_bytes :
                           rt_abi.private_base_bytes),
       .emit_rt_resource_v4 = v5_megakernel,
       .rt_feature_flags = v5_megakernel ?
-         (uint32_t)VENTUS_RT_RESOURCE_USES_TRAVERSAL : 0,
+         pipeline->rt_v5_feature_flags : 0,
       .rt_pds_layout_id = v5_megakernel ? VENTUS_RT_PDS_LAYOUT_V5 : 0,
       .rt_private_layout_id = v5_megakernel ?
          VENTUS_RT_PRIVATE_LAYOUT_V5 : 0,
@@ -2264,7 +2289,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          VENTUS_RT_V5_PDS_SIZE_BYTES : 0,
       .rt_continuation_offset_per_thread = v5_megakernel ?
          VENTUS_RT_V5_PDS_SIZE_BYTES : 0,
-      .rt_continuation_bytes_per_thread = 0,
+      .rt_continuation_bytes_per_thread = v5_megakernel ?
+         pipeline->rt_v5_continuation_stack_bytes : 0,
       .rt_payload_size_bytes = v5_megakernel ? ray_payload_size : 0,
       .rt_callable_data_size_bytes = v5_megakernel ? callable_data_size : 0,
    };

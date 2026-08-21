@@ -782,6 +782,12 @@ intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
           bit_sizes=[32])
 intrinsic("ventus_rt_hot_pds_address", src_comp=[1], dest_comp=1,
           bit_sizes=[32])
+# Compiler-private token paired with ventus_rt_continuation_return.  It stays
+# adjacent to a TraceRayEXT call until generic call lowering assigns call_idx.
+intrinsic("ventus_rt_continuation_begin", src_comp=[1])
+# Compiler-private marker delimiting the return side of a resident trace call.
+# src[] = { call_site, payload_byte_offset, payload_byte_size }
+intrinsic("ventus_rt_continuation_return", src_comp=[1, 1, 1])
 intrinsic("ventus_rt_release", src_comp=[1])
 # Global-wavefront producer doorbell.  The source is the lane's global submit
 # mailbox address; it is valid only after the producer has published VALID.

@@ -1615,6 +1615,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.width = info->width;
    args.height = info->height;
    args.depth = info->depth;
+   args.max_ray_recursion_depth = info->max_ray_recursion_depth;
    args.image_format = info->image_format;
    args.image_stride = image_width * image_bpp;
    args.camera_size = info->camera_range;

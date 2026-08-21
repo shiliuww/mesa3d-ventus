@@ -1986,6 +1986,34 @@ nir_lower_shader_calls(nir_shader *shader,
    NIR_PASS(_, shader, nir_opt_sort_and_pack_stack,
             start_call_scratch, options->stack_alignment, num_calls);
 
+   if (options->preserve_inline_resume) {
+      NIR_PASS(_, shader, nir_opt_remove_respills);
+
+      if (options->localized_loads)
+         NIR_PASS(_, shader, nir_opt_stack_loads);
+
+      struct stack_op_vectorizer_state vectorizer_state = {
+         .driver_callback = options->vectorizer_callback,
+         .driver_data = options->vectorizer_data,
+      };
+      nir_load_store_vectorize_options vect_opts = {
+         .modes = nir_var_shader_temp,
+         .callback = should_vectorize,
+         .cb_data = &vectorizer_state,
+      };
+      if (options->vectorizer_callback != NULL) {
+         NIR_PASS(_, shader, nir_split_stack_components);
+         NIR_PASS(_, shader, nir_opt_load_store_vectorize, &vect_opts);
+      }
+      NIR_PASS(_, shader, nir_lower_stack_to_scratch,
+               options->address_format);
+      nir_opt_cse(shader);
+
+      *resume_shaders_out = NULL;
+      *num_resume_shaders_out = 0;
+      return true;
+   }
+
    /* Make N copies of our shader */
    nir_shader **resume_shaders = ralloc_array(mem_ctx, nir_shader *, num_calls);
    for (unsigned i = 0; i < num_calls; i++) {

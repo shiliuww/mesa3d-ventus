@@ -11,10 +11,6 @@
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_v5.h"
 
-#define VT_RT_V5_CONTINUATION_HEADER_BYTES 16u
-#define VT_RT_V5_TRACE_PDS_PREFIX_BYTES 96u
-#define VT_RT_V5_TRACE_COMMITTED_BYTES 96u
-
 static bool
 remove_nonresident_call_for_analysis(nir_builder *b,
                                      nir_intrinsic_instr *intrin, void *data)
@@ -41,15 +37,55 @@ align_u32(uint32_t value, uint32_t alignment, uint32_t *result)
 }
 
 static bool
+resident_state_frame_stride(uint32_t payload_size_bytes, uint32_t *stride)
+{
+   const uint64_t bytes = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES +
+                          VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                          VENTUS_RT_V5_TRACE_COMMITTED_BYTES +
+                          payload_size_bytes;
+   return bytes <= UINT32_MAX &&
+          align_u32((uint32_t)bytes,
+                    VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES, stride);
+}
+
+static bool
+count_trace_calls(nir_shader *shader, uint32_t *count)
+{
+   uint32_t calls = 0;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+         case nir_intrinsic_trace_ray:
+            calls++;
+            break;
+         case nir_intrinsic_execute_callable:
+         case nir_intrinsic_report_ray_intersection:
+            return false;
+         default:
+            break;
+         }
+      }
+   }
+   *count = calls;
+   return true;
+}
+
+static bool
 resident_site_frame_size(enum vt_nir_rt_continuation_kind kind,
                          uint32_t ssa_spill_bytes,
                          uint32_t payload_size_bytes,
                          uint32_t *frame_size_bytes)
 {
-   uint64_t fixed_bytes = VT_RT_V5_CONTINUATION_HEADER_BYTES;
+   uint64_t fixed_bytes = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
    if (kind == VT_NIR_RT_TRACE_CONTINUATION)
-      fixed_bytes += VT_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                     VT_RT_V5_TRACE_COMMITTED_BYTES;
+      fixed_bytes += VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                     VENTUS_RT_V5_TRACE_COMMITTED_BYTES;
    fixed_bytes += payload_size_bytes;
    if (fixed_bytes > UINT32_MAX - ssa_spill_bytes)
       return false;
@@ -110,8 +146,8 @@ collect_resident_sites(
             .ssa_spill_bytes = ssa_spill_bytes,
             .parent_pds_save_bytes =
                kind == VT_NIR_RT_TRACE_CONTINUATION ?
-                  VT_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                     VT_RT_V5_TRACE_COMMITTED_BYTES : 0,
+                  VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                     VENTUS_RT_V5_TRACE_COMMITTED_BYTES : 0,
             .parent_payload_save_bytes = payload_size_bytes,
             .return_data_bytes =
                kind == VT_NIR_RT_TRACE_CONTINUATION ?
@@ -131,6 +167,56 @@ collect_resident_sites(
                MAX2(info->max_callable_frame_bytes, frame_size_bytes);
          }
       }
+   }
+   return true;
+}
+
+static bool
+map_resident_tokens(nir_shader *shader,
+                    struct vt_nir_rt_resident_continuation_info *info,
+                    void *mem_ctx)
+{
+   uint32_t *tokens = ralloc_array(mem_ctx, uint32_t, info->site_count);
+   uint32_t *calls = ralloc_array(mem_ctx, uint32_t, info->site_count);
+   bool *seen = rzalloc_array(mem_ctx, bool, info->site_count);
+   info->token_to_call = ralloc_array(mem_ctx, uint32_t, info->site_count);
+   if (!tokens || !calls || !seen || !info->token_to_call)
+      return false;
+
+   uint32_t token_count = 0;
+   uint32_t call_count = 0;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         if (intrin->intrinsic ==
+             nir_intrinsic_ventus_rt_continuation_begin) {
+            if (token_count >= info->site_count ||
+                !nir_src_is_const(intrin->src[0]))
+               return false;
+            const uint32_t token = nir_src_as_uint(intrin->src[0]);
+            if (token >= info->site_count || seen[token])
+               return false;
+            tokens[token_count++] = token;
+            seen[token] = true;
+         } else if (intrin->intrinsic == nir_intrinsic_rt_trace_ray) {
+            if (call_count >= info->site_count)
+               return false;
+            const uint32_t call = nir_intrinsic_call_idx(intrin);
+            if (call >= info->site_count)
+               return false;
+            calls[call_count++] = call;
+         }
+      }
+   }
+   if (token_count != info->site_count || call_count != info->site_count)
+      return false;
+   for (uint32_t i = 0; i < info->site_count; i++) {
+      if (!seen[i])
+         return false;
+      info->token_to_call[tokens[i]] = calls[i];
    }
    return true;
 }
@@ -200,6 +286,76 @@ vt_nir_plan_rt_resident_continuations(
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->stack_bytes_per_thread))
       return false;
+   return true;
+}
+
+bool
+vt_nir_lower_rt_resident_continuations(
+   nir_shader *shader, uint32_t max_ray_recursion_depth,
+   uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
+   struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx)
+{
+   if (!shader || !info || !mem_ctx ||
+       payload_size_bytes > VENTUS_RT_MAX_PAYLOAD_BYTES_V5 ||
+       callable_data_size_bytes > VENTUS_RT_MAX_CALLABLE_DATA_BYTES_V5)
+      return false;
+   *info = (struct vt_nir_rt_resident_continuation_info) {0};
+   info->lowered_initial_shader = shader;
+
+   uint32_t site_count = 0;
+   if (!count_trace_calls(shader, &site_count))
+      return false;
+   if (site_count == 0)
+      return true;
+   if (max_ray_recursion_depth == 0)
+      return false;
+
+   NIR_PASS(_, shader, nir_lower_vars_to_ssa);
+   const uint32_t ordinary_scratch_bytes = shader->scratch_size;
+   nir_shader **unused_resume_shaders = NULL;
+   uint32_t unused_resume_shader_count = 0;
+   const nir_lower_shader_calls_options options = {
+      .address_format = nir_address_format_32bit_offset,
+      .stack_alignment = VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+      .localized_loads = true,
+      .preserve_inline_resume = true,
+   };
+   if (!nir_lower_shader_calls(shader, &options, &unused_resume_shaders,
+                               &unused_resume_shader_count, mem_ctx) ||
+       unused_resume_shader_count != 0 || unused_resume_shaders != NULL)
+      return false;
+
+   info->site_count = site_count;
+   info->sites = rzalloc_array(mem_ctx, struct vt_nir_rt_continuation_site,
+                               site_count);
+   bool *seen = rzalloc_array(mem_ctx, bool, site_count);
+   if (!info->sites || !seen ||
+       !collect_resident_sites(shader, ordinary_scratch_bytes,
+                               payload_size_bytes, callable_data_size_bytes,
+                               info, seen))
+      return false;
+   for (uint32_t i = 0; i < site_count; i++) {
+      if (!seen[i] || info->sites[i].kind != VT_NIR_RT_TRACE_CONTINUATION)
+         return false;
+   }
+   if (!map_resident_tokens(shader, info, mem_ctx))
+      return false;
+
+   if (!align_u32(shader->scratch_size,
+                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+                  &info->scratch_bytes_per_thread) ||
+       !resident_state_frame_stride(payload_size_bytes,
+                                    &info->state_frame_stride_bytes))
+      return false;
+   const uint64_t state_bytes =
+      (uint64_t)site_count * info->state_frame_stride_bytes;
+   const uint64_t total = info->scratch_bytes_per_thread + state_bytes;
+   if (total > UINT32_MAX - VENTUS_RT_V5_PDS_SIZE_BYTES ||
+       !align_u32((uint32_t)total,
+                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+                  &info->stack_bytes_per_thread))
+      return false;
+
    return true;
 }
 

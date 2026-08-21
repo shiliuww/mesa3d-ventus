@@ -5800,6 +5800,13 @@ typedef struct nir_lower_shader_calls_options {
     */
    bool localized_loads;
 
+   /* Keep each call and its matching resume in the original control flow.
+    * This still spills values live across the call and lowers the stack to
+    * scratch, but does not clone resume shaders or replace resumes with halt.
+    * It is intended for resident, synchronously returning shader calls.
+    */
+   bool preserve_inline_resume;
+
    /* If this function pointer is not NULL, lower_shader_calls will run
     * nir_opt_load_store_vectorize for stack load/store operations. Otherwise
     * the optimizaion is not run.

@@ -297,6 +297,7 @@ main(int argc, char **argv)
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *v5_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *resident_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_loop_raygen = vt_rt_load_raygen_spirv(argv[2], &options);
@@ -552,6 +553,72 @@ main(int argc, char **argv)
                   v5_raygen,
                   VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET) == 1);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(v5_raygen));
+
+   struct vt_nir_rt_config resident_config = vt_nir_rt_default_config();
+   vt_nir_rt_config_apply_abi_layout(&resident_config, &abi);
+   resident_config.use_v5_pds = true;
+   resident_config.enable_monolithic_shader_callbacks = true;
+   nir_foreach_variable_in_shader(var, resident_raygen) {
+      if (var->data.mode == nir_var_shader_temp ||
+          var->data.mode == nir_var_shader_call_data) {
+         var->data.location = 0;
+         var->data.explicit_location = true;
+      }
+   }
+   VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
+      resident_raygen, &resident_config));
+   VT_RT_CHECK(vt_nir_lower_rt_payload(resident_raygen, &resident_config));
+   vt_nir_lower_rt_hit_record(resident_raygen, &resident_config);
+   vt_nir_lower_rt_control(resident_raygen, &resident_config);
+   vt_nir_lower_shader_record_ptr(resident_raygen, &resident_config);
+   vt_nir_lower_shader_scratch(resident_raygen, &resident_config);
+   struct vt_nir_rt_resident_continuation_info resident = {};
+   VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
+      resident_raygen, 1, linked_payload_size, 0, &resident, cps_mem_ctx));
+   VT_RT_CHECK(resident.site_count == 1);
+   VT_RT_CHECK(resident.resume_shader_count == 0);
+   VT_RT_CHECK(resident.state_frame_stride_bytes == 224);
+   VT_RT_CHECK(resident.stack_bytes_per_thread >= 224);
+   resident_config.use_v5_resident_continuations = true;
+   resident_config.v5_continuation_scratch_bytes =
+      resident.scratch_bytes_per_thread;
+   resident_config.v5_continuation_state_frame_stride_bytes =
+      resident.state_frame_stride_bytes;
+   resident_config.v5_payload_size_bytes = linked_payload_size;
+   VT_RT_CHECK(count_intrinsic(
+                  resident_raygen,
+                  nir_intrinsic_ventus_rt_continuation_begin) == 1);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_rt_trace_ray) == 1);
+   VT_RT_CHECK(count_intrinsic(
+                  resident_raygen,
+                  nir_intrinsic_ventus_rt_continuation_return) == 1);
+   VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(
+      resident_raygen, &resident_config));
+   VT_RT_CHECK(vt_nir_materialize_rt_resident_continuations(
+      resident_raygen, &resident_config, &resident));
+   nir_validate_shader(resident_raygen,
+                       "after Ventus resident V5 continuation lowering");
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_trace_ray) == 0);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_rt_trace_ray) == 0);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_rt_resume) == 0);
+   VT_RT_CHECK(count_intrinsic(
+                  resident_raygen,
+                  nir_intrinsic_ventus_rt_continuation_return) == 0);
+   VT_RT_CHECK(count_intrinsic(
+                  resident_raygen,
+                  nir_intrinsic_ventus_rt_continuation_begin) == 0);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_load_scratch) == 0);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_store_scratch) == 0);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_ventus_rt_traverse_v5) == 2);
+   VT_RT_CHECK(count_intrinsic(resident_raygen,
+                               nir_intrinsic_ventus_rt_release) == 1);
 
    struct vt_rt_intrinsic_counts closest_before;
    vt_rt_count_intrinsics(closest_hit, &closest_before);
@@ -838,6 +905,7 @@ main(int argc, char **argv)
 
    ralloc_free(raygen);
    ralloc_free(v5_raygen);
+   ralloc_free(resident_raygen);
    ralloc_free(cps_mem_ctx);
    ralloc_free(global_raygen);
    ralloc_free(global_callback_closest_hit);

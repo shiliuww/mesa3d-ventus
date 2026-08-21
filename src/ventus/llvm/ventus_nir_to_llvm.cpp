@@ -508,8 +508,17 @@ private:
                                       ConstantInt::get(i32, 31));
       Value *context =
          builder.CreateAdd(readVentusCsrI32("CSR_TID"), lane);
+      const uint64_t hotEnd =
+         uint64_t(rtHotPdsOffset) + uint64_t(rtHotPdsStride);
+      const uint64_t continuationEnd =
+         uint64_t(rtContinuationOffset) + uint64_t(rtContinuationBytes);
+      const uint64_t staticStride =
+         std::max(hotEnd, continuationEnd) ?
+            std::max(hotEnd, continuationEnd) :
+            VENTUS_RT_V5_PDS_SIZE_BYTES;
+      assert(staticStride <= UINT32_MAX);
       Value *frameOffset = builder.CreateMul(
-         context, ConstantInt::get(i32, VENTUS_RT_V5_PDS_SIZE_BYTES));
+         context, ConstantInt::get(i32, staticStride));
       return builder.CreateAdd(
          readVentusCsrI32("CSR_PDS"),
          builder.CreateAdd(frameOffset, asInt32(offset)));
