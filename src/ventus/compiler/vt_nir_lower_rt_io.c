@@ -4,6 +4,7 @@
  */
 
 #include "vt_nir.h"
+#include "ventus/common/ventus_rt_v5.h"
 
 #define VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT 0x8u
 
@@ -168,6 +169,136 @@ emit_trace_callbacks(nir_builder *b,
 }
 
 static bool
+lower_trace_ray_v5(nir_builder *b, nir_intrinsic_instr *intrin,
+                   struct lower_rt_io_state *state,
+                   const struct vt_nir_rt_trace_params *params,
+                   nir_def *dynamic_skip_closest_hit,
+                   bool constant_skip_closest_hit)
+{
+   const struct vt_nir_rt_config *config = state->config;
+   nir_def *launch_id = nir_load_ray_launch_id(b);
+   nir_def *lane_id =
+      nir_iand_imm(b, nir_channel(b, launch_id, 0),
+                   VENTUS_RT_V5_LANES_PER_WARP - 1);
+   nir_def *private_region_offset = load_dispatch_arg(
+      b, VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET, 32);
+   nir_def *private_state_address = vt_nir_rt_v5_private_address(
+      b, nir_imm_int(b, 0), private_region_offset, nir_imm_int(b, 0), lane_id);
+   nir_def *pds_address =
+      nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
+
+   vt_nir_store_active_level(b, config, VT_RT_LAYOUT_RAYGEN,
+                             nir_imm_int(b, state->trace_depth));
+   store_raygen_callback_decision(b, config, VT_RT_CALLBACK_PENDING);
+   const struct vt_nir_rt_v5_submit_result submit =
+      vt_nir_build_traversal_v5_submit(
+         b, params, pds_address, private_state_address);
+
+   nir_variable *compact_result_var = nir_local_variable_create(
+      b->impl, glsl_uint_type(), "ventus.v5.compact.result");
+   nir_store_var(b, compact_result_var, submit.compact_result, 0x1);
+
+   nir_loop *loop = nir_push_loop(b);
+   {
+      nir_def *compact_result = nir_load_var(b, compact_result_var);
+      nir_def *reason = nir_iand_imm(b, compact_result, 0xff);
+      nir_def *valid = nir_ine_imm(
+         b, nir_iand_imm(b, compact_result, VENTUS_RT_V5_COMPLETION_VALID), 0);
+      nir_def *complete_hit =
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_CLOSEST_HIT_READY);
+      nir_def *complete_miss =
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_MISS);
+      nir_def *hit_done =
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_HIT_DONE_NO_SHADER);
+      nir_def *candidate_non_opaque =
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_ANY_HIT_REQUIRED);
+      nir_def *candidate_procedural =
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_INTERSECTION_REQUIRED);
+      nir_def *candidate =
+         nir_ior(b, candidate_non_opaque, candidate_procedural);
+      nir_def *fault = nir_ior(
+         b, nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_FAULT),
+         nir_ieq_imm(b, reason, VENTUS_RT_V5_RETURN_UNSUPPORTED));
+      nir_def *terminal = nir_ior(
+         b, nir_inot(b, valid),
+         nir_ior(b, fault,
+                 nir_ior(b, hit_done,
+                         nir_ior(b, complete_hit, complete_miss))));
+
+      nir_def *candidate_instance_sbt =
+         vt_nir_load_candidate_hit_record_word(
+            b, config, VT_RT_LAYOUT_RAYGEN,
+            VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET, 32);
+      nir_def *committed_instance_sbt = vt_nir_load_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN,
+         VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET, 32);
+      nir_def *instance_sbt = nir_bcsel(
+         b, candidate, candidate_instance_sbt, committed_instance_sbt);
+      nir_def *candidate_geometry = vt_nir_load_candidate_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
+      nir_def *committed_geometry = vt_nir_load_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
+      nir_def *geometry =
+         nir_bcsel(b, candidate, candidate_geometry, committed_geometry);
+      nir_def *sbt_index = nir_iadd(
+         b, nir_iadd(b, instance_sbt,
+                     nir_imul(b, geometry, nir_u2u32(b, params->sbt_stride))),
+         nir_u2u32(b, params->sbt_offset));
+      nir_def *hit_record_ptr = vt_nir_build_hit_shader_record_ptr(
+         b, config, params, params->sbt_base, instance_sbt, geometry);
+      nir_def *miss_record_ptr =
+         vt_nir_build_miss_shader_record_ptr(b, config, params);
+      nir_def *candidate_t = vt_nir_load_candidate_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_HIT_T, 32);
+      nir_def *committed_t = vt_nir_load_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_HIT_T, 32);
+
+      struct vt_nir_rt_result result = {
+         .slot_base = pds_address,
+         .status = reason,
+         .hit = nir_ior(b, complete_hit, hit_done),
+         .hit_t = nir_bcsel(b, candidate, candidate_t, committed_t),
+         .sbt_index = sbt_index,
+         .instance_sbt_record_offset = instance_sbt,
+         .geometry_index = geometry,
+         .hit_shader_record_ptr = hit_record_ptr,
+         .miss_shader_record_ptr = miss_record_ptr,
+         .shader_record_ptr = nir_bcsel(
+            b, complete_miss, miss_record_ptr,
+            nir_bcsel(b, nir_ior(b, complete_hit, candidate), hit_record_ptr,
+                      nir_imm_int64(b, 0))),
+      };
+
+      emit_trace_callbacks(b, config, params, &result, complete_hit,
+                           complete_miss, candidate_non_opaque,
+                           candidate_procedural, dynamic_skip_closest_hit,
+                           constant_skip_closest_hit);
+
+      nir_push_if(b, terminal);
+      nir_jump(b, nir_jump_break);
+      nir_push_else(b, NULL);
+      nir_push_if(b, nir_inot(b, candidate));
+      nir_jump(b, nir_jump_break);
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
+
+      nir_store_var(
+         b, compact_result_var,
+         vt_nir_build_traversal_v5_resume(
+            b, pds_address, submit.private_state_address),
+         0x1);
+   }
+   nir_pop_loop(b, loop);
+
+   nir_push_if(b, submit.traverse_admitted);
+   nir_ventus_rt_release(b, pds_address);
+   nir_pop_if(b, NULL);
+
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+static bool
 lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
    if (intrin->intrinsic != nir_intrinsic_trace_ray)
@@ -206,8 +337,13 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       (nir_src_as_uint(intrin->src[1]) & VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
    nir_def *dynamic_skip_closest_hit =
       constant_flags ? NULL :
-                       trace_ray_has_flag(
+                          trace_ray_has_flag(
                           b, params.flags, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
+
+   if (config->use_v5_pds)
+      return lower_trace_ray_v5(
+         b, intrin, state, &params, dynamic_skip_closest_hit,
+         constant_skip_closest_hit);
 
    if (state->trace_depth > 0)
       copy_raygen_payload_level(b, config, state->trace_depth - 1,
@@ -446,8 +582,11 @@ vt_nir_lower_rt_io_monolithic(nir_shader *shader,
 
    }
 
-   if (progress)
+   if (progress && !config->use_v5_pds)
       progress |= insert_raygen_release_before_returns(shader, config);
+
+   if (progress && config->use_v5_pds)
+      nir_lower_vars_to_ssa(shader);
 
    if (progress) {
       nir_function_impl *impl = nir_shader_get_entrypoint(shader);

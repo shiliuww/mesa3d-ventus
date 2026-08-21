@@ -8,6 +8,7 @@
 #include "compiler/glsl_types.h"
 #include "nir/nir_deref.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "ventus/common/ventus_rt_v5.h"
 
 #include <limits.h>
 
@@ -41,9 +42,32 @@ uses_depth_relative_payload(const struct vt_lower_rt_var_state *state,
     * spill by active level.  Staged Dispatch gives each ray a distinct global
     * CPS frame, so adding the level again would escape that frame and would
     * also prevent the global-slot lowering from resolving the access. */
-   return state->mode != nir_var_function_temp && payload_size &&
+   return !state->config->use_v5_pds &&
+          state->mode != nir_var_function_temp && payload_size &&
           state->config->execution_model ==
              VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP;
+}
+
+static nir_def *
+v5_pds_address(nir_builder *b, uint32_t byte_offset)
+{
+   nir_def *base = nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
+   return nir_iadd_imm(b, nir_u2u64(b, base), byte_offset);
+}
+
+static nir_def *
+load_v5_pds_u32(nir_builder *b, uint32_t byte_offset)
+{
+   return nir_load_global(b, 1, 32, v5_pds_address(b, byte_offset),
+                          .align_mul = 4);
+}
+
+static void
+store_v5_pds_u32(nir_builder *b, uint32_t byte_offset, nir_def *value)
+{
+   nir_store_global(b, nir_u2u32(b, value),
+                    v5_pds_address(b, byte_offset),
+                    .write_mask = 0x1, .align_mul = 4);
 }
 
 static bool
@@ -93,6 +117,64 @@ vt_nir_load_ray_state_word(nir_builder *b,
                            enum vt_rt_shader_layout layout,
                            enum vt_rt_slot_word word)
 {
+   if (config->use_v5_pds) {
+      switch (word) {
+      case VT_RT_SLOT_ACCEL_LO:
+         return load_v5_pds_u32(
+            b, VENTUS_RT_V5_PDS_TRAVERSABLE_REFERENCE);
+      case VT_RT_SLOT_ACCEL_HI:
+         return load_v5_pds_u32(
+            b, VENTUS_RT_V5_PDS_TRAVERSABLE_REFERENCE + 4);
+      case VT_RT_SLOT_FLAGS:
+         return load_v5_pds_u32(b, VENTUS_RT_V5_PDS_RAY_FLAGS);
+      case VT_RT_SLOT_CULL_MASK:
+         return nir_iand_imm(
+            b, load_v5_pds_u32(
+                  b, VENTUS_RT_V5_PDS_TRACE_SELECTOR_CONTROL),
+            0xff);
+      case VT_RT_SLOT_SBT_OFFSET:
+         return nir_iand_imm(
+            b, nir_ushr_imm(
+                  b, load_v5_pds_u32(
+                        b, VENTUS_RT_V5_PDS_TRACE_SELECTOR_CONTROL),
+                  8),
+            0xf);
+      case VT_RT_SLOT_SBT_STRIDE:
+         return nir_iand_imm(
+            b, nir_ushr_imm(
+                  b, load_v5_pds_u32(
+                        b, VENTUS_RT_V5_PDS_TRACE_SELECTOR_CONTROL),
+                  12),
+            0xf);
+      case VT_RT_SLOT_MISS_INDEX:
+         return nir_ushr_imm(
+            b, load_v5_pds_u32(
+                  b, VENTUS_RT_V5_PDS_TRACE_SELECTOR_CONTROL),
+            16);
+      case VT_RT_SLOT_ORIGIN_X:
+      case VT_RT_SLOT_ORIGIN_Y:
+      case VT_RT_SLOT_ORIGIN_Z:
+      case VT_RT_SLOT_TMIN:
+      case VT_RT_SLOT_DIRECTION_X:
+      case VT_RT_SLOT_DIRECTION_Y:
+      case VT_RT_SLOT_DIRECTION_Z:
+      case VT_RT_SLOT_TMAX:
+         return load_v5_pds_u32(b, (uint32_t)word * sizeof(uint32_t));
+      case VT_RT_SLOT_PAYLOAD_PTR_LO:
+         return nir_u2u32(b, v5_pds_address(
+            b, VENTUS_RT_V5_PDS_CALL_DATA_BASE));
+      case VT_RT_SLOT_PAYLOAD_PTR_HI:
+         return nir_unpack_64_2x32_split_y(
+            b, v5_pds_address(b, VENTUS_RT_V5_PDS_CALL_DATA_BASE));
+      case VT_RT_SLOT_HIT_T:
+         return vt_nir_load_hit_record_word(
+            b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
+      case VT_RT_SLOT_SBT_INDEX:
+         return nir_imm_int(b, 0);
+      default:
+         return nir_imm_int(b, 0);
+      }
+   }
    const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
    return load_rt_slot_word(b, config, layout,
                             sp->ray_state_base_bytes + word * 4);
@@ -121,6 +203,8 @@ static nir_def *
 load_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                  uint32_t word)
 {
+   if (state->config->use_v5_pds)
+      return load_v5_pds_u32(b, state->base_offset + word * sizeof(uint32_t));
    enum vt_rt_shader_layout layout = current_layout(b);
    const struct vt_nir_scratchpad_layout *sp =
       &state->config->scratchpad[layout];
@@ -140,6 +224,10 @@ static void
 store_rt_var_word(nir_builder *b, const struct vt_lower_rt_var_state *state,
                   uint32_t word, nir_def *value)
 {
+   if (state->config->use_v5_pds) {
+      store_v5_pds_u32(b, state->base_offset + word * sizeof(uint32_t), value);
+      return;
+   }
    enum vt_rt_shader_layout layout = current_layout(b);
    const struct vt_nir_scratchpad_layout *sp =
       &state->config->scratchpad[layout];
@@ -604,7 +692,9 @@ vt_nir_lower_rt_payload(nir_shader *shader,
    }
 
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
-   uint32_t payload_base = config->scratchpad[layout].payload_base_bytes;
+   uint32_t payload_base = config->use_v5_pds ?
+      VENTUS_RT_V5_PDS_CALL_DATA_BASE :
+      config->scratchpad[layout].payload_base_bytes;
    nir_variable_mode payload_modes =
       nir_var_function_temp | nir_var_shader_call_data | nir_var_shader_temp;
    struct vt_payload_location_map payload_locations =

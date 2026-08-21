@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "nir/nir.h"
+#include "ventus/common/ventus_rt_v5.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
@@ -375,7 +376,8 @@ private:
 
    Value *sharedPtr(Value *addr)
    {
-      return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 3));
+      return builder.CreateIntToPtr(rtCanonicalSharedAddress(addr),
+                                    PointerType::get(context, 3));
    }
 
    Value *globalPtr(Value *addr)
@@ -492,6 +494,33 @@ private:
       return builder.CreateCall(type, read_mhartid, {});
    }
 
+   Value *readVentusCsrI32(StringRef csrName)
+   {
+      FunctionType *type = FunctionType::get(i32, false);
+      std::string assembly = "csrr $0, " + csrName.str();
+      InlineAsm *read = InlineAsm::get(type, assembly, "=r", false);
+      return builder.CreateCall(type, read, {});
+   }
+
+   Value *rtHotPdsAddress(Value *offset)
+   {
+      Value *lane = builder.CreateAnd(primaryDispatchPixelComponent(0),
+                                      ConstantInt::get(i32, 31));
+      Value *context =
+         builder.CreateAdd(readVentusCsrI32("CSR_TID"), lane);
+      Value *frameOffset = builder.CreateMul(
+         context, ConstantInt::get(i32, VENTUS_RT_V5_PDS_SIZE_BYTES));
+      return builder.CreateAdd(
+         readVentusCsrI32("CSR_PDS"),
+         builder.CreateAdd(frameOffset, asInt32(offset)));
+   }
+
+   Value *rtCanonicalSharedAddress(Value *offset)
+   {
+      return builder.CreateAdd(readVentusCsrI32("CSR_LDS"),
+                               asInt32(offset));
+   }
+
    Value *raygenLaunchIdComponent(unsigned i)
    {
       assert(i < 3);
@@ -542,7 +571,7 @@ private:
          raygenLaunchId[i] = primaryDispatchPixelComponent(i);
       }
 
-      if (!globalRtWavefront) {
+      if (!globalRtWavefront && !emitRtResourceV4) {
          storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_X, raygenLaunchId[0]);
          storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Y, raygenLaunchId[1]);
          storeI32PrivateSlot(VT_RT_SLOT_LAUNCH_ID_Z, raygenLaunchId[2]);
@@ -553,7 +582,7 @@ private:
    {
       if (noopRtIntrinsics)
          return ConstantAggregateZero::get(StructType::get(context, {i32, i32, i32}));
-      if (globalRtWavefront)
+      if (globalRtWavefront || emitRtResourceV4)
          return buildVector(3, i32, [&](unsigned i) {
             return raygenLaunchIdComponent(i);
          });
@@ -747,6 +776,25 @@ private:
                ConstantAsMetadata::get(ConstantInt::get(i32, 0)),
             };
             fn->setMetadata("ventus.rt.resource", MDNode::get(context, fields));
+
+            const uint64_t hotEnd =
+               uint64_t(rtHotPdsOffset) + uint64_t(rtHotPdsStride);
+            const uint64_t continuationEnd =
+               uint64_t(rtContinuationOffset) + uint64_t(rtContinuationBytes);
+            const uint64_t staticBytes = std::max(hotEnd, continuationEnd);
+            if (staticBytes) {
+               ArrayType *allocationType =
+                  ArrayType::get(Type::getInt8Ty(context), staticBytes);
+               auto *allocation = new GlobalVariable(
+                  module, allocationType, false, GlobalValue::InternalLinkage,
+                  UndefValue::get(allocationType),
+                  "__ventus_rt_pds_static." + name, nullptr,
+                  GlobalVariable::NotThreadLocal, 5);
+               allocation->setAlignment(Align(128));
+               Metadata *allocations[] = {ValueAsMetadata::get(allocation)};
+               fn->setMetadata("ventus.pds.static",
+                               MDNode::get(context, allocations));
+            }
          }
       }
       return fn;
@@ -1840,13 +1888,29 @@ private:
          return builder.CreateOr(builder.CreateZExt(asInt32(src(0)), i64),
                                  builder.CreateShl(builder.CreateZExt(asInt32(src(1)), i64),
                                                    ConstantInt::get(i64, 32)));
-      case nir_op_bcsel:
+      case nir_op_bcsel: {
+         auto selectValue = [&](Value *condition, Value *on_true,
+                                Value *on_false) {
+            if (on_true->getType() != on_false->getType()) {
+               if (on_true->getType()->isFloatingPointTy() ||
+                   on_false->getType()->isFloatingPointTy()) {
+                  on_true = asFloat(on_true);
+                  on_false = asFloat(on_false);
+               } else {
+                  on_true = asInt32(on_true);
+                  on_false = asInt32(on_false);
+               }
+            }
+            return builder.CreateSelect(condition, on_true, on_false);
+         };
+
          if (alu->def.num_components <= 1)
-            return builder.CreateSelect(asBool(src(0)), src(1), src(2));
+            return selectValue(asBool(src(0)), src(1), src(2));
          return buildVector(alu->def.num_components, i32, [&](unsigned i) {
-            return asInt32(builder.CreateSelect(asBool(src(0, i)), src(1, i),
-                                                src(2, i)));
+            return asInt32(
+               selectValue(asBool(src(0, i)), src(1, i), src(2, i)));
          });
+      }
       case nir_op_fdot2:
       case nir_op_fdot2_replicated:
       case nir_op_fdot3:
@@ -2086,7 +2150,11 @@ private:
                                 {i32, i32});
          return builder.CreateCall(fn,
                                    {asInt32(value(intrin->src[0])),
-                                    asInt32(value(intrin->src[1]))});
+                                    rtCanonicalSharedAddress(
+                                       value(intrin->src[1]))});
+      }
+      case nir_intrinsic_ventus_rt_hot_pds_address: {
+         return rtHotPdsAddress(value(intrin->src[0]));
       }
       case nir_intrinsic_ventus_rt_release: {
          if (noopRtIntrinsics)

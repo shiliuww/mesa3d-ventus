@@ -1307,6 +1307,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t args_dev_addr = 0;
    uint64_t metadata_dev_addr = 0;
    uint64_t pds_dev_addr = 0;
+   uint64_t pds_csr_base_addr = 0;
    uint64_t continuation_dev_addr = 0;
    uint64_t mailbox_dev_addr = 0;
    uint64_t global_queue_dev_addr = 0;
@@ -1954,6 +1955,26 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       if (!rv64 && !vtvk_bridge_require_rv32_range("legacy PDS", pds_dev_addr,
                                                     pds_image.size()))
          goto out;
+
+      pds_csr_base_addr = pds_dev_addr;
+      if (resource_envelope.has_rt_contract) {
+         struct ventus_rt_v5_pds_backing_layout pds_layout = {};
+         if (!ventus_rt_v5_pds_backing_layout(
+                pds_dev_addr, resource_envelope.pds_static_per_thread,
+                resource_envelope.pds_stack_size_per_thread,
+                vtvk_rt_lanes_per_warp, &pds_layout) ||
+             pds_layout.total_bytes_per_wg > pds_image.size()) {
+            mesa_loge("ventus-vk: V5 compiler-stack PDS bias exceeds the "
+                      "resident backing allocation");
+            goto out;
+         }
+         pds_csr_base_addr = pds_layout.csr_base;
+         mesa_logi("ventus-vk: V5 PDS backing=0x%" PRIx64
+                   " compiler-stack/wg=%" PRIu64
+                   " hot-base=0x%" PRIx64,
+                   pds_dev_addr, pds_layout.compiler_stack_bytes_per_wg,
+                   pds_csr_base_addr);
+      }
    } else if (pds_size) {
       if (!vtvk_driver_alloc_copy(&driver, NULL, pds_size, &pds_dev_addr)) {
          mesa_loge("ventus-vk: failed to allocate compiler private memory");
@@ -1963,6 +1984,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
           !vtvk_bridge_require_rv32_range("compiler private memory",
                                           pds_dev_addr, pds_size))
          goto out;
+      pds_csr_base_addr = pds_dev_addr;
    }
    if (driver.vt_copy_to_dev(driver.device, args_dev_addr, &args, sizeof(args),
                              0, 0) != 0) {
@@ -1999,7 +2021,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.pdsSize = pds_size_per_thread;
    kernel.sgprUsage = resource_envelope.sgpr_usage;
    kernel.vgprUsage = resource_envelope.vgpr_usage;
-   kernel.pdsBaseAddr = pds_dev_addr;
+   kernel.pdsBaseAddr = pds_csr_base_addr;
    kernel.num_thread_global[0] = info->width;
    kernel.num_thread_global[1] = info->height;
    kernel.num_thread_global[2] = info->depth;

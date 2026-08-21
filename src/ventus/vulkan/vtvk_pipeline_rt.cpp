@@ -1943,6 +1943,23 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->rt_uses_rv64 = device->rt_uses_rv64;
    pipeline->retain_generated_artifacts =
       vtvk_env_enabled("VENTUS_VK_RETAIN_SHADER_ARTIFACTS");
+   const bool v5_requested = vtvk_env_enabled("VENTUS_VK_RT_ABI_V5");
+   const bool v5_megakernel =
+      v5_requested &&
+      profile_config.profile == VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL;
+   if (v5_requested && !v5_megakernel) {
+      mesa_loge("ventus-vk: V5 resident ABI is only available for the "
+                "MegaKernel execution profile");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+   if (v5_megakernel && pipeline->max_ray_recursion_depth > 1) {
+      mesa_loge("ventus-vk: V5 MegaKernel recursion depth %u requires the "
+                "production continuation package (current limit is 1)",
+                pipeline->max_ray_recursion_depth);
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    pipeline->shaders =
       (nir_shader **)vk_zalloc2(&device->vk.alloc, pAllocator,
@@ -2076,6 +2093,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
+      config.use_v5_pds = v5_megakernel;
 
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&config, &rt_abi);
@@ -2094,6 +2112,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
+      rt_io_config.use_v5_pds = v5_megakernel;
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &rt_abi);
          rt_io_config.execution_model = VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER;
@@ -2218,7 +2237,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
-   pipeline->per_lane_scratch_size =
+   pipeline->per_lane_scratch_size = v5_megakernel ? 0 :
       MAX2(pipeline->per_lane_scratch_size, rt_abi.total_size_bytes);
    pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;
 
@@ -2231,7 +2250,23 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          "e-m:e-p:32:32-i64:64-n32-S128-A5-G1",
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
-      .private_base_bytes = global_wavefront ? 0 : rt_abi.private_base_bytes,
+      .private_base_bytes = global_wavefront ? 0 :
+         (v5_megakernel ? VENTUS_RT_V5_PDS_SIZE_BYTES :
+                          rt_abi.private_base_bytes),
+      .emit_rt_resource_v4 = v5_megakernel,
+      .rt_feature_flags = v5_megakernel ?
+         (uint32_t)VENTUS_RT_RESOURCE_USES_TRAVERSAL : 0,
+      .rt_pds_layout_id = v5_megakernel ? VENTUS_RT_PDS_LAYOUT_V5 : 0,
+      .rt_private_layout_id = v5_megakernel ?
+         VENTUS_RT_PRIVATE_LAYOUT_V5 : 0,
+      .rt_hot_pds_offset_per_thread = 0,
+      .rt_hot_pds_stride_bytes = v5_megakernel ?
+         VENTUS_RT_V5_PDS_SIZE_BYTES : 0,
+      .rt_continuation_offset_per_thread = v5_megakernel ?
+         VENTUS_RT_V5_PDS_SIZE_BYTES : 0,
+      .rt_continuation_bytes_per_thread = 0,
+      .rt_payload_size_bytes = v5_megakernel ? ray_payload_size : 0,
+      .rt_callable_data_size_bytes = v5_megakernel ? callable_data_size : 0,
    };
 
    pipeline->llvm_module =
@@ -2260,7 +2295,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    vtvk_fill_group_handles(pipeline, info);
 
    mesa_logi("ventus-vk: RT pipeline compiled via SPIR-V -> NIR -> "
-             "Ventus lowering -> LLVM; stages=%u groups=%u scratch=%u max_depth=%u llvm_functions=%zu",
+             "Ventus lowering -> LLVM; abi=%s stages=%u groups=%u scratch=%u "
+             "max_depth=%u llvm_functions=%zu",
+             v5_megakernel ? "V5" : "V4",
              info->stageCount, info->groupCount,
              pipeline->per_lane_scratch_size,
              pipeline->max_ray_recursion_depth,

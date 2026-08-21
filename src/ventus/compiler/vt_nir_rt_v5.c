@@ -27,8 +27,8 @@ load_global_u32(nir_builder *b, nir_def *base, uint32_t offset)
 static void
 store_pds_u32(nir_builder *b, nir_def *base, uint32_t offset, nir_def *value)
 {
-   nir_ventus_rt_store_slot(b, nir_u2u32(b, value),
-                            nir_iadd_imm(b, base, offset));
+   nir_store_global(b, nir_u2u32(b, value), add_u64_offset(b, base, offset),
+                    .write_mask = 0x1, .align_mul = 4);
 }
 
 static void
@@ -259,4 +259,13 @@ vt_nir_build_traversal_v5_submit(nir_builder *b,
       .private_state_address = private_state_address,
       .traverse_admitted = admitted,
    };
+}
+
+nir_def *
+vt_nir_build_traversal_v5_resume(nir_builder *b, nir_def *pds_address,
+                                 nir_def *private_state_address)
+{
+   nir_scoped_memory_barrier(b, SCOPE_DEVICE, NIR_MEMORY_RELEASE,
+                             nir_var_mem_shared | nir_var_mem_global);
+   return nir_ventus_rt_traverse_v5(b, pds_address, private_state_address);
 }

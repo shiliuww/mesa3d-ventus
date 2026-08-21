@@ -296,6 +296,7 @@ main(int argc, char **argv)
    config.hit_sbt_record_stride = 96;
    config.shader_group_handle_size = 32;
    nir_shader *raygen = vt_rt_load_raygen_spirv(argv[1], &options);
+   nir_shader *v5_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *cps_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_raygen = vt_rt_load_raygen_spirv(argv[1], &options);
    nir_shader *global_loop_raygen = vt_rt_load_raygen_spirv(argv[2], &options);
@@ -528,6 +529,29 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
+
+   struct vt_nir_rt_config v5_config = vt_nir_rt_default_config();
+   vt_nir_rt_config_apply_abi_layout(&v5_config, &abi);
+   v5_config.use_v5_pds = true;
+   VT_RT_CHECK(vt_nir_lower_rt_abi(v5_raygen, &v5_config));
+   VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(v5_raygen, &v5_config));
+   nir_validate_shader(v5_raygen, "after Ventus production V5 lowering");
+   struct vt_rt_intrinsic_counts v5_after;
+   vt_rt_count_intrinsics(v5_raygen, &v5_after);
+   VT_RT_CHECK(v5_after.trace_ray == 0);
+   VT_RT_CHECK(v5_after.ventus_rt_traverse == 0);
+   VT_RT_CHECK(v5_after.ventus_rt_traverse_v5 == 2);
+   VT_RT_CHECK(v5_after.ventus_rt_release == 1);
+   VT_RT_CHECK(v5_after.ventus_rt_load_slot == 0);
+   VT_RT_CHECK(v5_after.ventus_rt_store_slot == 0);
+   VT_RT_CHECK(v5_after.store_shared == 17);
+   VT_RT_CHECK(count_intrinsic(
+                  v5_raygen,
+                  nir_intrinsic_ventus_rt_hot_pds_address) > 0);
+   VT_RT_CHECK(vt_rt_count_dispatch_arg_offset(
+                  v5_raygen,
+                  VT_NIR_RT_DISPATCH_ARG_PRIVATE_REGION_OFFSET) == 1);
+   VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(v5_raygen));
 
    struct vt_rt_intrinsic_counts closest_before;
    vt_rt_count_intrinsics(closest_hit, &closest_before);
@@ -813,6 +837,7 @@ main(int argc, char **argv)
           manual_per_lane_scratch);
 
    ralloc_free(raygen);
+   ralloc_free(v5_raygen);
    ralloc_free(cps_mem_ctx);
    ralloc_free(global_raygen);
    ralloc_free(global_callback_closest_hit);

@@ -15,6 +15,7 @@
 #include "ventus/llvm/ventus_nir_to_llvm.h"
 
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -148,9 +149,11 @@ build_rt_traverse_v5_shader(const nir_shader_compiler_options *options)
    nir_def *private_address = vt_nir_rt_v5_private_address(
       &b, nir_imm_int(&b, 0), nir_imm_int(&b, 0x180),
       nir_imm_int(&b, 1), nir_imm_int(&b, 31));
+   nir_def *pds_address =
+      nir_ventus_rt_hot_pds_address(&b, nir_imm_int(&b, 0));
    const struct vt_nir_rt_v5_submit_result result =
       vt_nir_build_traversal_v5_submit(
-         &b, &params, nir_imm_int(&b, 0x1000), private_address);
+         &b, &params, pds_address, private_address);
    nir_ventus_rt_store_slot(&b, result.compact_result, nir_imm_int(&b, 0));
    return b.shader;
 }
@@ -194,6 +197,19 @@ main()
       rt_resource->getOperand(4));
    VT_RT_CHECK(rt_stride != nullptr);
    VT_RT_CHECK(rt_stride->getZExtValue() == 384);
+   llvm::MDNode *pds_static = entry->getMetadata("ventus.pds.static");
+   VT_RT_CHECK(pds_static != nullptr);
+   VT_RT_CHECK(pds_static->getNumOperands() == 1);
+   const auto *pds_value = llvm::dyn_cast<llvm::ValueAsMetadata>(
+      pds_static->getOperand(0).get());
+   const auto *pds_allocation = pds_value ?
+      llvm::dyn_cast<llvm::GlobalVariable>(pds_value->getValue()) : nullptr;
+   VT_RT_CHECK(pds_allocation != nullptr);
+   VT_RT_CHECK(pds_allocation->getAddressSpace() == 5);
+   const auto *pds_type =
+      llvm::dyn_cast<llvm::ArrayType>(pds_allocation->getValueType());
+   VT_RT_CHECK(pds_type != nullptr);
+   VT_RT_CHECK(pds_type->getNumElements() == 768);
 
    bool found_phi = false;
    bool found_float_bits = false;
@@ -246,27 +262,80 @@ main()
    VT_RT_CHECK(!traverse_v5->use_empty());
 
    bool found_v5_fence = false;
+   bool found_v5_pds_csr = false;
+   bool found_v5_lds_csr = false;
+   bool found_v5_thread_id = false;
+   bool found_v5_pds_stride = false;
+   unsigned v5_global_pds_store_count = 0;
    unsigned v5_shared_store_count = 0;
-   unsigned v5_pds_store_count = 0;
+   unsigned v5_canonical_shared_store_count = 0;
+   unsigned v5_private_store_count = 0;
    for (llvm::Function &function : *module) {
       for (llvm::BasicBlock &block : function) {
          for (llvm::Instruction &instruction : block) {
             found_v5_fence |= llvm::isa<llvm::FenceInst>(&instruction);
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+            if (call && call->isInlineAsm()) {
+               const auto *assembly = llvm::cast<llvm::InlineAsm>(
+                  call->getCalledOperand());
+               const llvm::StringRef text = assembly->getAsmString();
+               found_v5_pds_csr |= text.contains("CSR_PDS");
+               found_v5_lds_csr |= text.contains("CSR_LDS");
+               found_v5_thread_id |= text.contains("CSR_TID");
+            }
+            auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction);
+            if (binary && binary->getOpcode() == llvm::Instruction::Mul) {
+               for (const llvm::Use &operand : binary->operands()) {
+                  const auto *constant =
+                     llvm::dyn_cast<llvm::ConstantInt>(operand.get());
+                  found_v5_pds_stride |=
+                     constant && constant->getZExtValue() == 384;
+               }
+            }
             auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
             if (!store)
                continue;
             const unsigned address_space =
                store->getPointerAddressSpace();
+            v5_global_pds_store_count += address_space == 1;
             v5_shared_store_count += address_space == 3;
-            v5_pds_store_count += address_space == 5;
+            v5_private_store_count += address_space == 5;
+            if (address_space == 3) {
+               auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
+                  store->getPointerOperand());
+               auto *address = pointer
+                  ? llvm::dyn_cast<llvm::BinaryOperator>(
+                       pointer->getOperand(0))
+                  : nullptr;
+               bool has_lds_base = false;
+               if (address && address->getOpcode() == llvm::Instruction::Add) {
+                  for (const llvm::Use &operand : address->operands()) {
+                     auto *call = llvm::dyn_cast<llvm::CallBase>(operand.get());
+                     if (!call || !call->isInlineAsm())
+                        continue;
+                     const auto *assembly = llvm::cast<llvm::InlineAsm>(
+                        call->getCalledOperand());
+                     has_lds_base |=
+                        llvm::StringRef(assembly->getAsmString())
+                           .contains("CSR_LDS");
+                  }
+               }
+               v5_canonical_shared_store_count += has_lds_base;
+            }
          }
       }
    }
    VT_RT_CHECK(found_v5_fence);
+   VT_RT_CHECK(found_v5_pds_csr);
+   VT_RT_CHECK(found_v5_lds_csr);
+   VT_RT_CHECK(found_v5_thread_id);
+   VT_RT_CHECK(found_v5_pds_stride);
+   VT_RT_CHECK(v5_global_pds_store_count == 24);
    VT_RT_CHECK(v5_shared_store_count == 17);
-   /* The helper emits 24 PDS words; the translator also publishes three
-    * launch-ID words and the test stores the compact result. */
-   VT_RT_CHECK(v5_pds_store_count == 28);
+   VT_RT_CHECK(v5_canonical_shared_store_count == v5_shared_store_count);
+   /* Only the explicit test sink uses legacy private storage.  V5 launch IDs
+    * stay in SSA so field-major private slots cannot alias lane-major PDS. */
+   VT_RT_CHECK(v5_private_store_count == 1);
 
    delete module;
    ralloc_free(shader);

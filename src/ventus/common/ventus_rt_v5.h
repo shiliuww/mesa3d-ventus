@@ -34,6 +34,39 @@ enum ventus_rt_v5_pds_offset {
    VENTUS_RT_V5_PDS_CALL_DATA_BASE = VENTUS_RT_V5_CALL_DATA_OFFSET,
 };
 
+enum ventus_rt_v5_hit_offset {
+   VENTUS_RT_V5_HIT_T = 0x00,
+   VENTUS_RT_V5_HIT_INSTANCE_SBT_CONTRIBUTION = 0x04,
+   VENTUS_RT_V5_HIT_GEOMETRY_INDEX = 0x08,
+   VENTUS_RT_V5_HIT_PRIMITIVE_INDEX = 0x0c,
+   VENTUS_RT_V5_HIT_INSTANCE_METADATA_REFERENCE = 0x10,
+   VENTUS_RT_V5_HIT_METADATA = 0x18,
+   VENTUS_RT_V5_HIT_PRIMITIVE_REFERENCE = 0x20,
+   VENTUS_RT_V5_HIT_INSTANCE_INDEX = 0x28,
+   VENTUS_RT_V5_HIT_INSTANCE_CUSTOM_INDEX = 0x2c,
+   VENTUS_RT_V5_HIT_ATTRIBUTES = 0x40,
+};
+
+enum ventus_rt_v5_hit_geometry {
+   VENTUS_RT_V5_HIT_GEOMETRY_TRIANGLE = 1,
+   VENTUS_RT_V5_HIT_GEOMETRY_PROCEDURAL_AABB = 2,
+};
+
+enum ventus_rt_v5_hit_attribute_format {
+   VENTUS_RT_V5_HIT_ATTRIBUTE_BARYCENTRIC_FP32X2 = 1,
+   VENTUS_RT_V5_HIT_ATTRIBUTE_OPAQUE_BYTES = 2,
+};
+
+#define VENTUS_RT_V5_HIT_METADATA_GEOMETRY_MASK 0x3u
+#define VENTUS_RT_V5_HIT_METADATA_HIT_KIND_SHIFT 2u
+#define VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_COUNT_SHIFT 10u
+#define VENTUS_RT_V5_HIT_METADATA_ATTRIBUTE_FORMAT_SHIFT 16u
+#define VENTUS_RT_V5_HIT_METADATA_PROCEDURAL_ANY_HIT (1u << 24)
+#define VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID (1u << 25)
+
+#define VENTUS_RT_V5_SHADER_RETURN_ACCEPT (1u << 0)
+#define VENTUS_RT_V5_SHADER_RETURN_TERMINATE (1u << 1)
+
 enum ventus_rt_v5_private_offset {
    VENTUS_RT_V5_PRIVATE_FRONTIER_0 = 0x00,
    VENTUS_RT_V5_PRIVATE_FRONTIER_4 = 0x20,
@@ -68,6 +101,13 @@ struct ventus_rt_v5_private_placement {
    uint64_t region_offset;
    uint64_t total_bytes;
    uint64_t num_lds;
+};
+
+struct ventus_rt_v5_pds_backing_layout {
+   uint64_t compiler_stack_bytes_per_wg;
+   uint64_t static_bytes_per_wg;
+   uint64_t total_bytes_per_wg;
+   uint64_t csr_base;
 };
 
 static inline uint32_t
@@ -146,6 +186,33 @@ ventus_rt_v5_private_placement(uint64_t non_rt_cta_lds_bytes,
    placement->region_offset = region_offset;
    placement->total_bytes = total_bytes;
    placement->num_lds = num_lds;
+   return true;
+}
+
+static inline bool
+ventus_rt_v5_pds_backing_layout(
+   uint64_t allocation_base, uint64_t static_bytes_per_lane,
+   uint64_t compiler_stack_bytes_per_lane, uint32_t lane_count,
+   struct ventus_rt_v5_pds_backing_layout *layout)
+{
+   if (!layout || lane_count == 0 ||
+       static_bytes_per_lane > UINT64_MAX / lane_count ||
+       compiler_stack_bytes_per_lane > UINT64_MAX / lane_count)
+      return false;
+
+   const uint64_t stack_bytes =
+      compiler_stack_bytes_per_lane * lane_count;
+   const uint64_t static_bytes = static_bytes_per_lane * lane_count;
+   if (stack_bytes > UINT64_MAX - static_bytes ||
+       allocation_base > UINT64_MAX - stack_bytes)
+      return false;
+
+   layout->compiler_stack_bytes_per_wg = stack_bytes;
+   layout->static_bytes_per_wg = static_bytes;
+   layout->total_bytes_per_wg = stack_bytes + static_bytes;
+   /* Compiler private spills use negative logical offsets from CSR_PDS;
+    * canonical V5 hot-PDS addresses grow upward from the same boundary. */
+   layout->csr_base = allocation_base + stack_bytes;
    return true;
 }
 

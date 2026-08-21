@@ -43,5 +43,20 @@ main(void)
    assert(placement.num_lds == 8704);
    assert(!ventus_rt_v5_private_placement(0, 0, 4096, &placement));
    assert(!ventus_rt_v5_private_placement(4096, 1, 4096, &placement));
+
+   struct ventus_rt_v5_pds_backing_layout pds_layout;
+   assert(ventus_rt_v5_pds_backing_layout(0x90010000, 384, 256, 32,
+                                           &pds_layout));
+   assert(pds_layout.compiler_stack_bytes_per_wg == 8192);
+   assert(pds_layout.static_bytes_per_wg == 12288);
+   assert(pds_layout.total_bytes_per_wg == 20480);
+   assert(pds_layout.csr_base == 0x90012000);
+   assert(ventus_rt_v5_pds_backing_layout(0x1000, 384, 0, 32,
+                                           &pds_layout));
+   assert(pds_layout.csr_base == 0x1000);
+   assert(!ventus_rt_v5_pds_backing_layout(0, 384, 256, 0,
+                                            &pds_layout));
+   assert(!ventus_rt_v5_pds_backing_layout(
+      UINT64_MAX - 31, 384, 1, 32, &pds_layout));
    return 0;
 }

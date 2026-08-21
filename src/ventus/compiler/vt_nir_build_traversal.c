@@ -4,6 +4,234 @@
  */
 
 #include "vt_nir.h"
+#include "ventus/common/ventus_rt_v5.h"
+
+static nir_def *
+v5_pds_address(nir_builder *b, uint32_t byte_offset)
+{
+   nir_def *base = nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
+   return nir_iadd_imm(b, nir_u2u64(b, base), byte_offset);
+}
+
+static nir_def *
+v5_load_u32(nir_builder *b, uint32_t byte_offset)
+{
+   return nir_load_global(b, 1, 32, v5_pds_address(b, byte_offset),
+                          .align_mul = 4);
+}
+
+static void
+v5_store_u32(nir_builder *b, uint32_t byte_offset, nir_def *value)
+{
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_store_global(b, nir_u2u32(b, value), v5_pds_address(b, byte_offset),
+                    .write_mask = 0x1, .align_mul = 4);
+}
+
+static uint32_t
+v5_hit_base(bool candidate)
+{
+   return candidate ? VENTUS_RT_V5_PDS_CALLBACK_BASE :
+                      VENTUS_RT_V5_PDS_COMMITTED_BASE;
+}
+
+static nir_def *
+v5_hit_metadata(nir_builder *b, bool candidate)
+{
+   return v5_load_u32(b, v5_hit_base(candidate) + VENTUS_RT_V5_HIT_METADATA);
+}
+
+static void
+v5_update_hit_metadata(nir_builder *b, bool candidate, uint32_t clear_mask,
+                       nir_def *set_bits)
+{
+   nir_def *metadata = v5_hit_metadata(b, candidate);
+   metadata = nir_iand_imm(b, metadata, ~clear_mask);
+   v5_store_u32(b, v5_hit_base(candidate) + VENTUS_RT_V5_HIT_METADATA,
+                nir_ior(b, metadata, nir_u2u32(b, set_bits)));
+}
+
+static nir_def *
+v5_load_hit_word(nir_builder *b, bool candidate,
+                 enum vt_rt_hit_record_word word, uint32_t bit_size)
+{
+   const uint32_t base = v5_hit_base(candidate);
+   nir_def *metadata = NULL;
+   nir_def *value = NULL;
+   switch (word) {
+   case VT_RT_HIT_RECORD_STATUS:
+      if (candidate) {
+         value = nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID);
+      } else {
+         metadata = v5_hit_metadata(b, false);
+         value = nir_b2i32(
+            b, nir_ine_imm(b,
+                           nir_iand_imm(
+                              b, metadata,
+                              VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID),
+                           0));
+      }
+      break;
+   case VT_RT_HIT_RECORD_HIT_T:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_T);
+      break;
+   case VT_RT_HIT_RECORD_SBT_INDEX:
+   case VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO:
+   case VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI:
+      value = nir_imm_int(b, 0);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ID:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_PRIMITIVE_INDEX);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ID:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_INSTANCE_INDEX);
+      break;
+   case VT_RT_HIT_RECORD_GEOMETRY_ID:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_GEOMETRY_INDEX);
+      break;
+   case VT_RT_HIT_RECORD_HIT_KIND:
+      metadata = v5_hit_metadata(b, candidate);
+      value = nir_iand_imm(
+         b, nir_ushr_imm(b, metadata,
+                         VENTUS_RT_V5_HIT_METADATA_HIT_KIND_SHIFT),
+         0xff);
+      break;
+   case VT_RT_HIT_RECORD_BARYCENTRICS_X:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_ATTRIBUTES);
+      break;
+   case VT_RT_HIT_RECORD_BARYCENTRICS_Y:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_ATTRIBUTES + 4);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ADDR_LO:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_PRIMITIVE_REFERENCE);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI:
+      value = v5_load_u32(b, base + VENTUS_RT_V5_HIT_PRIMITIVE_REFERENCE + 4);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ADDR_LO:
+      value = v5_load_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_METADATA_REFERENCE);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ADDR_HI:
+      value = v5_load_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_METADATA_REFERENCE + 4);
+      break;
+   case VT_RT_HIT_RECORD_FRONT_FACE:
+      metadata = v5_hit_metadata(b, candidate);
+      value = nir_b2i32(
+         b, nir_ieq_imm(
+               b, nir_iand_imm(
+                     b, nir_ushr_imm(
+                           b, metadata,
+                           VENTUS_RT_V5_HIT_METADATA_HIT_KIND_SHIFT),
+                     0xff),
+               0xfe));
+      break;
+   case VT_RT_HIT_RECORD_OPAQUE:
+      value = nir_imm_int(b, 0);
+      break;
+   case VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST:
+      metadata = v5_hit_metadata(b, candidate);
+      value = nir_b2i32(
+         b, nir_ine_imm(
+               b, nir_iand_imm(
+                     b, metadata,
+                     VENTUS_RT_V5_HIT_METADATA_PROCEDURAL_ANY_HIT),
+               0));
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET:
+      value = v5_load_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_SBT_CONTRIBUTION);
+      break;
+   default:
+      value = nir_imm_int(b, 0);
+      break;
+   }
+   return bit_size == 1 ? nir_i2b(b, value) : value;
+}
+
+static void
+v5_store_hit_word(nir_builder *b, bool candidate,
+                  enum vt_rt_hit_record_word word, nir_def *value)
+{
+   const uint32_t base = v5_hit_base(candidate);
+   switch (word) {
+   case VT_RT_HIT_RECORD_STATUS: {
+      if (!candidate) {
+         nir_def *valid = nir_ieq_imm(b, nir_u2u32(b, value),
+                                      VT_RT_HIT_RECORD_STATUS_VALID);
+         v5_update_hit_metadata(
+            b, false, VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID,
+            nir_bcsel(
+               b, valid,
+               nir_imm_int(b,
+                           VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID),
+               nir_imm_int(b, 0)));
+      }
+      break;
+   }
+   case VT_RT_HIT_RECORD_HIT_T:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_T, value);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ID:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_PRIMITIVE_INDEX, value);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ID:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_INSTANCE_INDEX, value);
+      break;
+   case VT_RT_HIT_RECORD_GEOMETRY_ID:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_GEOMETRY_INDEX, value);
+      break;
+   case VT_RT_HIT_RECORD_HIT_KIND:
+      v5_update_hit_metadata(
+         b, candidate, 0xffu << VENTUS_RT_V5_HIT_METADATA_HIT_KIND_SHIFT,
+         nir_ishl_imm(b, nir_iand_imm(b, nir_u2u32(b, value), 0xff),
+                      VENTUS_RT_V5_HIT_METADATA_HIT_KIND_SHIFT));
+      break;
+   case VT_RT_HIT_RECORD_BARYCENTRICS_X:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_ATTRIBUTES, value);
+      break;
+   case VT_RT_HIT_RECORD_BARYCENTRICS_Y:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_ATTRIBUTES + 4, value);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ADDR_LO:
+      v5_store_u32(b, base + VENTUS_RT_V5_HIT_PRIMITIVE_REFERENCE, value);
+      break;
+   case VT_RT_HIT_RECORD_PRIMITIVE_ADDR_HI:
+      v5_store_u32(
+         b, base + VENTUS_RT_V5_HIT_PRIMITIVE_REFERENCE + 4, value);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ADDR_LO:
+      v5_store_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_METADATA_REFERENCE, value);
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_ADDR_HI:
+      v5_store_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_METADATA_REFERENCE + 4, value);
+      break;
+   case VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST:
+      v5_update_hit_metadata(
+         b, candidate, VENTUS_RT_V5_HIT_METADATA_PROCEDURAL_ANY_HIT,
+         nir_bcsel(
+            b, nir_i2b(b, value),
+            nir_imm_int(b,
+                        VENTUS_RT_V5_HIT_METADATA_PROCEDURAL_ANY_HIT),
+            nir_imm_int(b, 0)));
+      break;
+   case VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET:
+      v5_store_u32(
+         b, base + VENTUS_RT_V5_HIT_INSTANCE_SBT_CONTRIBUTION, value);
+      break;
+   case VT_RT_HIT_RECORD_SBT_INDEX:
+   case VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO:
+   case VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI:
+   case VT_RT_HIT_RECORD_FRONT_FACE:
+   case VT_RT_HIT_RECORD_OPAQUE:
+   default:
+      break;
+   }
+}
 
 struct vt_nir_rt_config
 vt_nir_rt_default_config(void)
@@ -11,6 +239,7 @@ vt_nir_rt_default_config(void)
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    struct vt_nir_rt_config config = {
       .execution_model = VT_RT_EXECUTION_ITERATIVE_RAYGEN_LOOP,
+      .use_v5_pds = false,
       .scratchpad = {
          [VT_RT_LAYOUT_RAYGEN] = {
             .base_bytes = 0,
@@ -82,6 +311,8 @@ vt_nir_load_active_level(nir_builder *b,
                          const struct vt_nir_rt_config *config,
                          enum vt_rt_shader_layout layout)
 {
+   if (config->use_v5_pds)
+      return v5_load_u32(b, VENTUS_RT_V5_PDS_RECURSION_DEPTH);
    return nir_ventus_rt_load_slot(
       b, 1, 32,
       vt_nir_scratchpad_addr(b, config, layout,
@@ -95,6 +326,10 @@ vt_nir_store_active_level(nir_builder *b,
                           enum vt_rt_shader_layout layout,
                           nir_def *level)
 {
+   if (config->use_v5_pds) {
+      v5_store_u32(b, VENTUS_RT_V5_PDS_RECURSION_DEPTH, level);
+      return;
+   }
    nir_ventus_rt_store_slot(
       b, level,
       vt_nir_scratchpad_addr(b, config, layout,
@@ -160,6 +395,13 @@ vt_nir_load_payload_word(nir_builder *b,
                          enum vt_rt_payload_word word,
                          uint32_t bit_size)
 {
+   if (config->use_v5_pds) {
+      return nir_load_global(
+         b, 1, bit_size,
+         v5_pds_address(
+            b, VENTUS_RT_V5_PDS_CALL_DATA_BASE + word * sizeof(uint32_t)),
+         .align_mul = 4);
+   }
    return nir_ventus_rt_load_slot(b, 1, bit_size,
                                   vt_nir_payload_addr(b, config, layout, word));
 }
@@ -171,6 +413,12 @@ vt_nir_store_payload_word(nir_builder *b,
                           enum vt_rt_payload_word word,
                           nir_def *value)
 {
+   if (config->use_v5_pds) {
+      v5_store_u32(b,
+                   VENTUS_RT_V5_PDS_CALL_DATA_BASE + word * sizeof(uint32_t),
+                   value);
+      return;
+   }
    nir_ventus_rt_store_slot(b, value,
                             vt_nir_payload_addr(b, config, layout, word));
 }
@@ -182,6 +430,8 @@ vt_nir_load_hit_record_word(nir_builder *b,
                             enum vt_rt_hit_record_word word,
                             uint32_t bit_size)
 {
+   if (config->use_v5_pds)
+      return v5_load_hit_word(b, false, word, bit_size);
    return nir_ventus_rt_load_slot(b, 1, bit_size,
                                   vt_nir_hit_record_addr(b, config, layout, word));
 }
@@ -193,6 +443,10 @@ vt_nir_store_hit_record_word(nir_builder *b,
                              enum vt_rt_hit_record_word word,
                              nir_def *value)
 {
+   if (config->use_v5_pds) {
+      v5_store_hit_word(b, false, word, value);
+      return;
+   }
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
    nir_ventus_rt_store_slot(b, value,
@@ -206,6 +460,8 @@ vt_nir_load_candidate_hit_record_word(nir_builder *b,
                                       enum vt_rt_hit_record_word word,
                                       uint32_t bit_size)
 {
+   if (config->use_v5_pds)
+      return v5_load_hit_word(b, true, word, bit_size);
    return nir_ventus_rt_load_slot(
       b, 1, bit_size,
       vt_nir_candidate_hit_record_addr(b, config, layout, word));
@@ -218,6 +474,10 @@ vt_nir_store_candidate_hit_record_word(nir_builder *b,
                                        enum vt_rt_hit_record_word word,
                                        nir_def *value)
 {
+   if (config->use_v5_pds) {
+      v5_store_hit_word(b, true, word, value);
+      return;
+   }
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
    nir_ventus_rt_store_slot(
@@ -231,6 +491,19 @@ vt_nir_load_control_word(nir_builder *b,
                          enum vt_rt_control_word word,
                          uint32_t bit_size)
 {
+   if (config->use_v5_pds) {
+      nir_def *effect =
+         v5_load_u32(b, VENTUS_RT_V5_PDS_CALLBACK_BASE);
+      nir_def *terminate = nir_ine_imm(
+         b, nir_iand_imm(b, effect, VENTUS_RT_V5_SHADER_RETURN_TERMINATE), 0);
+      nir_def *accept = nir_ine_imm(
+         b, nir_iand_imm(b, effect, VENTUS_RT_V5_SHADER_RETURN_ACCEPT), 0);
+      nir_def *decision = nir_bcsel(
+         b, terminate, nir_imm_int(b, VT_RT_CALLBACK_TERMINATE),
+         nir_bcsel(b, accept, nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
+                   nir_imm_int(b, VT_RT_CALLBACK_IGNORE)));
+      return bit_size == 1 ? nir_i2b(b, decision) : decision;
+   }
    return nir_ventus_rt_load_slot(b, 1, bit_size,
                                   vt_nir_control_addr(b, config, layout, word));
 }
@@ -242,6 +515,21 @@ vt_nir_store_control_word(nir_builder *b,
                           enum vt_rt_control_word word,
                           nir_def *value)
 {
+   if (config->use_v5_pds) {
+      nir_def *is_accept =
+         nir_ieq_imm(b, nir_u2u32(b, value), VT_RT_CALLBACK_ACCEPT);
+      nir_def *is_terminate =
+         nir_ieq_imm(b, nir_u2u32(b, value), VT_RT_CALLBACK_TERMINATE);
+      nir_def *effect = nir_bcsel(
+         b, is_terminate,
+         nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_ACCEPT |
+                           VENTUS_RT_V5_SHADER_RETURN_TERMINATE),
+         nir_bcsel(b, is_accept,
+                   nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_ACCEPT),
+                   nir_imm_int(b, 0)));
+      v5_store_u32(b, VENTUS_RT_V5_PDS_CALLBACK_BASE, effect);
+      return;
+   }
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
    nir_ventus_rt_store_slot(b, value,
@@ -296,13 +584,11 @@ store_u64_words(nir_builder *b, nir_def *base, enum vt_rt_slot_word lo_word,
    }
 }
 
-static nir_def *
-build_hit_shader_record_ptr(nir_builder *b,
-                            const struct vt_nir_rt_config *config,
-                            const struct vt_nir_rt_trace_params *params,
-                            nir_def *record_base,
-                            nir_def *instance_sbt_record_offset,
-                            nir_def *geometry_index)
+nir_def *
+vt_nir_build_hit_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_trace_params *params, nir_def *record_base,
+   nir_def *instance_sbt_record_offset, nir_def *geometry_index)
 {
    if (!record_base)
       record_base = nir_imm_int64(b, 0);
@@ -324,10 +610,10 @@ build_hit_shader_record_ptr(nir_builder *b,
    return nir_iadd(b, nir_u2u64(b, record_base), record_offset);
 }
 
-static nir_def *
-build_miss_shader_record_ptr(nir_builder *b,
-                             const struct vt_nir_rt_config *config,
-                             const struct vt_nir_rt_trace_params *params)
+nir_def *
+vt_nir_build_miss_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_trace_params *params)
 {
    nir_def *record_base = params->miss_sbt_base ?
       params->miss_sbt_base : nir_imm_int64(b, 0);
@@ -409,9 +695,11 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *geometry_index =
       nir_bcsel(b, is_candidate, candidate_geometry_index, committed_geometry_index);
    nir_def *hit_shader_record_ptr =
-      build_hit_shader_record_ptr(b, config, params, params->sbt_base,
-                                  instance_sbt_record_offset, geometry_index);
-   nir_def *miss_shader_record_ptr = build_miss_shader_record_ptr(b, config, params);
+      vt_nir_build_hit_shader_record_ptr(
+         b, config, params, params->sbt_base,
+         instance_sbt_record_offset, geometry_index);
+   nir_def *miss_shader_record_ptr =
+      vt_nir_build_miss_shader_record_ptr(b, config, params);
    nir_def *complete_hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT);
    nir_def *complete_miss = nir_ieq_imm(b, status,
                                         VT_RT_TRAVERSAL_COMPLETE_MISS);

@@ -161,6 +161,7 @@ typedef void (*vt_nir_rt_emit_shader_cb)(nir_builder *b,
 
 struct vt_nir_rt_config {
    enum vt_rt_execution_model execution_model;
+   bool use_v5_pds;
    struct vt_nir_scratchpad_layout scratchpad[VT_RT_LAYOUT_COUNT];
    uint64_t hit_sbt_base_addr;
    uint32_t hit_sbt_record_stride;
@@ -351,6 +352,19 @@ vt_nir_build_traversal_v5_submit(nir_builder *b,
                                  const struct vt_nir_rt_trace_params *params,
                                  nir_def *pds_address,
                                  nir_def *private_state_address);
+
+nir_def *vt_nir_build_traversal_v5_resume(nir_builder *b,
+                                          nir_def *pds_address,
+                                          nir_def *private_state_address);
+
+nir_def *vt_nir_build_hit_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_trace_params *params, nir_def *record_base,
+   nir_def *instance_sbt_record_offset, nir_def *geometry_index);
+
+nir_def *vt_nir_build_miss_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   const struct vt_nir_rt_trace_params *params);
 
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
