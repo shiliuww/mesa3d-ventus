@@ -29,6 +29,16 @@ vt_rt_v5_contract_test = executable(
   build_by_default : false,
 )
 
+vt_vtas_v2_contract_test = executable(
+  'vt_vtas_v2_contract_test',
+  [
+    'vt_vtas_v2_contract_test.cpp',
+    '../common/ventus_rt_bvh_v2.cpp',
+  ],
+  include_directories : [inc_src],
+  build_by_default : false,
+)
+
 test(
   'vt_rt_profile',
   vt_rt_profile_test,
@@ -50,6 +60,12 @@ test(
 test(
   'vt_rt_v5_contract',
   vt_rt_v5_contract_test,
+  suite : ['ventus'],
+)
+
+test(
+  'vt_vtas_v2_contract',
+  vt_vtas_v2_contract_test,
   suite : ['ventus'],
 )
 

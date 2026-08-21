@@ -77,7 +77,8 @@ plane. They are not extra hard-operation operands.
 The verified `raytracingshadows` path currently performs all of the following:
 
 - creates the Ventus Vulkan device and RT pipeline;
-- builds triangle BLAS and instance TLAS into Ventus BVH ABI v1;
+- builds triangle BLAS and instance TLAS into Ventus VTAS V2, including
+  parent-replay metadata validated before publication;
 - materializes SBT regions and a restricted descriptor table;
 - collects dispatch state in `vkCmdTraceRaysKHR`;
 - emits and links the generated Ventus ELF;

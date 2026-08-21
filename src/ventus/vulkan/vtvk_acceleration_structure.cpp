@@ -13,6 +13,7 @@
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "ventus/common/ventus_rt_bvh_v2.h"
 
 struct vtvk_aabb {
    float min[3];
@@ -26,6 +27,8 @@ struct vtvk_build_node {
 static std::vector<struct vtvk_acceleration_structure *> vtvk_as_registry;
 
 #define VTVK_AS_DEVICE_ADDRESS_ALIGNMENT 256u
+
+static constexpr uint16_t vtvk_target_as_version = VENTUS_AS_VERSION_V2;
 
 static void *
 vtvk_handle_to_ptr(uint64_t handle)
@@ -119,6 +122,14 @@ vtvk_load_u32(const uint8_t *base, uint32_t offset)
    return value;
 }
 
+static uint16_t
+vtvk_load_u16(const uint8_t *base, uint32_t offset)
+{
+   uint16_t value;
+   memcpy(&value, base + offset, sizeof(value));
+   return value;
+}
+
 static uint64_t
 vtvk_load_u64(const uint8_t *base, uint32_t offset)
 {
@@ -168,14 +179,15 @@ vtvk_log_transform(const char *name, const float matrix[3][4])
 }
 
 static void
-vtvk_write_header(uint8_t *dst, enum ventus_as_type type, uint32_t root_ref,
+vtvk_write_header(uint8_t *dst, uint16_t version, enum ventus_as_type type,
+                  uint32_t root_ref,
                   uint32_t node_count, uint32_t node_region_size,
                   uint32_t primitive_count, uint32_t instance_count,
                   const struct vtvk_aabb *root_aabb)
 {
    memset(dst, 0, VENTUS_AS_HEADER_SIZE);
    vtvk_store_u32(dst, VENTUS_AS_HEADER_MAGIC, VENTUS_AS_MAGIC);
-   vtvk_store_u16(dst, VENTUS_AS_HEADER_VERSION, VENTUS_AS_VERSION);
+   vtvk_store_u16(dst, VENTUS_AS_HEADER_VERSION, version);
    vtvk_store_u16(dst, VENTUS_AS_HEADER_HEADER_SIZE, VENTUS_AS_HEADER_SIZE);
    vtvk_store_u32(dst, VENTUS_AS_HEADER_TYPE, type);
    vtvk_store_u32(dst, VENTUS_AS_HEADER_ROOT_NODE_REF, root_ref);
@@ -197,8 +209,52 @@ vtvk_write_header(uint8_t *dst, enum ventus_as_type type, uint32_t root_ref,
    vtvk_store_f32(dst, VENTUS_AS_HEADER_ROOT_AABB_MAX_Z, root_aabb->max[2]);
 }
 
+static uint32_t
+vtvk_align_u32(uint32_t value, uint32_t alignment)
+{
+   return (value + alignment - 1) & ~(alignment - 1);
+}
+
 static void
-vtvk_write_box4(uint8_t *dst, uint32_t offset,
+vtvk_write_v2_child_parent(uint8_t *dst, uint32_t parent_offset,
+                           uint32_t child_ref, uint8_t child_index)
+{
+   const uint32_t child_type = ventus_bvh_node_ref_type(child_ref);
+   const uint32_t child_offset = ventus_bvh_node_ref_offset(child_ref);
+   uint8_t *child = dst + child_offset;
+   if (child_type == VENTUS_BVH_NODE_BOX4) {
+      vtvk_store_u32(child, VENTUS_BOX4_V2_PARENT_NODE_REF,
+                     ventus_bvh_make_node_ref(parent_offset,
+                                              VENTUS_BVH_NODE_BOX4));
+      child[VENTUS_BOX4_V2_PARENT_CHILD_INDEX] = child_index;
+      child[VENTUS_BOX4_V2_NODE_FLAGS] = 0;
+   } else if (child_type == VENTUS_BVH_NODE_INSTANCE) {
+      vtvk_store_u32(child, VENTUS_INSTANCE_V2_PARENT_EDGE,
+                     parent_offset | child_index);
+   }
+}
+
+static void
+vtvk_write_v2_root(uint8_t *dst, uint32_t root_ref)
+{
+   if (root_ref == VENTUS_AS_INVALID_NODE)
+      return;
+
+   const uint32_t root_type = ventus_bvh_node_ref_type(root_ref);
+   uint8_t *root = dst + ventus_bvh_node_ref_offset(root_ref);
+   if (root_type == VENTUS_BVH_NODE_BOX4) {
+      vtvk_store_u32(root, VENTUS_BOX4_V2_PARENT_NODE_REF,
+                     VENTUS_AS_INVALID_NODE);
+      root[VENTUS_BOX4_V2_PARENT_CHILD_INDEX] = 0xff;
+      root[VENTUS_BOX4_V2_NODE_FLAGS] = VENTUS_BOX4_V2_NODE_FLAG_ROOT;
+   } else if (root_type == VENTUS_BVH_NODE_INSTANCE) {
+      vtvk_store_u32(root, VENTUS_INSTANCE_V2_PARENT_EDGE,
+                     VENTUS_INSTANCE_V2_ROOT_PARENT_EDGE);
+   }
+}
+
+static void
+vtvk_write_box4(uint8_t *dst, uint16_t version, uint32_t offset,
                 const std::vector<struct vtvk_build_node> &children)
 {
    uint8_t *node = dst + offset;
@@ -215,6 +271,8 @@ vtvk_write_box4(uint8_t *dst, uint32_t offset,
       vtvk_store_f32(node, VENTUS_BOX4_MAX_X + i * 4, children[i].bounds.max[0]);
       vtvk_store_f32(node, VENTUS_BOX4_MAX_Y + i * 4, children[i].bounds.max[1]);
       vtvk_store_f32(node, VENTUS_BOX4_MAX_Z + i * 4, children[i].bounds.max[2]);
+      if (version == VENTUS_AS_VERSION_V2)
+         vtvk_write_v2_child_parent(dst, offset, children[i].ref, i);
    }
 }
 
@@ -240,13 +298,27 @@ vtvk_internal_box_count(uint64_t leaf_count)
    return total;
 }
 
+static uint64_t
+vtvk_as_required_size(uint16_t version, uint64_t leaf_bytes,
+                      uint64_t internal_count)
+{
+   uint64_t size = VENTUS_AS_HEADER_SIZE + leaf_bytes;
+   if (version == VENTUS_AS_VERSION_V2 && internal_count)
+      size = (size + VENTUS_AS_BOX4_NODE_SIZE - 1) &
+             ~(uint64_t(VENTUS_AS_BOX4_NODE_SIZE) - 1);
+   return size + internal_count * VENTUS_AS_BOX4_NODE_SIZE;
+}
+
 static struct vtvk_build_node
-vtvk_build_box_tree(uint8_t *dst, uint32_t *cursor,
+vtvk_build_box_tree(uint8_t *dst, uint16_t version, uint32_t *cursor,
                     std::vector<struct vtvk_build_node> leaves,
                     uint32_t *node_count)
 {
    if (leaves.size() == 1)
       return leaves[0];
+
+   if (version == VENTUS_AS_VERSION_V2)
+      *cursor = vtvk_align_u32(*cursor, VENTUS_AS_BOX4_NODE_SIZE);
 
    while (leaves.size() > 1) {
       std::vector<struct vtvk_build_node> next;
@@ -261,7 +333,7 @@ vtvk_build_box_tree(uint8_t *dst, uint32_t *cursor,
          }
 
          uint32_t offset = vtvk_next_node_offset(cursor, VENTUS_AS_BOX4_NODE_SIZE);
-         vtvk_write_box4(dst, offset, children);
+         vtvk_write_box4(dst, version, offset, children);
          (*node_count)++;
 
          next.push_back({
@@ -273,6 +345,23 @@ vtvk_build_box_tree(uint8_t *dst, uint32_t *cursor,
    }
 
    return leaves[0];
+}
+
+static VkResult
+vtvk_validate_built_as(struct vtvk_device *device, const uint8_t *dst,
+                       uint32_t used_size, uint16_t version)
+{
+   if (version != VENTUS_AS_VERSION_V2)
+      return VK_SUCCESS;
+
+   struct ventus_vtas_v2_validation_result validation = {};
+   if (ventus_vtas_v2_validate(dst, used_size, &validation))
+      return VK_SUCCESS;
+
+   mesa_loge("ventus-vk: rejected malformed VTAS V2: %s ref=0x%x detail=0x%x",
+             ventus_vtas_v2_validation_error_string(validation.error),
+             validation.node_ref, validation.detail);
+   return vk_error(device, VK_ERROR_UNKNOWN);
 }
 
 struct vtvk_acceleration_structure *
@@ -710,9 +799,12 @@ vtvk_build_blas(struct vtvk_device *device,
       struct vtvk_aabb bounds;
       vtvk_aabb_zero(&bounds);
       memset(as->data, 0, as->size);
-      vtvk_write_header((uint8_t *)as->data, VENTUS_AS_TYPE_BLAS,
+      vtvk_write_header((uint8_t *)as->data, vtvk_target_as_version,
+                        VENTUS_AS_TYPE_BLAS,
                         VENTUS_AS_INVALID_NODE, 0, 0, 0, 0, &bounds);
-      return VK_SUCCESS;
+      return vtvk_validate_built_as(device, (const uint8_t *)as->data,
+                                    VENTUS_AS_HEADER_SIZE,
+                                    vtvk_target_as_version);
    }
    if (!ranges)
       return vk_error(device, VK_ERROR_UNKNOWN);
@@ -741,9 +833,9 @@ vtvk_build_blas(struct vtvk_device *device,
    const uint64_t leaf_size =
       geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR ?
       VENTUS_AS_AABB_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE;
-   const uint64_t required_size =
-      VENTUS_AS_HEADER_SIZE + primitive_count * leaf_size +
-      vtvk_internal_box_count(primitive_count) * VENTUS_AS_BOX4_NODE_SIZE;
+   const uint64_t internal_count = vtvk_internal_box_count(primitive_count);
+   const uint64_t required_size = vtvk_as_required_size(
+      vtvk_target_as_version, primitive_count * leaf_size, internal_count);
    if (required_size > as->size || required_size > UINT32_MAX)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -782,12 +874,20 @@ vtvk_build_blas(struct vtvk_device *device,
       root.ref = VENTUS_AS_INVALID_NODE;
       vtvk_aabb_zero(&root.bounds);
    } else {
-      root = vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+      root = vtvk_build_box_tree(dst, vtvk_target_as_version, &cursor, leaves,
+                                 &node_count);
    }
-   vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
+   if (vtvk_target_as_version == VENTUS_AS_VERSION_V2)
+      vtvk_write_v2_root(dst, root.ref);
+   vtvk_write_header(dst, vtvk_target_as_version, VENTUS_AS_TYPE_BLAS,
+                     root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE,
                      uint32_t(primitive_count), 0,
                      &root.bounds);
+   VkResult validation = vtvk_validate_built_as(
+      device, dst, cursor, vtvk_target_as_version);
+   if (validation != VK_SUCCESS)
+      return validation;
    if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
       mesa_logi("ventus-vk: BLAS geometry_count=%u primitive_count=%" PRIu64
                 " node_count=%u root=0x%x",
@@ -817,10 +917,11 @@ vtvk_build_tlas(struct vtvk_device *device,
    uint8_t *dst = (uint8_t *)as->data;
    if (!dst)
       return vk_error(device, VK_ERROR_UNKNOWN);
-   const uint64_t required_size =
-      VENTUS_AS_HEADER_SIZE +
-      uint64_t(instance_count) * VENTUS_AS_INSTANCE_NODE_SIZE +
-      vtvk_internal_box_count(instance_count) * VENTUS_AS_BOX4_NODE_SIZE;
+   const uint64_t internal_count = vtvk_internal_box_count(instance_count);
+   const uint64_t required_size = vtvk_as_required_size(
+      vtvk_target_as_version,
+      uint64_t(instance_count) * VENTUS_AS_INSTANCE_NODE_SIZE,
+      internal_count);
    if (required_size > as->size || required_size > UINT32_MAX)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -828,9 +929,11 @@ vtvk_build_tlas(struct vtvk_device *device,
       struct vtvk_aabb bounds;
       vtvk_aabb_zero(&bounds);
       memset(dst, 0, as->size);
-      vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, VENTUS_AS_INVALID_NODE,
+      vtvk_write_header(dst, vtvk_target_as_version, VENTUS_AS_TYPE_TLAS,
+                        VENTUS_AS_INVALID_NODE,
                         0, 0, 0, 0, &bounds);
-      return VK_SUCCESS;
+      return vtvk_validate_built_as(device, dst, VENTUS_AS_HEADER_SIZE,
+                                    vtvk_target_as_version);
    }
 
    const VkAccelerationStructureGeometryInstancesDataKHR *instances =
@@ -888,8 +991,17 @@ vtvk_build_tlas(struct vtvk_device *device,
          (blas_as->snapshot ? blas_as->snapshot :
                               (const uint8_t *)blas_as->data) : nullptr;
       if (!blas_as || !blas_as->built || !blas ||
-          vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
+          vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC ||
+          vtvk_load_u16(blas, VENTUS_AS_HEADER_VERSION) !=
+             vtvk_target_as_version)
          return vk_error(device, VK_ERROR_UNKNOWN);
+      if (vtvk_target_as_version == VENTUS_AS_VERSION_V2) {
+         struct ventus_vtas_v2_validation_result validation = {};
+         const size_t blas_size = blas_as->snapshot ? blas_as->snapshot_size :
+                                                      blas_as->size;
+         if (!ventus_vtas_v2_validate(blas, blas_size, &validation))
+            return vk_error(device, VK_ERROR_UNKNOWN);
+      }
 
       struct vtvk_aabb blas_bounds = vtvk_header_aabb(blas);
       struct vtvk_aabb bounds = vtvk_transform_aabb(&inst->transform,
@@ -920,10 +1032,18 @@ vtvk_build_tlas(struct vtvk_device *device,
    }
 
    struct vtvk_build_node root =
-      vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
-   vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, root.ref, node_count,
+      vtvk_build_box_tree(dst, vtvk_target_as_version, &cursor, leaves,
+                          &node_count);
+   if (vtvk_target_as_version == VENTUS_AS_VERSION_V2)
+      vtvk_write_v2_root(dst, root.ref);
+   vtvk_write_header(dst, vtvk_target_as_version, VENTUS_AS_TYPE_TLAS,
+                     root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE, 0, instance_count,
                      &root.bounds);
+   VkResult validation = vtvk_validate_built_as(
+      device, dst, cursor, vtvk_target_as_version);
+   if (validation != VK_SUCCESS)
+      return validation;
    if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
       mesa_logi("ventus-vk: TLAS instance_count=%u node_count=%u root=0x%x",
                 instance_count, node_count, root.ref);
@@ -1110,10 +1230,9 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
       }
    }
    uint64_t internal_count = vtvk_internal_box_count(primitive_count);
-   uint64_t internal_bytes = internal_count * VENTUS_AS_BOX4_NODE_SIZE;
 
-   pSizeInfo->accelerationStructureSize =
-      VENTUS_AS_HEADER_SIZE + primitive_bytes + internal_bytes + 256;
+   pSizeInfo->accelerationStructureSize = vtvk_as_required_size(
+      vtvk_target_as_version, primitive_bytes, internal_count) + 256;
    pSizeInfo->updateScratchSize = 2048 + primitive_bytes;
    pSizeInfo->buildScratchSize = 4096 + primitive_bytes;
 }
@@ -1167,13 +1286,13 @@ vtvk_execute_recorded_as_build_command(
             vtvk_build_as(device, &build->infos[i],
                           ranges ? &ranges : nullptr);
          if (result != VK_SUCCESS) {
-            mesa_loge("ventus-vk: AS build failed for Ventus BVH ABI v1 "
-                      "object=%u (%d)", i, result);
+            mesa_loge("ventus-vk: AS build failed for Ventus BVH ABI v%u "
+                      "object=%u (%d)", vtvk_target_as_version, i, result);
             return result;
          }
       }
-      mesa_logi("ventus-vk: queue submit AS build wrote Ventus BVH ABI v1 "
-                "objects=%u", build->info_count);
+      mesa_logi("ventus-vk: queue submit AS build wrote Ventus BVH ABI v%u "
+                "objects=%u", vtvk_target_as_version, build->info_count);
       return VK_SUCCESS;
    }
 
@@ -1234,14 +1353,16 @@ vtvk_execute_recorded_as_build_command(
                        ranges ? &ranges : nullptr);
       if (result != VK_SUCCESS) {
          mesa_loge("ventus-vk: indirect AS build failed for Ventus BVH "
-                   "ABI v1 object=%u (%d)", i, result);
+                   "ABI v%u object=%u (%d)", vtvk_target_as_version, i,
+                   result);
          return result;
       }
    }
 
    mesa_logi("ventus-vk: queue submit indirect AS build wrote Ventus BVH "
-             "ABI v1 objects=%u geometries=%u",
-             build->info_count, build->total_geometry_count);
+             "ABI v%u objects=%u geometries=%u",
+             vtvk_target_as_version, build->info_count,
+             build->total_geometry_count);
    return VK_SUCCESS;
 }
 

@@ -11,6 +11,7 @@ vtvk_entrypoints = custom_target(
 )
 
 libvtvk_files = files(
+  '../common/ventus_rt_bvh_v2.cpp',
   'vtvk_acceleration_structure.cpp',
   'vtvk_cmd_buffer.c',
   'vtvk_descriptors.c',
