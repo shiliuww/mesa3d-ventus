@@ -331,20 +331,9 @@ resident_save_parent_state(
    nir_def *pds, nir_def *frame)
 {
    const uint32_t header = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
-   if (site->parent_pds_save_bytes) {
-      assert(site->parent_pds_save_bytes ==
-             VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
-      resident_copy_words(b, pds, 0, frame, header,
-                          VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
-      resident_copy_words(b, pds, VENTUS_RT_V5_PDS_COMMITTED_BASE, frame,
-                          header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
-                          VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
-   }
    resident_copy_words(
       b, pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE, frame,
-      header + site->parent_pds_save_bytes,
-      site->parent_payload_save_bytes);
+      header, site->parent_payload_save_bytes);
 }
 
 static bool
@@ -1068,21 +1057,6 @@ materialize_resident_intrinsic(nir_builder *b,
    nir_def *frame_state = resident_global_load_u32(b, frame, 0);
 
    nir_push_if(b, nir_ieq_imm(
-                     b, frame_state, VT_NIR_RT_FRAME_TRACE_NESTED));
-   const uint32_t header = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
-   if (site->parent_pds_save_bytes) {
-      assert(site->parent_pds_save_bytes ==
-             VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
-      resident_copy_words(b, frame, header, pds, 0,
-                          VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
-      resident_copy_words(b, frame,
-                          header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
-                          pds, VENTUS_RT_V5_PDS_COMMITTED_BASE,
-                          VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
-   }
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(
                      b, frame_state, VT_NIR_RT_FRAME_TRACE_ROOT));
    resident_global_store_u32(
       b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS,
@@ -1092,7 +1066,6 @@ materialize_resident_intrinsic(nir_builder *b,
       nir_imm_int(b, 0));
    vt_nir_store_active_level(
       b, state->config, VT_RT_LAYOUT_RAYGEN, nir_imm_int(b, 0));
-   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 
    vt_nir_rt_v5_publish_stack_pop(b, false);

@@ -3034,7 +3034,6 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    std::vector<vtvk_rt_resident_trace_shader> resident_trace_shaders;
    std::vector<struct vt_nir_rt_resident_continuation_info>
       resident_continuations;
-   bool resident_parent_state_ssa_complete = true;
    uint32_t callable_frame_bytes = 0;
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
@@ -3278,10 +3277,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
 
       for (const auto &resident_shader : resident_trace_shaders) {
-         bool shader_complete = false;
+         struct vt_nir_rt_parent_state_ssa_info parent_state = {};
          if (!vt_nir_opt_rt_parent_state_ssa(
                 resident_shader.shader, &resident_config,
-                &shader_complete)) {
+                &parent_state)) {
             mesa_loge("ventus-vk: V5 parent-state SSA preparation failed "
                       "for %s",
                       _mesa_shader_stage_to_string(
@@ -3289,11 +3288,16 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
             vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
             return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
          }
-         resident_parent_state_ssa_complete &= shader_complete;
-      }
-      if (!resident_parent_state_ssa_complete) {
-         mesa_logi("ventus-vk: V5 resident continuation retains the "
-                   "conservative parent-PDS snapshot");
+         if (parent_state.unresolved_access_count != 0) {
+            mesa_loge("ventus-vk: V5 parent-state SSA rejected %u raw "
+                      "carrier accesses (mask=0x%x) in %s",
+                      parent_state.unresolved_access_count,
+                      parent_state.unresolved_access_mask,
+                      _mesa_shader_stage_to_string(
+                         resident_shader.shader->info.stage));
+            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+         }
       }
 
       for (const auto &resident_shader : resident_trace_shaders) {
@@ -3365,7 +3369,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          if (!vt_nir_lower_rt_resident_continuations(
                 shader,
                 pipeline->max_ray_recursion_depth, ray_payload_size,
-                callable_data_size, resident_parent_state_ssa_complete,
+                callable_data_size, true,
                 &resident, pipeline->nir_mem_ctx)) {
             mesa_loge("ventus-vk: V5 resident trace continuation lowering "
                       "failed for %s",
@@ -3380,12 +3384,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                const struct vt_nir_rt_continuation_site &site =
                   resident.sites[site_index];
                mesa_logi("ventus-vk: RT trace continuation site stage=%s "
-                         "call=%u control=%u parent=%u live-ssa=%u "
+                         "call=%u control=%u live-ssa=%u "
                          "ssa-base=%u ssa-offset=%u "
                          "return=call-data+%u:%u frame=%u",
                          _mesa_shader_stage_to_string(shader->info.stage),
                          site.call_index, VT_NIR_RT_FRAME_BODY_OFFSET,
-                         site.parent_pds_save_bytes, site.ssa_spill_bytes,
+                         site.ssa_spill_bytes,
                          resident.scratch_base_bytes,
                          resident.scratch_offset_bytes,
                          site.return_data_offset, site.return_data_bytes,

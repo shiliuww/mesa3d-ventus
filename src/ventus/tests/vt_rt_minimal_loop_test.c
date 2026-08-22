@@ -546,12 +546,11 @@ main(int argc, char **argv)
    VT_RT_CHECK(resident_plan.sites[0].kind ==
                VT_NIR_RT_TRACE_CONTINUATION);
    VT_RT_CHECK(resident_plan.sites[0].ssa_spill_bytes == 0);
-   VT_RT_CHECK(resident_plan.sites[0].parent_pds_save_bytes == 192);
    VT_RT_CHECK(resident_plan.sites[0].parent_payload_save_bytes == 0);
    VT_RT_CHECK(resident_plan.sites[0].return_data_bytes ==
                linked_payload_size);
-   VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 224);
-   VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 480);
+   VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 32);
+   VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 96);
    VT_RT_CHECK((resident_plan.feature_flags &
                 VENTUS_RT_RESOURCE_USES_TRACE_CONTINUATION) != 0);
    nir_shader *callable_probe = build_resident_callable_probe(&options);
@@ -563,7 +562,6 @@ main(int argc, char **argv)
    VT_RT_CHECK(callable_plan.sites[0].kind ==
                VT_NIR_RT_CALLABLE_CONTINUATION);
    VT_RT_CHECK(callable_plan.sites[0].ssa_spill_bytes == 16);
-   VT_RT_CHECK(callable_plan.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(callable_plan.sites[0].parent_payload_save_bytes ==
                linked_payload_size);
    VT_RT_CHECK(callable_plan.sites[0].return_data_bytes ==
@@ -589,11 +587,12 @@ main(int argc, char **argv)
    parent_state_config.use_v5_pds = true;
    parent_state_config.enable_monolithic_shader_callbacks = true;
 
-   bool parent_state_ssa_complete = false;
+   struct vt_nir_rt_parent_state_ssa_info parent_state_ssa_info = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       parent_state_ssa_probe, &parent_state_config,
-      &parent_state_ssa_complete));
-   VT_RT_CHECK(parent_state_ssa_complete);
+      &parent_state_ssa_info));
+   VT_RT_CHECK(parent_state_ssa_info.unresolved_access_count == 0);
+   VT_RT_CHECK(parent_state_ssa_info.unresolved_access_mask == 0);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_state_ssa_probe, &parent_state_config));
    VT_RT_CHECK(vt_nir_lower_rt_abi(
@@ -601,17 +600,15 @@ main(int argc, char **argv)
    struct vt_nir_rt_resident_continuation_info parent_state_ssa = {};
    VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
       parent_state_ssa_probe, 2, linked_payload_size, 0,
-      parent_state_ssa_complete, &parent_state_ssa, cps_mem_ctx));
-   VT_RT_CHECK(parent_state_ssa.parent_state_ssa_complete);
+      true, &parent_state_ssa, cps_mem_ctx));
    VT_RT_CHECK(parent_state_ssa.site_count == 1);
-   VT_RT_CHECK(parent_state_ssa.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_state_ssa.sites[0].ssa_spill_bytes > 0);
 
-   bool parent_hit_attribute_complete = false;
+   struct vt_nir_rt_parent_state_ssa_info parent_hit_attribute_info = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       parent_hit_attribute_probe, &parent_state_config,
-      &parent_hit_attribute_complete));
-   VT_RT_CHECK(parent_hit_attribute_complete);
+      &parent_hit_attribute_info));
+   VT_RT_CHECK(parent_hit_attribute_info.unresolved_access_count == 0);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_hit_attribute_probe, &parent_state_config));
    VT_RT_CHECK(vt_nir_lower_rt_abi(
@@ -619,10 +616,8 @@ main(int argc, char **argv)
    struct vt_nir_rt_resident_continuation_info parent_hit_attribute = {};
    VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
       parent_hit_attribute_probe, 2, linked_payload_size, 0,
-      parent_hit_attribute_complete, &parent_hit_attribute, cps_mem_ctx));
-   VT_RT_CHECK(parent_hit_attribute.parent_state_ssa_complete);
+      true, &parent_hit_attribute, cps_mem_ctx));
    VT_RT_CHECK(parent_hit_attribute.site_count == 1);
-   VT_RT_CHECK(parent_hit_attribute.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_hit_attribute.sites[0].ssa_spill_bytes > 0);
 
    struct vt_nir_rt_abi_layout dynamic_hit_abi = abi;
@@ -633,11 +628,13 @@ main(int argc, char **argv)
    dynamic_hit_config.use_v5_pds = true;
    dynamic_hit_config.enable_monolithic_shader_callbacks = true;
 
-   bool parent_dynamic_hit_attribute_complete = false;
+   struct vt_nir_rt_parent_state_ssa_info
+      parent_dynamic_hit_attribute_info = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       parent_dynamic_hit_attribute_probe, &dynamic_hit_config,
-      &parent_dynamic_hit_attribute_complete));
-   VT_RT_CHECK(parent_dynamic_hit_attribute_complete);
+      &parent_dynamic_hit_attribute_info));
+   VT_RT_CHECK(
+      parent_dynamic_hit_attribute_info.unresolved_access_count == 0);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_dynamic_hit_attribute_probe, &dynamic_hit_config));
    VT_RT_CHECK(vt_nir_lower_rt_abi(
@@ -646,48 +643,43 @@ main(int argc, char **argv)
       parent_dynamic_hit_attribute = {};
    VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
       parent_dynamic_hit_attribute_probe, 2, linked_payload_size, 0,
-      parent_dynamic_hit_attribute_complete,
+      true,
       &parent_dynamic_hit_attribute, cps_mem_ctx));
-   VT_RT_CHECK(parent_dynamic_hit_attribute.parent_state_ssa_complete);
    VT_RT_CHECK(parent_dynamic_hit_attribute.site_count == 1);
-   VT_RT_CHECK(
-      parent_dynamic_hit_attribute.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_dynamic_hit_attribute.sites[0].ssa_spill_bytes > 0);
 
-   bool parent_named_pds_carrier_complete = false;
+   struct vt_nir_rt_parent_state_ssa_info parent_named_pds_carrier_info = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       parent_named_pds_carrier_probe, &parent_state_config,
-      &parent_named_pds_carrier_complete));
-   VT_RT_CHECK(parent_named_pds_carrier_complete);
+      &parent_named_pds_carrier_info));
+   VT_RT_CHECK(parent_named_pds_carrier_info.unresolved_access_count == 0);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_named_pds_carrier_probe, &parent_state_config));
    struct vt_nir_rt_resident_continuation_info parent_named_pds_carrier = {};
    VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
       parent_named_pds_carrier_probe, 2, linked_payload_size, 0,
-      parent_named_pds_carrier_complete, &parent_named_pds_carrier,
+      true, &parent_named_pds_carrier,
       cps_mem_ctx));
-   VT_RT_CHECK(parent_named_pds_carrier.parent_state_ssa_complete);
    VT_RT_CHECK(parent_named_pds_carrier.site_count == 1);
-   VT_RT_CHECK(
-      parent_named_pds_carrier.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_named_pds_carrier.sites[0].ssa_spill_bytes > 0);
 
-   bool parent_state_fallback_complete = true;
+   struct vt_nir_rt_parent_state_ssa_info parent_state_fallback_info = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       parent_state_fallback_probe, &parent_state_config,
-      &parent_state_fallback_complete));
-   VT_RT_CHECK(!parent_state_fallback_complete);
+      &parent_state_fallback_info));
+   VT_RT_CHECK(parent_state_fallback_info.unresolved_access_count != 0);
+   VT_RT_CHECK((parent_state_fallback_info.unresolved_access_mask &
+                VT_NIR_RT_PARENT_STATE_RAW_PDS_ADDRESS) != 0);
+   VT_RT_CHECK((parent_state_fallback_info.unresolved_access_mask &
+                VT_NIR_RT_PARENT_STATE_RAW_PDS_SLOT) != 0);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_state_fallback_probe, &parent_state_config));
    VT_RT_CHECK(vt_nir_lower_rt_abi(
       parent_state_fallback_probe, &parent_state_config));
    struct vt_nir_rt_resident_continuation_info parent_state_fallback = {};
-   VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
+   VT_RT_CHECK(!vt_nir_lower_rt_resident_continuations(
       parent_state_fallback_probe, 2, linked_payload_size, 0,
-      parent_state_fallback_complete, &parent_state_fallback, cps_mem_ctx));
-   VT_RT_CHECK(!parent_state_fallback.parent_state_ssa_complete);
-   VT_RT_CHECK(parent_state_fallback.site_count == 1);
-   VT_RT_CHECK(parent_state_fallback.sites[0].parent_pds_save_bytes == 192);
+      false, &parent_state_fallback, cps_mem_ctx));
 
    ralloc_free(callable_probe);
    fprintf(stderr, "stage cps-terminal\n");
@@ -826,11 +818,11 @@ main(int argc, char **argv)
    vt_nir_rt_config_apply_abi_layout(&resident_config, &abi);
    resident_config.use_v5_pds = true;
    resident_config.enable_monolithic_shader_callbacks = true;
-   bool resident_parent_state_ssa_complete = false;
+   struct vt_nir_rt_parent_state_ssa_info resident_parent_state = {};
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
       resident_raygen, &resident_config,
-      &resident_parent_state_ssa_complete));
-   VT_RT_CHECK(resident_parent_state_ssa_complete);
+      &resident_parent_state));
+   VT_RT_CHECK(resident_parent_state.unresolved_access_count == 0);
    nir_foreach_variable_in_shader(var, resident_raygen) {
       if (var->data.mode == nir_var_shader_temp ||
           var->data.mode == nir_var_shader_call_data) {
@@ -848,11 +840,9 @@ main(int argc, char **argv)
    struct vt_nir_rt_resident_continuation_info resident = {};
    VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
       resident_raygen, 1, linked_payload_size, 0,
-      resident_parent_state_ssa_complete, &resident, cps_mem_ctx));
+      true, &resident, cps_mem_ctx));
    VT_RT_CHECK(resident.site_count == 1);
    VT_RT_CHECK(resident.resume_shader_count == 0);
-   VT_RT_CHECK(resident.parent_state_ssa_complete);
-   VT_RT_CHECK(resident.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(resident.scratch_base_bytes == 308);
    VT_RT_CHECK(resident.scratch_offset_bytes == 16);
    VT_RT_CHECK(resident.scratch_bytes_per_thread == 16);

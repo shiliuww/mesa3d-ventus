@@ -493,11 +493,21 @@ struct vt_nir_rt_continuation_site {
    enum vt_nir_rt_continuation_kind kind;
    uint32_t call_index;
    uint32_t ssa_spill_bytes;
-   uint32_t parent_pds_save_bytes;
    uint32_t parent_payload_save_bytes;
    uint32_t return_data_offset;
    uint32_t return_data_bytes;
    uint32_t frame_size_bytes;
+};
+
+enum vt_nir_rt_parent_state_unresolved {
+   VT_NIR_RT_PARENT_STATE_HIT_ATTRIB_DEREF = BITFIELD_BIT(0),
+   VT_NIR_RT_PARENT_STATE_RAW_PDS_ADDRESS = BITFIELD_BIT(1),
+   VT_NIR_RT_PARENT_STATE_RAW_PDS_SLOT = BITFIELD_BIT(2),
+};
+
+struct vt_nir_rt_parent_state_ssa_info {
+   uint32_t unresolved_access_mask;
+   uint32_t unresolved_access_count;
 };
 
 struct vt_nir_rt_resident_continuation_info {
@@ -515,7 +525,6 @@ struct vt_nir_rt_resident_continuation_info {
    uint32_t scratch_offset_bytes;
    uint32_t state_frame_stride_bytes;
    uint32_t stack_bytes_per_thread;
-   bool parent_state_ssa_complete;
 };
 
 nir_def *vt_nir_rt_v5_continuation_stack_base(nir_builder *b);
@@ -557,12 +566,13 @@ bool vt_nir_prepare_rt_resident_continuations(
 
 /*
  * Hoist immutable parent-invocation RT system values into SSA before a
- * resident trace call can replace the active PDS image.  complete is false
- * when the shader contains a parent-state access which is not covered by the
- * SSA contract; callers must then retain the conservative PDS snapshot.
+ * resident trace call can replace the active PDS image.  The result records
+ * every access which is not covered by the SSA contract; production callers
+ * must reject a nonzero unresolved_access_count.
  */
 bool vt_nir_opt_rt_parent_state_ssa(
-   nir_shader *shader, const struct vt_nir_rt_config *config, bool *complete);
+   nir_shader *shader, const struct vt_nir_rt_config *config,
+   struct vt_nir_rt_parent_state_ssa_info *info);
 
 /* Lower resident trace calls in place.  Mesa's shader-call liveness pass
  * provides selective SSA spill/reload while preserving the original CFG. */
@@ -572,8 +582,8 @@ bool vt_nir_lower_rt_resident_continuations(
    bool parent_state_ssa_complete,
    struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx);
 
-/* Bind compiler-private scratch and parent-PDS frames to the per-thread V5
- * continuation range and remove all resident-continuation pseudo intrinsics. */
+/* Bind compiler-private scratch to the per-thread V5 continuation range and
+ * remove all resident-continuation pseudo intrinsics. */
 bool vt_nir_materialize_rt_resident_continuations(
    nir_shader *shader, const struct vt_nir_rt_config *config,
    const struct vt_nir_rt_resident_continuation_info *info);

@@ -342,7 +342,7 @@ lower_parent_hit_attrib_load(nir_builder *b, nir_instr *instr, void *data)
 static bool
 prepare_parent_hit_attrib_ssa(nir_shader *shader,
                               const struct vt_nir_rt_config *config,
-                              bool *complete)
+                              struct vt_nir_rt_parent_state_ssa_info *info)
 {
    bool progress = false;
    progress |= nir_lower_vars_to_explicit_types(
@@ -363,8 +363,11 @@ prepare_parent_hit_attrib_ssa(nir_shader *shader,
             if (instr->type != nir_instr_type_deref)
                continue;
             nir_deref_instr *deref = nir_instr_as_deref(instr);
-            if (nir_deref_mode_is(deref, nir_var_ray_hit_attrib))
-               *complete = false;
+            if (nir_deref_mode_is(deref, nir_var_ray_hit_attrib)) {
+               info->unresolved_access_mask |=
+                  VT_NIR_RT_PARENT_STATE_HIT_ATTRIB_DEREF;
+               info->unresolved_access_count++;
+            }
          }
       }
    }
@@ -374,10 +377,11 @@ prepare_parent_hit_attrib_ssa(nir_shader *shader,
 bool
 vt_nir_opt_rt_parent_state_ssa(nir_shader *shader,
                                const struct vt_nir_rt_config *config,
-                               bool *complete)
+                               struct vt_nir_rt_parent_state_ssa_info *info)
 {
-   if (!shader || !config || !complete)
+   if (!shader || !config || !info)
       return false;
+   *info = (struct vt_nir_rt_parent_state_ssa_info) {0};
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    if (!impl)
@@ -397,11 +401,10 @@ vt_nir_opt_rt_parent_state_ssa(nir_shader *shader,
          break;
    }
 
-   *complete = true;
    if (!has_trace)
       return true;
 
-   bool progress = prepare_parent_hit_attrib_ssa(shader, config, complete);
+   bool progress = prepare_parent_hit_attrib_ssa(shader, config, info);
    nir_foreach_block(block, impl) {
       nir_foreach_instr_safe(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
@@ -418,22 +421,19 @@ vt_nir_opt_rt_parent_state_ssa(nir_shader *shader,
             continue;
          }
 
-         if (intrin->intrinsic == nir_intrinsic_load_deref &&
-             nir_src_is_deref(intrin->src[0])) {
-            nir_variable *var = nir_deref_instr_get_variable(
-               nir_src_as_deref(intrin->src[0]));
-            if (var && var->data.mode == nir_var_ray_hit_attrib)
-               *complete = false;
-         }
-
-         /* Direct PDS access is outside the system-value proof.  Preserve the
-          * old full snapshot unless a later compiler pass gives it an
-          * explicit SSA lifetime. */
          if (intrin->intrinsic ==
-                nir_intrinsic_ventus_rt_hot_pds_address ||
-             intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot ||
-             intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot)
-            *complete = false;
+             nir_intrinsic_ventus_rt_hot_pds_address) {
+            info->unresolved_access_mask |=
+               VT_NIR_RT_PARENT_STATE_RAW_PDS_ADDRESS;
+            info->unresolved_access_count++;
+         } else if (intrin->intrinsic ==
+                       nir_intrinsic_ventus_rt_load_slot ||
+                    intrin->intrinsic ==
+                       nir_intrinsic_ventus_rt_store_slot) {
+            info->unresolved_access_mask |=
+               VT_NIR_RT_PARENT_STATE_RAW_PDS_SLOT;
+            info->unresolved_access_count++;
+         }
       }
    }
 
@@ -473,15 +473,11 @@ count_trace_calls(nir_shader *shader, uint32_t *count)
 }
 
 static bool
-resident_site_frame_size(enum vt_nir_rt_continuation_kind kind,
-                         uint32_t ssa_spill_bytes,
-                         uint32_t parent_pds_save_bytes,
+resident_site_frame_size(uint32_t ssa_spill_bytes,
                          uint32_t payload_size_bytes,
                          uint32_t *frame_size_bytes)
 {
    uint64_t fixed_bytes = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
-   if (kind == VT_NIR_RT_TRACE_CONTINUATION)
-      fixed_bytes += parent_pds_save_bytes;
    fixed_bytes += payload_size_bytes;
    if (fixed_bytes > UINT32_MAX - ssa_spill_bytes)
       return false;
@@ -500,7 +496,6 @@ static bool
 collect_resident_sites(
    nir_shader *shader, uint32_t ordinary_scratch_bytes,
    uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
-   uint32_t parent_pds_save_bytes,
    struct vt_nir_rt_resident_continuation_info *info, bool *seen)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
@@ -532,9 +527,7 @@ collect_resident_sites(
             kind == VT_NIR_RT_TRACE_CONTINUATION ?
                0 : callable_data_size_bytes;
          uint32_t frame_size_bytes = 0;
-         if (!resident_site_frame_size(kind, ssa_spill_bytes,
-                                       kind == VT_NIR_RT_TRACE_CONTINUATION ?
-                                          parent_pds_save_bytes : 0,
+         if (!resident_site_frame_size(ssa_spill_bytes,
                                        parent_payload_save_bytes,
                                        &frame_size_bytes))
             return false;
@@ -552,9 +545,6 @@ collect_resident_sites(
             .kind = kind,
             .call_index = call_index,
             .ssa_spill_bytes = ssa_spill_bytes,
-            .parent_pds_save_bytes =
-               kind == VT_NIR_RT_TRACE_CONTINUATION ?
-                  parent_pds_save_bytes : 0,
             .parent_payload_save_bytes = parent_payload_save_bytes,
             .return_data_bytes =
                kind == VT_NIR_RT_TRACE_CONTINUATION ?
@@ -708,16 +698,12 @@ vt_nir_plan_rt_resident_continuations(
       return false;
    if (!collect_resident_sites(analysis, ordinary_scratch_bytes,
                                payload_size_bytes, callable_data_size_bytes,
-                               VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                                  VENTUS_RT_V5_TRACE_COMMITTED_BYTES,
                                info, seen))
       return false;
    for (uint32_t i = 0; i < resume_shader_count; i++) {
       if (!collect_resident_sites(resume_shaders[i], ordinary_scratch_bytes,
                                   payload_size_bytes,
                                   callable_data_size_bytes,
-                                  VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-                                     VENTUS_RT_V5_TRACE_COMMITTED_BYTES,
                                   info, seen))
          return false;
    }
@@ -753,12 +739,12 @@ vt_nir_lower_rt_resident_continuations(
    struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx)
 {
    if (!shader || !info || !mem_ctx ||
+       !parent_state_ssa_complete ||
        payload_size_bytes > VENTUS_RT_MAX_PAYLOAD_BYTES_V5 ||
        callable_data_size_bytes > VENTUS_RT_MAX_CALLABLE_DATA_BYTES_V5)
       return false;
    *info = (struct vt_nir_rt_resident_continuation_info) {0};
    info->lowered_initial_shader = shader;
-   info->parent_state_ssa_complete = parent_state_ssa_complete;
 
    uint32_t site_count = 0;
    if (!count_trace_calls(shader, &site_count))
@@ -787,13 +773,9 @@ vt_nir_lower_rt_resident_continuations(
    info->sites = rzalloc_array(mem_ctx, struct vt_nir_rt_continuation_site,
                                site_count);
    bool *seen = rzalloc_array(mem_ctx, bool, site_count);
-   const uint32_t parent_pds_save_bytes = parent_state_ssa_complete ? 0 :
-      VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-         VENTUS_RT_V5_TRACE_COMMITTED_BYTES;
    if (!info->sites || !seen ||
        !collect_resident_sites(shader, ordinary_scratch_bytes,
                                payload_size_bytes, callable_data_size_bytes,
-                               parent_pds_save_bytes,
                                info, seen))
       return false;
    for (uint32_t i = 0; i < site_count; i++) {
@@ -808,8 +790,7 @@ vt_nir_lower_rt_resident_continuations(
        !align_u32(shader->scratch_size - ordinary_scratch_bytes,
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->scratch_bytes_per_thread) ||
-       !align_u32(VENTUS_RT_V5_CONTINUATION_HEADER_BYTES +
-                     parent_pds_save_bytes,
+       !align_u32(VENTUS_RT_V5_CONTINUATION_HEADER_BYTES,
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->scratch_offset_bytes))
       return false;
