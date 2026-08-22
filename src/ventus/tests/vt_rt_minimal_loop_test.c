@@ -421,7 +421,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(resident_plan.sites[0].return_data_bytes ==
                linked_payload_size);
    VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 224);
-   VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 224);
+   VT_RT_CHECK(resident_plan.stack_bytes_per_thread == 480);
    VT_RT_CHECK((resident_plan.feature_flags &
                 VENTUS_RT_RESOURCE_USES_TRACE_CONTINUATION) != 0);
    nir_shader *callable_probe = build_resident_callable_probe(&options);
@@ -438,14 +438,14 @@ main(int argc, char **argv)
                linked_payload_size);
    VT_RT_CHECK(callable_plan.sites[0].return_data_bytes ==
                linked_payload_size);
-   VT_RT_CHECK(callable_plan.sites[0].frame_size_bytes == 48);
-   VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 48);
+   VT_RT_CHECK(callable_plan.sites[0].frame_size_bytes == 64);
+   VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 288);
    struct vt_nir_rt_resident_continuation_info wide_callable_plan = {};
    VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 48,
       &wide_callable_plan, cps_mem_ctx));
-   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 48);
-   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 48);
+   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 64);
+   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 288);
    VT_RT_CHECK(!vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 0,
       &wide_callable_plan, cps_mem_ctx));
@@ -608,8 +608,10 @@ main(int argc, char **argv)
       resident_raygen, 1, linked_payload_size, 0, &resident, cps_mem_ctx));
    VT_RT_CHECK(resident.site_count == 1);
    VT_RT_CHECK(resident.resume_shader_count == 0);
-   VT_RT_CHECK(resident.state_frame_stride_bytes == 224);
-   VT_RT_CHECK(resident.stack_bytes_per_thread >= 224);
+   VT_RT_CHECK(resident.scratch_offset_bytes == 224);
+   VT_RT_CHECK(resident.scratch_bytes_per_thread == 320);
+   VT_RT_CHECK(resident.state_frame_stride_bytes == 544);
+   VT_RT_CHECK(resident.stack_bytes_per_thread == 1120);
    resident_config.use_v5_resident_continuations = true;
    resident_config.v5_continuation_scratch_bytes =
       resident.scratch_bytes_per_thread;

@@ -139,6 +139,20 @@ public:
         entryPointNames(options ? options->entry_point_names : nullptr),
         entryPointCount(options ? options->entry_point_count : 0) {}
 
+   void predeclareEntryPoints()
+   {
+      if (!entryPointNames)
+         return;
+
+      for (unsigned i = 0; i < entryPointCount; ++i) {
+         const char *name = entryPointNames[i];
+         if (!name || !name[0] || module.getFunction(name))
+            continue;
+         Function::Create(FunctionType::get(Type::getVoidTy(context), false),
+                          GlobalValue::ExternalLinkage, name, module);
+      }
+   }
+
    bool translate(nir_shader *shader, unsigned shaderIndex,
                   bool requireSsaFunctionTemps)
    {
@@ -777,9 +791,12 @@ private:
          name = entryPointName;
       else if (shader->info.stage == MESA_SHADER_RAYGEN)
          name = "main";
-      Function *fn =
-         Function::Create(FunctionType::get(Type::getVoidTy(context), false),
-                          GlobalValue::ExternalLinkage, name, module);
+      Function *fn = module.getFunction(name);
+      if (!fn) {
+         fn = Function::Create(
+            FunctionType::get(Type::getVoidTy(context), false),
+            GlobalValue::ExternalLinkage, name, module);
+      }
       if (entryPointIsKernel || name == "main") {
          fn->setCallingConv(static_cast<CallingConv::ID>(VENTUS_KERNEL_CALLING_CONV));
          if (emitRtResourceV4) {
@@ -2543,6 +2560,10 @@ vt_nir_to_llvm_translate(nir_shader **shaders, unsigned shader_count,
    module->setDataLayout(options && options->data_layout ? options->data_layout : "e-m:e-p:32:32-i64:64-n32-S128-A5-G1");
 
    VentusNirToLlvm translator(context, *module, options);
+   /* Entry calls may target a shader translated later in the array.  Declare
+    * the complete same-ELF entry set first so nested Callable and other
+    * forward edges do not depend on translation order. */
+   translator.predeclareEntryPoints();
    for (unsigned i = 0; i < shader_count; ++i) {
       if (shaders[i] && !translator.translate(
                             shaders[i], i,

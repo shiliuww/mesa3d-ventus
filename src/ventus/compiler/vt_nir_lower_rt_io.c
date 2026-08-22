@@ -176,25 +176,6 @@ emit_trace_callbacks(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
-enum resident_frame_state {
-   RESIDENT_FRAME_INACTIVE = 0,
-   RESIDENT_FRAME_ROOT = 1,
-   RESIDENT_FRAME_NESTED = 2,
-};
-
-static nir_def *
-resident_frame_address(nir_builder *b, const struct vt_nir_rt_config *config,
-                       uint32_t call_site)
-{
-   const uint64_t offset =
-      (uint64_t)VENTUS_RT_V5_PDS_SIZE_BYTES +
-      config->v5_continuation_scratch_bytes +
-      (uint64_t)call_site *
-         config->v5_continuation_state_frame_stride_bytes;
-   assert(offset <= UINT32_MAX);
-   return nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, (uint32_t)offset));
-}
-
 static nir_def *
 resident_global_load_u32(nir_builder *b, nir_def *base, uint32_t offset)
 {
@@ -387,33 +368,13 @@ lower_trace_ray_v5(nir_builder *b, nir_intrinsic_instr *intrin,
       .private_state_address = private_state_address,
    };
    if (resident) {
-      const uint32_t call_site = nir_intrinsic_call_idx(intrin);
-      nir_def *frame = resident_frame_address(b, config, call_site);
       nir_def *parent_depth = vt_nir_load_active_level(
          b, config, VT_RT_LAYOUT_RAYGEN);
       nir_def *max_depth = load_dispatch_arg(
          b, VT_NIR_RT_DISPATCH_ARG_MAX_RAY_RECURSION_DEPTH, 32);
       nir_def *depth_allowed = nir_ult(b, parent_depth, max_depth);
-      resident_global_store_u32(
-         b, frame, 0, nir_imm_int(b, RESIDENT_FRAME_INACTIVE));
 
       nir_push_if(b, depth_allowed);
-      nir_def *has_parent = nir_ine_imm(b, parent_depth, 0);
-      nir_push_if(b, has_parent);
-      resident_save_parent_pds(b, config, pds_address, frame);
-      resident_global_store_u32(
-         b, frame, 0, nir_imm_int(b, RESIDENT_FRAME_NESTED));
-      nir_push_else(b, NULL);
-      resident_global_store_u32(
-         b, frame, 0, nir_imm_int(b, RESIDENT_FRAME_ROOT));
-      nir_pop_if(b, NULL);
-
-      resident_global_store_u32(
-         b, pds_address, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS,
-         nir_u2u32(b, frame));
-      resident_global_store_u32(
-         b, pds_address, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS + 4,
-         nir_unpack_64_2x32_split_y(b, nir_u2u64(b, frame)));
       vt_nir_store_active_level(
          b, config, VT_RT_LAYOUT_RAYGEN, nir_iadd_imm(b, parent_depth, 1));
       store_raygen_callback_decision(b, config, VT_RT_CALLBACK_PENDING);
@@ -968,12 +929,15 @@ struct materialize_resident_state {
 };
 
 static nir_def *
-resident_scratch_address(nir_builder *b, nir_def *offset)
+resident_scratch_address(
+   nir_builder *b, const struct vt_nir_rt_resident_continuation_info *info,
+   nir_def *offset)
 {
-   nir_def *logical_offset = nir_iadd_imm(
-      b, nir_u2u32(b, offset), VENTUS_RT_V5_PDS_SIZE_BYTES);
-   return nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(b, logical_offset));
+   return nir_iadd(
+      b, vt_nir_rt_v5_current_continuation_frame(b),
+      nir_u2u64(b, nir_iadd_imm(
+                      b, nir_u2u32(b, offset),
+                      info->scratch_offset_bytes)));
 }
 
 static bool
@@ -982,14 +946,42 @@ materialize_resident_intrinsic(nir_builder *b,
 {
    struct materialize_resident_state *state = data;
    switch (intrin->intrinsic) {
-   case nir_intrinsic_ventus_rt_continuation_begin:
+   case nir_intrinsic_ventus_rt_continuation_begin: {
+      if (!nir_src_is_const(intrin->src[0])) {
+         state->failed = true;
+         return false;
+      }
+      const uint32_t token = nir_src_as_uint(intrin->src[0]);
+      if (token >= state->info->site_count) {
+         state->failed = true;
+         return false;
+      }
+      b->cursor = nir_before_instr(&intrin->instr);
+      nir_def *pds = nir_u2u64(
+         b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
+      nir_def *parent_depth = vt_nir_load_active_level(
+         b, state->config, VT_RT_LAYOUT_RAYGEN);
+      nir_def *has_parent = nir_ine_imm(b, parent_depth, 0);
+      struct vt_nir_rt_stack_cursor cursor;
+      vt_nir_rt_v5_load_stack_cursor(b, &cursor);
+      nir_push_if(b, has_parent);
+      resident_save_parent_pds(
+         b, state->config, pds, cursor.next_frame);
+      nir_pop_if(b, NULL);
+      vt_nir_rt_v5_publish_stack_push(
+         b, &cursor,
+         nir_bcsel(b, has_parent,
+                   nir_imm_int(b, VT_NIR_RT_FRAME_TRACE_NESTED),
+                   nir_imm_int(b, VT_NIR_RT_FRAME_TRACE_ROOT)),
+         nir_imm_int(b, token), NULL, false);
       nir_instr_remove(&intrin->instr);
       return true;
+   }
    case nir_intrinsic_load_scratch: {
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def *value = nir_load_global(
          b, intrin->def.num_components, intrin->def.bit_size,
-         resident_scratch_address(b, intrin->src[0].ssa),
+         resident_scratch_address(b, state->info, intrin->src[0].ssa),
          .align_mul = nir_intrinsic_align_mul(intrin),
          .align_offset = nir_intrinsic_align_offset(intrin));
       nir_def_rewrite_uses(&intrin->def, value);
@@ -1000,7 +992,7 @@ materialize_resident_intrinsic(nir_builder *b,
       b->cursor = nir_before_instr(&intrin->instr);
       nir_store_global(
          b, intrin->src[0].ssa,
-         resident_scratch_address(b, intrin->src[1].ssa),
+         resident_scratch_address(b, state->info, intrin->src[1].ssa),
          .write_mask = nir_intrinsic_write_mask(intrin),
          .align_mul = nir_intrinsic_align_mul(intrin),
          .align_offset = nir_intrinsic_align_offset(intrin));
@@ -1039,7 +1031,7 @@ materialize_resident_intrinsic(nir_builder *b,
 
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *pds = nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
-   nir_def *frame = resident_frame_address(b, state->config, call_site);
+   nir_def *frame = vt_nir_rt_v5_current_continuation_frame(b);
    nir_def *frame_state = resident_global_load_u32(b, frame, 0);
    nir_def *child_payload[VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES / 4];
    const uint32_t payload_words = payload_bytes / sizeof(uint32_t);
@@ -1048,7 +1040,8 @@ materialize_resident_intrinsic(nir_builder *b,
          b, pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE + payload_offset + word * 4);
    }
 
-   nir_push_if(b, nir_ieq_imm(b, frame_state, RESIDENT_FRAME_NESTED));
+   nir_push_if(b, nir_ieq_imm(
+                     b, frame_state, VT_NIR_RT_FRAME_TRACE_NESTED));
    const uint32_t header = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
    resident_copy_words(b, frame, header, pds, 0,
                        VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
@@ -1069,7 +1062,8 @@ materialize_resident_intrinsic(nir_builder *b,
          child_payload[word]);
    }
    nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, frame_state, RESIDENT_FRAME_ROOT));
+   nir_push_if(b, nir_ieq_imm(
+                     b, frame_state, VT_NIR_RT_FRAME_TRACE_ROOT));
    resident_global_store_u32(
       b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS,
       nir_imm_int(b, 0));
@@ -1080,6 +1074,8 @@ materialize_resident_intrinsic(nir_builder *b,
       b, state->config, VT_RT_LAYOUT_RAYGEN, nir_imm_int(b, 0));
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
+
+   vt_nir_rt_v5_publish_stack_pop(b, false);
 
    nir_instr_remove(&intrin->instr);
    return true;

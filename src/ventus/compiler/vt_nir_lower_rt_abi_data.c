@@ -11,6 +11,7 @@
 #include "ventus/common/ventus_rt_v5.h"
 
 #include <limits.h>
+#include <stdio.h>
 
 #define VT_RT_MAX_PAYLOAD_LOCATIONS 32
 
@@ -440,8 +441,18 @@ vt_nir_rt_compute_pipeline_call_data_sizes(
                   continue;
                }
 
-               if (!include_call_data_variable(var, end))
+               if (!include_call_data_variable(var, end)) {
+                  fprintf(stderr,
+                          "ventus-nir: unresolved RT call-data operand "
+                          "stage=%s variable=%s mode=0x%x explicit=%u "
+                          "location=%d\n",
+                          _mesa_shader_stage_to_string(shader->info.stage),
+                          var && var->name ? var->name : "<none>",
+                          var ? (unsigned)var->data.mode : 0,
+                          var && var->data.explicit_location ? 1 : 0,
+                          var ? var->data.location : -1);
                   return false;
+               }
                locations[var->data.location] = true;
             }
          }

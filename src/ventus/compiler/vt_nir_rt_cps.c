@@ -6,10 +6,161 @@
 #include "vt_nir.h"
 
 #include <limits.h>
+#include <string.h>
 
 #include "util/ralloc.h"
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_v5.h"
+
+static nir_def *
+stack_load_u32(nir_builder *b, nir_def *base, uint32_t offset)
+{
+   return nir_load_global(b, 1, 32,
+                          nir_iadd_imm(b, nir_u2u64(b, base), offset),
+                          .align_mul = 4);
+}
+
+static void
+stack_store_u32(nir_builder *b, nir_def *base, uint32_t offset,
+                nir_def *value)
+{
+   nir_store_global(b, nir_u2u32(b, value),
+                    nir_iadd_imm(b, nir_u2u64(b, base), offset),
+                    .write_mask = 0x1, .align_mul = 4);
+}
+
+nir_def *
+vt_nir_rt_v5_continuation_stack_base(nir_builder *b)
+{
+   return nir_u2u64(
+      b, nir_ventus_rt_hot_pds_address(
+            b, nir_imm_int(b, VENTUS_RT_V5_PDS_SIZE_BYTES)));
+}
+
+nir_def *
+vt_nir_rt_v5_current_continuation_frame(nir_builder *b)
+{
+   nir_def *pds = nir_u2u64(
+      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
+   return nir_load_global(
+      b, 1, 64,
+      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
+      .align_mul = 8);
+}
+
+void
+vt_nir_rt_v5_load_stack_cursor(nir_builder *b,
+                               struct vt_nir_rt_stack_cursor *cursor)
+{
+   memset(cursor, 0, sizeof(*cursor));
+   cursor->base = vt_nir_rt_v5_continuation_stack_base(b);
+   cursor->stack_pointer = stack_load_u32(
+      b, cursor->base, VT_NIR_RT_STACK_SP_OFFSET);
+   cursor->callable_depth = stack_load_u32(
+      b, cursor->base, VT_NIR_RT_STACK_CALLABLE_DEPTH_OFFSET);
+   cursor->frame_stride = stack_load_u32(
+      b, cursor->base, VT_NIR_RT_STACK_FRAME_STRIDE_OFFSET);
+   cursor->frame_capacity = stack_load_u32(
+      b, cursor->base, VT_NIR_RT_STACK_FRAME_CAPACITY_OFFSET);
+   cursor->callable_capacity = stack_load_u32(
+      b, cursor->base, VT_NIR_RT_STACK_CALLABLE_CAPACITY_OFFSET);
+   cursor->next_frame = nir_iadd(
+      b, nir_iadd_imm(b, cursor->base, VT_NIR_RT_STACK_HEADER_BYTES),
+      nir_u2u64(b, nir_imul(b, cursor->stack_pointer,
+                            cursor->frame_stride)));
+}
+
+void
+vt_nir_rt_v5_publish_stack_push(
+   nir_builder *b, const struct vt_nir_rt_stack_cursor *cursor,
+   nir_def *frame_kind, nir_def *site_id,
+   nir_def *record_ptr, bool callable)
+{
+   stack_store_u32(b, cursor->next_frame, VT_NIR_RT_FRAME_KIND_OFFSET,
+                   frame_kind);
+   stack_store_u32(b, cursor->next_frame, VT_NIR_RT_FRAME_SITE_OFFSET,
+                   site_id ? site_id : nir_imm_int(b, 0));
+   nir_store_global(
+      b, record_ptr ? nir_u2u64(b, record_ptr) : nir_imm_int64(b, 0),
+      nir_iadd_imm(b, cursor->next_frame,
+                   VT_NIR_RT_FRAME_RECORD_PTR_OFFSET),
+      .write_mask = 0x1, .align_mul = 8);
+   stack_store_u32(b, cursor->base, VT_NIR_RT_STACK_SP_OFFSET,
+                   nir_iadd_imm(b, cursor->stack_pointer, 1));
+   if (callable) {
+      stack_store_u32(b, cursor->base,
+                      VT_NIR_RT_STACK_CALLABLE_DEPTH_OFFSET,
+                      nir_iadd_imm(b, cursor->callable_depth, 1));
+   }
+
+   nir_def *pds = nir_u2u64(
+      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
+   nir_store_global(
+      b, cursor->next_frame,
+      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
+      .write_mask = 0x1, .align_mul = 8);
+}
+
+void
+vt_nir_rt_v5_publish_stack_pop(nir_builder *b, bool callable)
+{
+   struct vt_nir_rt_stack_cursor cursor;
+   vt_nir_rt_v5_load_stack_cursor(b, &cursor);
+   nir_def *new_sp = nir_iadd_imm(b, cursor.stack_pointer, -1);
+   stack_store_u32(b, cursor.base, VT_NIR_RT_STACK_SP_OFFSET, new_sp);
+   if (callable) {
+      stack_store_u32(b, cursor.base,
+                      VT_NIR_RT_STACK_CALLABLE_DEPTH_OFFSET,
+                      nir_iadd_imm(b, cursor.callable_depth, -1));
+   }
+
+   nir_def *previous = nir_iadd(
+      b, nir_iadd_imm(b, cursor.base, VT_NIR_RT_STACK_HEADER_BYTES),
+      nir_u2u64(b, nir_imul(
+                      b, nir_iadd_imm(b, new_sp, -1), cursor.frame_stride)));
+   previous = nir_bcsel(b, nir_ine_imm(b, new_sp, 0), previous,
+                        nir_imm_int64(b, 0));
+   nir_def *pds = nir_u2u64(
+      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
+   nir_store_global(
+      b, previous,
+      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
+      .write_mask = 0x1, .align_mul = 8);
+}
+
+bool
+vt_nir_rt_v5_initialize_continuation_stack(
+   nir_shader *shader, uint32_t frame_stride, uint32_t frame_capacity,
+   uint32_t callable_capacity)
+{
+   if (!shader || frame_stride < VT_NIR_RT_CALLABLE_FRAME_BYTES ||
+       (frame_stride & (VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES - 1)) ||
+       frame_capacity == 0 || callable_capacity > frame_capacity)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (!impl)
+      return false;
+   nir_builder b = nir_builder_at(nir_before_cf_list(&impl->body));
+   nir_def *base = vt_nir_rt_v5_continuation_stack_base(&b);
+   stack_store_u32(&b, base, VT_NIR_RT_STACK_SP_OFFSET, nir_imm_int(&b, 0));
+   stack_store_u32(&b, base, VT_NIR_RT_STACK_CALLABLE_DEPTH_OFFSET,
+                   nir_imm_int(&b, 0));
+   stack_store_u32(&b, base, VT_NIR_RT_STACK_FRAME_STRIDE_OFFSET,
+                   nir_imm_int(&b, frame_stride));
+   stack_store_u32(&b, base, VT_NIR_RT_STACK_FRAME_CAPACITY_OFFSET,
+                   nir_imm_int(&b, frame_capacity));
+   stack_store_u32(&b, base, VT_NIR_RT_STACK_CALLABLE_CAPACITY_OFFSET,
+                   nir_imm_int(&b, callable_capacity));
+
+   nir_def *pds = nir_u2u64(
+      &b, nir_ventus_rt_hot_pds_address(&b, nir_imm_int(&b, 0)));
+   nir_store_global(
+      &b, nir_imm_int64(&b, 0),
+      nir_iadd_imm(&b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
+      .write_mask = 0x1, .align_mul = 8);
+   return true;
+}
 
 static bool
 remove_nonresident_call_for_analysis(nir_builder *b,
@@ -36,6 +187,35 @@ align_u32(uint32_t value, uint32_t alignment, uint32_t *result)
    return true;
 }
 
+bool
+vt_nir_rt_v5_compute_continuation_stack_layout(
+   uint32_t frame_stride, uint32_t max_active_trace_frames,
+   uint32_t max_active_callable_frames, bool reserve_trace_guard_frame,
+   uint32_t *physical_frame_capacity, uint32_t *stack_bytes_per_thread)
+{
+   if (!physical_frame_capacity || !stack_bytes_per_thread ||
+       frame_stride == 0 ||
+       (frame_stride & (VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES - 1)))
+      return false;
+
+   const uint64_t guard_frames =
+      reserve_trace_guard_frame && max_active_trace_frames ? 1 : 0;
+   const uint64_t capacity = (uint64_t)max_active_trace_frames +
+                             max_active_callable_frames + guard_frames;
+   const uint64_t bytes = VT_NIR_RT_STACK_HEADER_BYTES +
+                          capacity * frame_stride;
+   if (capacity == 0 || capacity > UINT32_MAX || bytes > UINT32_MAX)
+      return false;
+
+   uint32_t aligned_bytes = 0;
+   if (!align_u32((uint32_t)bytes,
+                  VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES, &aligned_bytes))
+      return false;
+   *physical_frame_capacity = (uint32_t)capacity;
+   *stack_bytes_per_thread = aligned_bytes;
+   return true;
+}
+
 static bool
 resident_state_frame_stride(uint32_t payload_size_bytes, uint32_t *stride)
 {
@@ -45,7 +225,7 @@ resident_state_frame_stride(uint32_t payload_size_bytes, uint32_t *stride)
                           payload_size_bytes;
    return bytes <= UINT32_MAX &&
           align_u32((uint32_t)bytes,
-                    VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES, stride);
+                    VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES, stride);
 }
 
 static bool
@@ -90,7 +270,7 @@ resident_site_frame_size(enum vt_nir_rt_continuation_kind kind,
    if (fixed_bytes > UINT32_MAX - ssa_spill_bytes)
       return false;
    return align_u32((uint32_t)fixed_bytes + ssa_spill_bytes,
-                    VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+                    VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES,
                     frame_size_bytes);
 }
 
@@ -278,13 +458,18 @@ vt_nir_plan_rt_resident_continuations(
       return false;
    if (info->max_callable_frame_bytes && callable_data_size_bytes == 0)
       return false;
-   uint64_t stack_bytes =
-      (uint64_t)info->max_trace_frame_bytes * max_ray_recursion_depth +
-      info->max_callable_frame_bytes;
-   if (stack_bytes > UINT32_MAX ||
-       !align_u32((uint32_t)stack_bytes,
-                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
-                  &info->stack_bytes_per_thread))
+   const uint32_t frame_stride = MAX2(
+      MAX2(info->max_trace_frame_bytes, info->max_callable_frame_bytes),
+      info->max_callable_frame_bytes ? VT_NIR_RT_CALLABLE_FRAME_BYTES : 0);
+   const uint32_t callable_capacity =
+      info->max_callable_frame_bytes ? VT_NIR_RT_BASE_CALLABLE_DEPTH : 0;
+   const uint32_t trace_capacity =
+      info->max_trace_frame_bytes ? max_ray_recursion_depth : 0;
+   uint32_t physical_capacity = 0;
+   if (!vt_nir_rt_v5_compute_continuation_stack_layout(
+          frame_stride, trace_capacity, callable_capacity,
+          trace_capacity != 0, &physical_capacity,
+          &info->stack_bytes_per_thread))
       return false;
    return true;
 }
@@ -345,15 +530,26 @@ vt_nir_lower_rt_resident_continuations(
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->scratch_bytes_per_thread) ||
        !resident_state_frame_stride(payload_size_bytes,
-                                    &info->state_frame_stride_bytes))
+                                    &info->scratch_offset_bytes))
       return false;
-   const uint64_t state_bytes =
-      (uint64_t)site_count * info->state_frame_stride_bytes;
-   const uint64_t total = info->scratch_bytes_per_thread + state_bytes;
-   if (total > UINT32_MAX - VENTUS_RT_V5_PDS_SIZE_BYTES ||
-       !align_u32((uint32_t)total,
-                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
-                  &info->stack_bytes_per_thread))
+   const uint64_t frame_bytes =
+      (uint64_t)info->scratch_offset_bytes + info->scratch_bytes_per_thread;
+   if (frame_bytes > UINT32_MAX ||
+       !align_u32((uint32_t)frame_bytes,
+                  VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES,
+                  &info->state_frame_stride_bytes))
+      return false;
+   info->state_frame_stride_bytes = MAX2(
+      info->state_frame_stride_bytes, VT_NIR_RT_CALLABLE_FRAME_BYTES);
+   info->max_trace_frame_bytes = MAX2(
+      info->max_trace_frame_bytes, info->state_frame_stride_bytes);
+   const uint32_t callable_capacity =
+      callable_data_size_bytes ? VT_NIR_RT_BASE_CALLABLE_DEPTH : 0;
+   uint32_t physical_capacity = 0;
+   if (!vt_nir_rt_v5_compute_continuation_stack_layout(
+          info->state_frame_stride_bytes, max_ray_recursion_depth,
+          callable_capacity, true, &physical_capacity,
+          &info->stack_bytes_per_thread))
       return false;
 
    return true;

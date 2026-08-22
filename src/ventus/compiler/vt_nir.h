@@ -154,6 +154,39 @@ struct vt_nir_pipeline_scratch_info {
    uint32_t shader_scratch_size[VT_RT_LAYOUT_COUNT];
 };
 
+/* Compiler-private resident RT continuation layout.  These values describe
+ * generated code inside one pipeline ELF; they are not public PDS/RTcore ABI. */
+#define VT_NIR_RT_STACK_HEADER_BYTES 32u
+#define VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES 32u
+#define VT_NIR_RT_STACK_SP_OFFSET 0u
+#define VT_NIR_RT_STACK_CALLABLE_DEPTH_OFFSET 4u
+#define VT_NIR_RT_STACK_FRAME_STRIDE_OFFSET 8u
+#define VT_NIR_RT_STACK_FRAME_CAPACITY_OFFSET 12u
+#define VT_NIR_RT_STACK_CALLABLE_CAPACITY_OFFSET 16u
+
+#define VT_NIR_RT_FRAME_KIND_OFFSET 0u
+#define VT_NIR_RT_FRAME_SITE_OFFSET 4u
+#define VT_NIR_RT_FRAME_RECORD_PTR_OFFSET 8u
+#define VT_NIR_RT_FRAME_BODY_OFFSET 16u
+#define VT_NIR_RT_CALLABLE_FRAME_BYTES 128u
+#define VT_NIR_RT_BASE_CALLABLE_DEPTH 2u
+
+enum vt_nir_rt_resident_frame_kind {
+   VT_NIR_RT_FRAME_TRACE_ROOT = 1,
+   VT_NIR_RT_FRAME_TRACE_NESTED = 2,
+   VT_NIR_RT_FRAME_CALLABLE = 3,
+};
+
+struct vt_nir_rt_stack_cursor {
+   nir_def *base;
+   nir_def *stack_pointer;
+   nir_def *callable_depth;
+   nir_def *frame_stride;
+   nir_def *frame_capacity;
+   nir_def *callable_capacity;
+   nir_def *next_frame;
+};
+
 typedef void (*vt_nir_rt_emit_shader_cb)(nir_builder *b,
                                          const struct vt_nir_rt_trace_params *params,
                                          const struct vt_nir_rt_result *result,
@@ -468,9 +501,27 @@ struct vt_nir_rt_resident_continuation_info {
    uint32_t max_trace_frame_bytes;
    uint32_t max_callable_frame_bytes;
    uint32_t scratch_bytes_per_thread;
+   uint32_t scratch_offset_bytes;
    uint32_t state_frame_stride_bytes;
    uint32_t stack_bytes_per_thread;
 };
+
+nir_def *vt_nir_rt_v5_continuation_stack_base(nir_builder *b);
+nir_def *vt_nir_rt_v5_current_continuation_frame(nir_builder *b);
+void vt_nir_rt_v5_load_stack_cursor(nir_builder *b,
+                                    struct vt_nir_rt_stack_cursor *cursor);
+void vt_nir_rt_v5_publish_stack_push(
+   nir_builder *b, const struct vt_nir_rt_stack_cursor *cursor,
+   nir_def *frame_kind, nir_def *site_id,
+   nir_def *record_ptr, bool callable);
+void vt_nir_rt_v5_publish_stack_pop(nir_builder *b, bool callable);
+bool vt_nir_rt_v5_initialize_continuation_stack(
+   nir_shader *shader, uint32_t frame_stride, uint32_t frame_capacity,
+   uint32_t callable_capacity);
+bool vt_nir_rt_v5_compute_continuation_stack_layout(
+   uint32_t frame_stride, uint32_t max_active_trace_frames,
+   uint32_t max_active_callable_frames, bool reserve_trace_guard_frame,
+   uint32_t *physical_frame_capacity, uint32_t *stack_bytes_per_thread);
 
 bool vt_nir_lower_rt_cps(nir_shader *shader,
                          struct vt_nir_rt_cps_info *info,
