@@ -547,8 +547,7 @@ main(int argc, char **argv)
                VT_NIR_RT_TRACE_CONTINUATION);
    VT_RT_CHECK(resident_plan.sites[0].ssa_spill_bytes == 0);
    VT_RT_CHECK(resident_plan.sites[0].parent_pds_save_bytes == 192);
-   VT_RT_CHECK(resident_plan.sites[0].parent_payload_save_bytes ==
-               linked_payload_size);
+   VT_RT_CHECK(resident_plan.sites[0].parent_payload_save_bytes == 0);
    VT_RT_CHECK(resident_plan.sites[0].return_data_bytes ==
                linked_payload_size);
    VT_RT_CHECK(resident_plan.sites[0].frame_size_bytes == 224);

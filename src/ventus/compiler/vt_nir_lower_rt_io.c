@@ -968,8 +968,7 @@ materialize_resident_intrinsic(nir_builder *b,
       const struct vt_nir_rt_continuation_site *site =
          &state->info->sites[call_site];
       if (site->kind != VT_NIR_RT_TRACE_CONTINUATION ||
-          site->parent_payload_save_bytes !=
-             state->config->v5_payload_size_bytes) {
+          site->parent_payload_save_bytes != 0) {
          state->failed = true;
          return false;
       }
@@ -1048,8 +1047,9 @@ materialize_resident_intrinsic(nir_builder *b,
    const struct vt_nir_rt_continuation_site *site =
       &state->info->sites[call_site];
    if (site->kind != VT_NIR_RT_TRACE_CONTINUATION ||
-       site->parent_payload_save_bytes !=
-          state->config->v5_payload_size_bytes) {
+       site->parent_payload_save_bytes != 0 ||
+       site->return_data_offset != payload_offset ||
+       site->return_data_bytes != payload_bytes) {
       state->failed = true;
       return false;
    }
@@ -1058,12 +1058,6 @@ materialize_resident_intrinsic(nir_builder *b,
    nir_def *pds = nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
    nir_def *frame = vt_nir_rt_v5_current_continuation_frame(b);
    nir_def *frame_state = resident_global_load_u32(b, frame, 0);
-   nir_def *child_payload[VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES / 4];
-   const uint32_t payload_words = payload_bytes / sizeof(uint32_t);
-   for (uint32_t word = 0; word < payload_words; word++) {
-      child_payload[word] = resident_global_load_u32(
-         b, pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE + payload_offset + word * 4);
-   }
 
    nir_push_if(b, nir_ieq_imm(
                      b, frame_state, VT_NIR_RT_FRAME_TRACE_NESTED));
@@ -1078,17 +1072,6 @@ materialize_resident_intrinsic(nir_builder *b,
                           header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
                           pds, VENTUS_RT_V5_PDS_COMMITTED_BASE,
                           VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
-   }
-   resident_copy_words(
-      b, frame,
-      header + site->parent_pds_save_bytes,
-      pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE,
-      site->parent_payload_save_bytes);
-   for (uint32_t word = 0; word < payload_words; word++) {
-      resident_global_store_u32(
-         b, pds,
-         VENTUS_RT_V5_PDS_CALL_DATA_BASE + payload_offset + word * 4,
-         child_payload[word]);
    }
    nir_push_else(b, NULL);
    nir_push_if(b, nir_ieq_imm(

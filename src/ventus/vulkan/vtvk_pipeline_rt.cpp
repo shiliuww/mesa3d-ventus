@@ -12,6 +12,7 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/glsl_types.h"
 #include "nir/nir.h"
+#include "nir/nir_deref.h"
 #include "util/hash_table.h"
 #include "util/log.h"
 #include "util/ralloc.h"
@@ -774,11 +775,134 @@ struct vtvk_rt_callback_shader_entry {
    nir_variable *callable_shader_record_ptr;
    uint32_t executable_index;
    const char *executable_symbol;
+   uint32_t call_data_read_word_mask = 0;
+   uint32_t call_data_write_word_mask = 0;
+   bool call_data_summary_complete = false;
 };
 
+static bool
+vtvk_rt_mark_call_data_range(uint32_t start, uint32_t bytes,
+                             uint32_t *word_mask)
+{
+   if (!word_mask || bytes == 0 ||
+       start >= VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES ||
+       bytes > VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES - start)
+      return false;
+   const uint32_t first = start / sizeof(uint32_t);
+   const uint32_t last = (start + bytes - 1) / sizeof(uint32_t);
+   for (uint32_t word = first; word <= last; ++word)
+      *word_mask |= 1u << word;
+   return true;
+}
+
+static bool
+vtvk_rt_mark_call_data_deref(nir_deref_instr *deref,
+                             uint32_t components, uint32_t bit_size,
+                             uint32_t component_mask, uint32_t *word_mask)
+{
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : nullptr;
+   if (!var || var->data.mode != nir_var_shader_call_data ||
+       !var->data.explicit_location || var->data.location < 0)
+      return false;
+
+   unsigned var_size = 0;
+   unsigned var_align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &var_size, &var_align);
+   const uint32_t var_base =
+      (uint32_t)var->data.location * VT_RT_ABI_ALIGNMENT_BYTES;
+   if (nir_deref_instr_has_indirect(deref))
+      return vtvk_rt_mark_call_data_range(var_base, var_size, word_mask);
+
+   const uint32_t deref_offset = nir_deref_instr_get_const_offset(
+      deref, glsl_get_natural_size_align_bytes);
+   const uint32_t component_bytes = DIV_ROUND_UP(bit_size, 8);
+   for (uint32_t component = 0; component < components; ++component) {
+      if ((component_mask & BITFIELD_BIT(component)) == 0)
+         continue;
+      if (!vtvk_rt_mark_call_data_range(
+             var_base + deref_offset + component * component_bytes,
+             component_bytes, word_mask))
+         return false;
+   }
+   return true;
+}
+
+static bool
+vtvk_rt_mark_full_call_data_var(nir_deref_instr *deref, uint32_t *word_mask)
+{
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : nullptr;
+   if (!var || var->data.mode != nir_var_shader_call_data ||
+       !var->data.explicit_location || var->data.location < 0)
+      return false;
+   unsigned size = 0;
+   unsigned align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   return vtvk_rt_mark_call_data_range(
+      (uint32_t)var->data.location * VT_RT_ABI_ALIGNMENT_BYTES,
+      size, word_mask);
+}
+
+static bool
+vtvk_rt_compute_call_data_summary(nir_shader *shader, uint32_t *read_mask,
+                                  uint32_t *write_mask)
+{
+   if (!shader || !read_mask || !write_mask)
+      return false;
+   *read_mask = 0;
+   *write_mask = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic == nir_intrinsic_load_deref &&
+                nir_src_is_deref(intrin->src[0])) {
+               nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+               nir_variable *var = nir_deref_instr_get_variable(deref);
+               if (var && var->data.mode == nir_var_shader_call_data &&
+                   !vtvk_rt_mark_call_data_deref(
+                      deref, intrin->def.num_components, intrin->def.bit_size,
+                      BITFIELD_MASK(intrin->def.num_components), read_mask))
+                  return false;
+               continue;
+            }
+            if (intrin->intrinsic == nir_intrinsic_store_deref &&
+                nir_src_is_deref(intrin->src[0])) {
+               nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+               nir_variable *var = nir_deref_instr_get_variable(deref);
+               if (var && var->data.mode == nir_var_shader_call_data &&
+                   !vtvk_rt_mark_call_data_deref(
+                      deref, nir_src_num_components(intrin->src[1]),
+                      nir_src_bit_size(intrin->src[1]),
+                      nir_intrinsic_write_mask(intrin), write_mask))
+                  return false;
+               continue;
+            }
+
+            const nir_intrinsic_info *info =
+               &nir_intrinsic_infos[intrin->intrinsic];
+            for (unsigned src = 0; src < info->num_srcs; ++src) {
+               if (!nir_src_is_deref(intrin->src[src]))
+                  continue;
+               nir_deref_instr *deref = nir_src_as_deref(intrin->src[src]);
+               nir_variable *var = nir_deref_instr_get_variable(deref);
+               if (!var || var->data.mode != nir_var_shader_call_data)
+                  continue;
+               /* Calls and uncommon deref operations are conservatively
+                * inout until interprocedural summaries are available. */
+               if (!vtvk_rt_mark_full_call_data_var(deref, read_mask) ||
+                   !vtvk_rt_mark_full_call_data_var(deref, write_mask))
+                  return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 enum {
-   VTVK_RT_CALLABLE_PARENT_DATA_BYTES =
-      VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES,
    VTVK_RT_CALLABLE_PARENT_DATA_OFFSET = VT_NIR_RT_FRAME_BODY_OFFSET,
    VTVK_RT_ENTRY_RECORD_PTR_OFFSET = VT_NIR_RT_FRAME_RECORD_PTR_OFFSET,
    VTVK_RT_ENTRY_FRAME_BYTES = VT_NIR_RT_CALLABLE_FRAME_BYTES,
@@ -839,6 +963,35 @@ struct vtvk_rt_callback_shaders {
    std::vector<vtvk_rt_callback_shader_entry> intersection;
    std::vector<vtvk_rt_callback_shader_entry> callable;
 };
+
+static bool
+vtvk_rt_compute_entry_call_data_summaries(vtvk_rt_callback_shaders *entries)
+{
+   if (!entries)
+      return false;
+   std::vector<vtvk_rt_callback_shader_entry> *groups[] = {
+      &entries->miss, &entries->closest_hit, &entries->any_hit,
+      &entries->intersection, &entries->callable,
+   };
+   for (auto *group : groups) {
+      for (auto &entry : *group) {
+         entry.call_data_summary_complete = vtvk_rt_compute_call_data_summary(
+            entry.shader, &entry.call_data_read_word_mask,
+            &entry.call_data_write_word_mask);
+         if (!entry.call_data_summary_complete)
+            return false;
+         if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+            mesa_logi("ventus-vk: RT entry group=%u stage=%s call-data "
+                      "read=0x%06x write=0x%06x",
+                      entry.group_index,
+                      _mesa_shader_stage_to_string(entry.stage),
+                      entry.call_data_read_word_mask,
+                      entry.call_data_write_word_mask);
+         }
+      }
+   }
+   return true;
+}
 
 struct vtvk_rt_pipeline_callback_data {
    const vtvk_rt_callback_shaders *shaders;
@@ -1538,7 +1691,10 @@ vtvk_clone_rt_callable_depth_entries(
          return false;
 
       clones->push_back({source[i].group_index, source[i].stage, clone,
-                         nullptr, UINT32_MAX, nullptr});
+                         nullptr, UINT32_MAX, nullptr,
+                         source[i].call_data_read_word_mask,
+                         source[i].call_data_write_word_mask,
+                         source[i].call_data_summary_complete});
    }
 
    const char *suffix = ralloc_asprintf(mem_ctx, "_depth%u", depth);
@@ -1568,7 +1724,10 @@ vtvk_clone_rt_trace_depth_entries(
       if (!clone)
          return false;
       clones->push_back({source[i].group_index, source[i].stage, clone,
-                         nullptr, UINT32_MAX, nullptr});
+                         nullptr, UINT32_MAX, nullptr,
+                         source[i].call_data_read_word_mask,
+                         source[i].call_data_write_word_mask,
+                         source[i].call_data_summary_complete});
    }
 
    const char *suffix = ralloc_asprintf(mem_ctx, "_trace_depth%u", depth);
@@ -1609,23 +1768,32 @@ vtvk_rt_store_call_data_word(nir_builder *b, uint32_t byte_offset,
 }
 
 static void
-vtvk_rt_save_callable_words(nir_builder *b, nir_def *frame,
-                            uint32_t frame_offset, uint32_t bytes)
+vtvk_rt_save_callable_words(nir_builder *b, uint32_t call_data_offset,
+                            nir_def *frame, uint32_t frame_offset,
+                            uint32_t word_mask)
 {
-   for (uint32_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
+   for (uint32_t word = 0; word < 4; ++word) {
+      if ((word_mask & BITFIELD_BIT(word)) == 0)
+         continue;
+      const uint32_t offset = word * sizeof(uint32_t);
       vtvk_rt_global_store_u32(
          b, frame, frame_offset + offset,
-         vtvk_rt_load_call_data_word(b, offset));
+         vtvk_rt_load_call_data_word(b, call_data_offset + offset));
    }
 }
 
 static void
 vtvk_rt_restore_callable_words(nir_builder *b, nir_def *frame,
-                               uint32_t frame_offset, uint32_t bytes)
+                               uint32_t frame_offset,
+                               uint32_t call_data_offset,
+                               uint32_t word_mask)
 {
-   for (uint32_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
+   for (uint32_t word = 0; word < 4; ++word) {
+      if ((word_mask & BITFIELD_BIT(word)) == 0)
+         continue;
+      const uint32_t offset = word * sizeof(uint32_t);
       vtvk_rt_store_call_data_word(
-         b, offset,
+         b, call_data_offset + offset,
          vtvk_rt_global_load_u32(b, frame, frame_offset + offset));
    }
 }
@@ -1678,6 +1846,24 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
       return false;
    }
 
+   uint32_t target_read_mask = 0;
+   uint32_t target_write_mask = 0;
+   bool target_summary_complete = true;
+   for (const vtvk_rt_callback_shader_entry &entry : *state->callables) {
+      target_read_mask |= entry.call_data_read_word_mask;
+      target_write_mask |= entry.call_data_write_word_mask;
+      target_summary_complete &= entry.call_data_summary_complete;
+   }
+   const uint32_t component_mask = BITFIELD_MASK(components);
+   const uint32_t first_word = payload_offset / sizeof(uint32_t);
+   uint32_t local_read_mask =
+      (target_read_mask >> first_word) & component_mask;
+   uint32_t local_write_mask =
+      (target_write_mask >> first_word) & component_mask;
+   if (!target_summary_complete)
+      local_read_mask = local_write_mask = component_mask;
+   const uint32_t local_access_mask = local_read_mask | local_write_mask;
+
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *base = vtvk_load_rt_dispatch_arg(
       b, VT_NIR_RT_DISPATCH_ARG_CALLABLE_SBT_ADDR, 64);
@@ -1713,14 +1899,16 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
    nir_push_if(b, nir_iand(b, stack_available, callable_available));
    nir_def *frame = cursor.next_frame;
    vtvk_rt_save_callable_words(
-      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
-      VTVK_RT_CALLABLE_PARENT_DATA_BYTES);
+      b, payload_offset, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
+      local_access_mask);
    vt_nir_rt_v5_publish_stack_push(
       b, &cursor, nir_imm_int(b, VT_NIR_RT_FRAME_CALLABLE),
       nir_imm_int(b, 0), nir_iadd_imm(b, record, 32), true);
 
    nir_def *call_data = nir_load_var(b, payload);
    for (unsigned component = 0; component < components; ++component) {
+      if ((local_access_mask & BITFIELD_BIT(component)) == 0)
+         continue;
       vtvk_rt_store_call_data_word(
          b, payload_offset + component * sizeof(uint32_t),
          nir_channel(b, call_data, component));
@@ -1733,13 +1921,16 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
    }
    nir_def *returned_components[4];
    for (unsigned component = 0; component < components; ++component) {
-      returned_components[component] = vtvk_rt_load_call_data_word(
-         b, payload_offset + component * sizeof(uint32_t));
+      returned_components[component] =
+         (local_write_mask & BITFIELD_BIT(component)) ?
+            vtvk_rt_load_call_data_word(
+               b, payload_offset + component * sizeof(uint32_t)) :
+            nir_channel(b, call_data, component);
    }
    nir_def *returned_data = nir_vec(b, returned_components, components);
    vtvk_rt_restore_callable_words(
-      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
-      VTVK_RT_CALLABLE_PARENT_DATA_BYTES);
+      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET, payload_offset,
+      local_access_mask);
    vt_nir_rt_v5_publish_stack_pop(b, true);
    nir_store_var(b, payload, returned_data, BITFIELD_MASK(components));
    nir_push_else(b, NULL);
@@ -2821,6 +3012,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
+   if (!vtvk_rt_compute_entry_call_data_summaries(&cb_shaders)) {
+      mesa_loge("ventus-vk: RT entry call-data summary is not statically "
+                "resolvable");
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    uint32_t ray_payload_size = 0;
    uint32_t callable_data_size = 0;

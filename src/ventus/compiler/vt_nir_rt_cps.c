@@ -534,11 +534,13 @@ collect_resident_sites(
             return false;
          const uint32_t ssa_spill_bytes =
             stack_size - ordinary_scratch_bytes;
+         const uint32_t parent_payload_save_bytes =
+            kind == VT_NIR_RT_TRACE_CONTINUATION ? 0 : payload_size_bytes;
          uint32_t frame_size_bytes = 0;
          if (!resident_site_frame_size(kind, ssa_spill_bytes,
                                        kind == VT_NIR_RT_TRACE_CONTINUATION ?
                                           parent_pds_save_bytes : 0,
-                                       payload_size_bytes,
+                                       parent_payload_save_bytes,
                                        &frame_size_bytes))
             return false;
 
@@ -558,7 +560,7 @@ collect_resident_sites(
             .parent_pds_save_bytes =
                kind == VT_NIR_RT_TRACE_CONTINUATION ?
                   parent_pds_save_bytes : 0,
-            .parent_payload_save_bytes = payload_size_bytes,
+            .parent_payload_save_bytes = parent_payload_save_bytes,
             .return_data_bytes =
                kind == VT_NIR_RT_TRACE_CONTINUATION ?
                   payload_size_bytes : callable_data_size_bytes,
@@ -627,6 +629,46 @@ map_resident_tokens(nir_shader *shader,
       if (!seen[i])
          return false;
       info->token_to_call[tokens[i]] = calls[i];
+   }
+   return true;
+}
+
+static bool
+map_resident_return_ranges(
+   nir_shader *shader, struct vt_nir_rt_resident_continuation_info *info)
+{
+   bool *seen = rzalloc_array(info->sites, bool, info->site_count);
+   if (!seen)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         if (intrin->intrinsic !=
+                nir_intrinsic_ventus_rt_continuation_return)
+            continue;
+         if (!nir_src_is_const(intrin->src[0]) ||
+             !nir_src_is_const(intrin->src[1]) ||
+             !nir_src_is_const(intrin->src[2]))
+            return false;
+         const uint32_t token = nir_src_as_uint(intrin->src[0]);
+         if (token >= info->site_count)
+            return false;
+         const uint32_t call = info->token_to_call[token];
+         if (call >= info->site_count || seen[call])
+            return false;
+         struct vt_nir_rt_continuation_site *site = &info->sites[call];
+         site->return_data_offset = nir_src_as_uint(intrin->src[1]);
+         site->return_data_bytes = nir_src_as_uint(intrin->src[2]);
+         seen[call] = true;
+      }
+   }
+   for (uint32_t i = 0; i < info->site_count; ++i) {
+      if (info->sites[i].kind == VT_NIR_RT_TRACE_CONTINUATION && !seen[i])
+         return false;
    }
    return true;
 }
@@ -764,14 +806,14 @@ vt_nir_lower_rt_resident_continuations(
       if (!seen[i] || info->sites[i].kind != VT_NIR_RT_TRACE_CONTINUATION)
          return false;
    }
-   if (!map_resident_tokens(shader, info, mem_ctx))
+   if (!map_resident_tokens(shader, info, mem_ctx) ||
+       !map_resident_return_ranges(shader, info))
       return false;
 
    if (!align_u32(shader->scratch_size,
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->scratch_bytes_per_thread) ||
-       !resident_state_frame_stride(parent_pds_save_bytes,
-                                    payload_size_bytes,
+       !resident_state_frame_stride(parent_pds_save_bytes, 0,
                                     &info->scratch_offset_bytes))
       return false;
    const uint64_t frame_bytes =

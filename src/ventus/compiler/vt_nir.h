@@ -495,6 +495,7 @@ struct vt_nir_rt_continuation_site {
    uint32_t ssa_spill_bytes;
    uint32_t parent_pds_save_bytes;
    uint32_t parent_payload_save_bytes;
+   uint32_t return_data_offset;
    uint32_t return_data_bytes;
    uint32_t frame_size_bytes;
 };
