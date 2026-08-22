@@ -133,7 +133,7 @@ vt_nir_rt_v5_initialize_continuation_stack(
    nir_shader *shader, uint32_t frame_stride, uint32_t frame_capacity,
    uint32_t callable_capacity)
 {
-   if (!shader || frame_stride < VT_NIR_RT_CALLABLE_FRAME_BYTES ||
+   if (!shader || frame_stride < VT_NIR_RT_MIN_FRAME_BYTES ||
        (frame_stride & (VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES - 1)) ||
        frame_capacity == 0 || callable_capacity > frame_capacity)
       return false;
@@ -209,18 +209,6 @@ vt_nir_rt_v5_compute_continuation_stack_layout(
    *physical_frame_capacity = (uint32_t)capacity;
    *stack_bytes_per_thread = aligned_bytes;
    return true;
-}
-
-static bool
-resident_state_frame_stride(uint32_t parent_pds_save_bytes,
-                            uint32_t payload_size_bytes, uint32_t *stride)
-{
-   const uint64_t bytes = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES +
-                          parent_pds_save_bytes +
-                          payload_size_bytes;
-   return bytes <= UINT32_MAX &&
-          align_u32((uint32_t)bytes,
-                    VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES, stride);
 }
 
 static bool
@@ -497,7 +485,13 @@ resident_site_frame_size(enum vt_nir_rt_continuation_kind kind,
    fixed_bytes += payload_size_bytes;
    if (fixed_bytes > UINT32_MAX - ssa_spill_bytes)
       return false;
-   return align_u32((uint32_t)fixed_bytes + ssa_spill_bytes,
+   uint32_t body_offset = 0;
+   if (!align_u32((uint32_t)fixed_bytes,
+                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+                  &body_offset) ||
+       body_offset > UINT32_MAX - ssa_spill_bytes)
+      return false;
+   return align_u32(body_offset + ssa_spill_bytes,
                     VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES,
                     frame_size_bytes);
 }
@@ -535,7 +529,8 @@ collect_resident_sites(
          const uint32_t ssa_spill_bytes =
             stack_size - ordinary_scratch_bytes;
          const uint32_t parent_payload_save_bytes =
-            kind == VT_NIR_RT_TRACE_CONTINUATION ? 0 : payload_size_bytes;
+            kind == VT_NIR_RT_TRACE_CONTINUATION ?
+               0 : callable_data_size_bytes;
          uint32_t frame_size_bytes = 0;
          if (!resident_site_frame_size(kind, ssa_spill_bytes,
                                        kind == VT_NIR_RT_TRACE_CONTINUATION ?
@@ -735,9 +730,8 @@ vt_nir_plan_rt_resident_continuations(
       return false;
    if (info->max_callable_frame_bytes && callable_data_size_bytes == 0)
       return false;
-   const uint32_t frame_stride = MAX2(
-      MAX2(info->max_trace_frame_bytes, info->max_callable_frame_bytes),
-      info->max_callable_frame_bytes ? VT_NIR_RT_CALLABLE_FRAME_BYTES : 0);
+   const uint32_t frame_stride = MAX2(info->max_trace_frame_bytes,
+                                      info->max_callable_frame_bytes);
    const uint32_t callable_capacity =
       info->max_callable_frame_bytes ? VT_NIR_RT_BASE_CALLABLE_DEPTH : 0;
    const uint32_t trace_capacity =
@@ -810,12 +804,16 @@ vt_nir_lower_rt_resident_continuations(
        !map_resident_return_ranges(shader, info))
       return false;
 
-   if (!align_u32(shader->scratch_size,
+   if (shader->scratch_size < ordinary_scratch_bytes ||
+       !align_u32(shader->scratch_size - ordinary_scratch_bytes,
                   VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
                   &info->scratch_bytes_per_thread) ||
-       !resident_state_frame_stride(parent_pds_save_bytes, 0,
-                                    &info->scratch_offset_bytes))
+       !align_u32(VENTUS_RT_V5_CONTINUATION_HEADER_BYTES +
+                     parent_pds_save_bytes,
+                  VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
+                  &info->scratch_offset_bytes))
       return false;
+   info->scratch_base_bytes = ordinary_scratch_bytes;
    const uint64_t frame_bytes =
       (uint64_t)info->scratch_offset_bytes + info->scratch_bytes_per_thread;
    if (frame_bytes > UINT32_MAX ||
@@ -823,8 +821,6 @@ vt_nir_lower_rt_resident_continuations(
                   VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES,
                   &info->state_frame_stride_bytes))
       return false;
-   info->state_frame_stride_bytes = MAX2(
-      info->state_frame_stride_bytes, VT_NIR_RT_CALLABLE_FRAME_BYTES);
    info->max_trace_frame_bytes = MAX2(
       info->max_trace_frame_bytes, info->state_frame_stride_bytes);
    const uint32_t callable_capacity =

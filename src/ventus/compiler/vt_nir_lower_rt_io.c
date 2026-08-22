@@ -935,13 +935,13 @@ struct materialize_resident_state {
 static nir_def *
 resident_scratch_address(
    nir_builder *b, const struct vt_nir_rt_resident_continuation_info *info,
-   nir_def *offset)
+   uint32_t offset)
 {
+   assert(offset >= info->scratch_base_bytes);
    return nir_iadd(
       b, vt_nir_rt_v5_current_continuation_frame(b),
-      nir_u2u64(b, nir_iadd_imm(
-                      b, nir_u2u32(b, offset),
-                      info->scratch_offset_bytes)));
+      nir_imm_int64(b, info->scratch_offset_bytes +
+                           offset - info->scratch_base_bytes));
 }
 
 static bool
@@ -994,10 +994,14 @@ materialize_resident_intrinsic(nir_builder *b,
       return true;
    }
    case nir_intrinsic_load_scratch: {
+      if (!nir_src_is_const(intrin->src[0]) ||
+          nir_src_as_uint(intrin->src[0]) < state->info->scratch_base_bytes)
+         return false;
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def *value = nir_load_global(
          b, intrin->def.num_components, intrin->def.bit_size,
-         resident_scratch_address(b, state->info, intrin->src[0].ssa),
+         resident_scratch_address(
+            b, state->info, nir_src_as_uint(intrin->src[0])),
          .align_mul = nir_intrinsic_align_mul(intrin),
          .align_offset = nir_intrinsic_align_offset(intrin));
       nir_def_rewrite_uses(&intrin->def, value);
@@ -1005,10 +1009,14 @@ materialize_resident_intrinsic(nir_builder *b,
       return true;
    }
    case nir_intrinsic_store_scratch:
+      if (!nir_src_is_const(intrin->src[1]) ||
+          nir_src_as_uint(intrin->src[1]) < state->info->scratch_base_bytes)
+         return false;
       b->cursor = nir_before_instr(&intrin->instr);
       nir_store_global(
          b, intrin->src[0].ssa,
-         resident_scratch_address(b, state->info, intrin->src[1].ssa),
+         resident_scratch_address(
+            b, state->info, nir_src_as_uint(intrin->src[1])),
          .write_mask = nir_intrinsic_write_mask(intrin),
          .align_mul = nir_intrinsic_align_mul(intrin),
          .align_offset = nir_intrinsic_align_offset(intrin));
@@ -1109,6 +1117,8 @@ vt_nir_materialize_rt_resident_continuations(
    };
    const bool progress = nir_shader_intrinsics_pass(
       shader, materialize_resident_intrinsic, nir_metadata_none, &state);
+   if (progress && !state.failed)
+      shader->scratch_size = info->scratch_base_bytes;
    return progress && !state.failed;
 }
 

@@ -569,13 +569,14 @@ main(int argc, char **argv)
    VT_RT_CHECK(callable_plan.sites[0].return_data_bytes ==
                linked_payload_size);
    VT_RT_CHECK(callable_plan.sites[0].frame_size_bytes == 64);
-   VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 288);
+   VT_RT_CHECK(callable_plan.stack_bytes_per_thread == 160);
    struct vt_nir_rt_resident_continuation_info wide_callable_plan = {};
    VT_RT_CHECK(vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 48,
       &wide_callable_plan, cps_mem_ctx));
-   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 64);
-   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 288);
+   VT_RT_CHECK(wide_callable_plan.sites[0].parent_payload_save_bytes == 48);
+   VT_RT_CHECK(wide_callable_plan.sites[0].frame_size_bytes == 96);
+   VT_RT_CHECK(wide_callable_plan.stack_bytes_per_thread == 224);
    VT_RT_CHECK(!vt_nir_plan_rt_resident_continuations(
       callable_probe, 1, linked_payload_size, 0,
       &wide_callable_plan, cps_mem_ctx));
@@ -852,10 +853,11 @@ main(int argc, char **argv)
    VT_RT_CHECK(resident.resume_shader_count == 0);
    VT_RT_CHECK(resident.parent_state_ssa_complete);
    VT_RT_CHECK(resident.sites[0].parent_pds_save_bytes == 0);
-   VT_RT_CHECK(resident.scratch_offset_bytes == 32);
-   VT_RT_CHECK(resident.scratch_bytes_per_thread == 320);
-   VT_RT_CHECK(resident.state_frame_stride_bytes == 352);
-   VT_RT_CHECK(resident.stack_bytes_per_thread == 736);
+   VT_RT_CHECK(resident.scratch_base_bytes == 308);
+   VT_RT_CHECK(resident.scratch_offset_bytes == 16);
+   VT_RT_CHECK(resident.scratch_bytes_per_thread == 16);
+   VT_RT_CHECK(resident.state_frame_stride_bytes == 32);
+   VT_RT_CHECK(resident.stack_bytes_per_thread == 96);
    resident_config.use_v5_resident_continuations = true;
    resident_config.v5_continuation_scratch_bytes =
       resident.scratch_bytes_per_thread;

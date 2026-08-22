@@ -905,7 +905,6 @@ vtvk_rt_compute_call_data_summary(nir_shader *shader, uint32_t *read_mask,
 enum {
    VTVK_RT_CALLABLE_PARENT_DATA_OFFSET = VT_NIR_RT_FRAME_BODY_OFFSET,
    VTVK_RT_ENTRY_RECORD_PTR_OFFSET = VT_NIR_RT_FRAME_RECORD_PTR_OFFSET,
-   VTVK_RT_ENTRY_FRAME_BYTES = VT_NIR_RT_CALLABLE_FRAME_BYTES,
 };
 
 static bool
@@ -1801,8 +1800,22 @@ vtvk_rt_restore_callable_words(nir_builder *b, nir_def *frame,
 struct vtvk_rt_callable_entry_lower_data {
    const std::vector<vtvk_rt_callback_shader_entry> *callables;
    std::vector<vtvk_rt_callable_payload_binding> payload_bindings;
+   uint32_t max_frame_bytes;
    bool failed;
 };
+
+static uint32_t
+vtvk_rt_callable_frame_bytes(uint32_t word_mask)
+{
+   uint32_t frame_end = VT_NIR_RT_FRAME_BODY_OFFSET;
+   for (uint32_t word = 0; word < 4; ++word) {
+      if (word_mask & BITFIELD_BIT(word))
+         frame_end = VT_NIR_RT_FRAME_BODY_OFFSET +
+                     (word + 1) * sizeof(uint32_t);
+   }
+   return ALIGN_POT(MAX2(frame_end, VT_NIR_RT_MIN_FRAME_BYTES),
+                    VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES);
+}
 
 static bool
 vtvk_lower_rt_execute_callable_entry(nir_builder *b,
@@ -1863,6 +1876,17 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
    if (!target_summary_complete)
       local_read_mask = local_write_mask = component_mask;
    const uint32_t local_access_mask = local_read_mask | local_write_mask;
+   const uint32_t call_site_frame_bytes =
+      vtvk_rt_callable_frame_bytes(local_access_mask);
+   state->max_frame_bytes = MAX2(state->max_frame_bytes,
+                                 call_site_frame_bytes);
+   if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+      mesa_logi("ventus-vk: RT Callable continuation site stage=%s "
+                "call-data=%u read=0x%x write=0x%x access=0x%x frame=%u",
+                _mesa_shader_stage_to_string(b->shader->info.stage),
+                payload_offset, local_read_mask, local_write_mask,
+                local_access_mask, call_site_frame_bytes);
+   }
 
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *base = vtvk_load_rt_dispatch_arg(
@@ -1951,9 +1975,10 @@ static bool
 vtvk_lower_rt_callable_entry_invocations(
    nir_shader **shaders, uint32_t shader_count,
    const std::vector<vtvk_rt_callback_shader_entry> &callables,
-   bool *uses_callable_entry)
+   bool *uses_callable_entry, uint32_t *max_frame_bytes)
 {
-   if (!shaders || callables.empty())
+   if (!shaders || !uses_callable_entry || !max_frame_bytes ||
+       callables.empty())
       return true;
 
    for (uint32_t i = 0; i < shader_count; i++) {
@@ -1976,6 +2001,7 @@ vtvk_lower_rt_callable_entry_invocations(
          continue;
 
       *uses_callable_entry = true;
+      *max_frame_bytes = MAX2(*max_frame_bytes, state.max_frame_bytes);
       nir_fixup_deref_modes(shader);
       nir_opt_dead_cf(shader);
       nir_opt_dce(shader);
@@ -3009,6 +3035,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    std::vector<struct vt_nir_rt_resident_continuation_info>
       resident_continuations;
    bool resident_parent_state_ssa_complete = true;
+   uint32_t callable_frame_bytes = 0;
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -3069,7 +3096,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
       if (!vtvk_lower_rt_callable_entry_invocations(
              root_callable_callers.data(), root_callable_callers.size(),
-             cb_shaders.callable, &uses_callable_entry)) {
+             cb_shaders.callable, &uses_callable_entry,
+             &callable_frame_bytes)) {
          mesa_loge("ventus-vk: root Callable invocation lowering failed");
          vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -3080,7 +3108,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       for (const auto &depth_entries : callable_depth_layers) {
          if (!vtvk_lower_rt_callable_entry_invocations(
                 depth_callers.data(), depth_callers.size(), depth_entries,
-                &uses_callable_entry)) {
+                &uses_callable_entry, &callable_frame_bytes)) {
             mesa_loge("ventus-vk: nested Callable invocation lowering failed");
             vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
             return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -3329,8 +3357,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
 
    if (v5_megakernel) {
       resident_continuations.resize(resident_trace_shaders.size());
-      uint32_t frame_stride = uses_callable_entry ?
-         VTVK_RT_ENTRY_FRAME_BYTES : 0;
+      uint32_t frame_stride = callable_frame_bytes;
       for (size_t i = 0; i < resident_trace_shaders.size(); i++) {
          nir_shader *shader = resident_trace_shaders[i].shader;
          struct vt_nir_rt_resident_continuation_info &resident =
@@ -3347,6 +3374,24 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
             return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
          }
          pipeline->rt_v5_feature_flags |= resident.feature_flags;
+         if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+            for (uint32_t site_index = 0;
+                 site_index < resident.site_count; ++site_index) {
+               const struct vt_nir_rt_continuation_site &site =
+                  resident.sites[site_index];
+               mesa_logi("ventus-vk: RT trace continuation site stage=%s "
+                         "call=%u control=%u parent=%u live-ssa=%u "
+                         "ssa-base=%u ssa-offset=%u "
+                         "return=call-data+%u:%u frame=%u",
+                         _mesa_shader_stage_to_string(shader->info.stage),
+                         site.call_index, VT_NIR_RT_FRAME_BODY_OFFSET,
+                         site.parent_pds_save_bytes, site.ssa_spill_bytes,
+                         resident.scratch_base_bytes,
+                         resident.scratch_offset_bytes,
+                         site.return_data_offset, site.return_data_bytes,
+                         site.frame_size_bytes);
+            }
+         }
          pipeline->rt_v5_max_trace_frame_bytes = MAX2(
             pipeline->rt_v5_max_trace_frame_bytes,
             resident.max_trace_frame_bytes);
@@ -3358,7 +3403,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          pipeline->rt_v5_feature_flags |=
             VENTUS_RT_RESOURCE_USES_CALLABLE_CONTINUATION;
          pipeline->rt_v5_max_callable_frame_bytes =
-            VTVK_RT_ENTRY_FRAME_BYTES;
+            callable_frame_bytes;
       }
       frame_stride = ALIGN_POT(frame_stride, 32);
       pipeline->rt_v5_continuation_frame_stride = frame_stride;
@@ -3375,6 +3420,15 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          mesa_loge("ventus-vk: V5 continuation stack resource overflow");
          vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+      if (vtvk_env_enabled("VENTUS_VK_NIR_PROBE")) {
+         mesa_logi("ventus-vk: RT continuation layout max-trace=%u "
+                   "max-callable=%u stride=%u capacity=%u stack=%u",
+                   pipeline->rt_v5_max_trace_frame_bytes,
+                   pipeline->rt_v5_max_callable_frame_bytes,
+                   pipeline->rt_v5_continuation_frame_stride,
+                   pipeline->rt_v5_continuation_frame_capacity,
+                   pipeline->rt_v5_continuation_stack_bytes);
       }
       if (!vt_nir_rt_v5_initialize_continuation_stack(
              cb_shaders.raygen, frame_stride,

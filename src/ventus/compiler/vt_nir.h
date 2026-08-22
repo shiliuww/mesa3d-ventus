@@ -177,7 +177,7 @@ struct vt_nir_pipeline_scratch_info {
 #define VT_NIR_RT_FRAME_SITE_OFFSET 4u
 #define VT_NIR_RT_FRAME_RECORD_PTR_OFFSET 8u
 #define VT_NIR_RT_FRAME_BODY_OFFSET 16u
-#define VT_NIR_RT_CALLABLE_FRAME_BYTES 128u
+#define VT_NIR_RT_MIN_FRAME_BYTES 32u
 #define VT_NIR_RT_BASE_CALLABLE_DEPTH 2u
 
 enum vt_nir_rt_resident_frame_kind {
@@ -510,6 +510,7 @@ struct vt_nir_rt_resident_continuation_info {
    uint32_t feature_flags;
    uint32_t max_trace_frame_bytes;
    uint32_t max_callable_frame_bytes;
+   uint32_t scratch_base_bytes;
    uint32_t scratch_bytes_per_thread;
    uint32_t scratch_offset_bytes;
    uint32_t state_frame_stride_bytes;
