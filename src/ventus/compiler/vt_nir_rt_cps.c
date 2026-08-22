@@ -34,20 +34,28 @@ stack_store_u32(nir_builder *b, nir_def *base, uint32_t offset,
 nir_def *
 vt_nir_rt_v5_continuation_stack_base(nir_builder *b)
 {
-   return nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(
-            b, nir_imm_int(b, VENTUS_RT_V5_PDS_SIZE_BYTES)));
+   return nir_ventus_rt_continuation_stack_address(b);
 }
 
 nir_def *
 vt_nir_rt_v5_current_continuation_frame(nir_builder *b)
 {
-   nir_def *pds = nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
-   return nir_load_global(
-      b, 1, 64,
-      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
-      .align_mul = 8);
+   nir_def *lo = nir_ventus_rt_load_pds_field(
+      b, .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME, .range_base = 0);
+   nir_def *hi = nir_ventus_rt_load_pds_field(
+      b, .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME, .range_base = 4);
+   return nir_pack_64_2x32_split(b, lo, hi);
+}
+
+static void
+store_current_continuation_frame(nir_builder *b, nir_def *frame)
+{
+   nir_ventus_rt_store_pds_field(
+      b, nir_unpack_64_2x32_split_x(b, frame),
+      .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME, .range_base = 0);
+   nir_ventus_rt_store_pds_field(
+      b, nir_unpack_64_2x32_split_y(b, frame),
+      .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME, .range_base = 4);
 }
 
 void
@@ -95,12 +103,7 @@ vt_nir_rt_v5_publish_stack_push(
                       nir_iadd_imm(b, cursor->callable_depth, 1));
    }
 
-   nir_def *pds = nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
-   nir_store_global(
-      b, cursor->next_frame,
-      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
-      .write_mask = 0x1, .align_mul = 8);
+   store_current_continuation_frame(b, cursor->next_frame);
 }
 
 void
@@ -122,12 +125,7 @@ vt_nir_rt_v5_publish_stack_pop(nir_builder *b, bool callable)
                       b, nir_iadd_imm(b, new_sp, -1), cursor.frame_stride)));
    previous = nir_bcsel(b, nir_ine_imm(b, new_sp, 0), previous,
                         nir_imm_int64(b, 0));
-   nir_def *pds = nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
-   nir_store_global(
-      b, previous,
-      nir_iadd_imm(b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
-      .write_mask = 0x1, .align_mul = 8);
+   store_current_continuation_frame(b, previous);
 }
 
 bool
@@ -155,12 +153,7 @@ vt_nir_rt_v5_initialize_continuation_stack(
    stack_store_u32(&b, base, VT_NIR_RT_STACK_CALLABLE_CAPACITY_OFFSET,
                    nir_imm_int(&b, callable_capacity));
 
-   nir_def *pds = nir_u2u64(
-      &b, nir_ventus_rt_hot_pds_address(&b, nir_imm_int(&b, 0)));
-   nir_store_global(
-      &b, nir_imm_int64(&b, 0),
-      nir_iadd_imm(&b, pds, VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS),
-      .write_mask = 0x1, .align_mul = 8);
+   store_current_continuation_frame(&b, nir_imm_int64(&b, 0));
    return true;
 }
 

@@ -782,6 +782,18 @@ intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
           bit_sizes=[32])
 intrinsic("ventus_rt_hot_pds_address", src_comp=[1], dest_comp=1,
           bit_sizes=[32])
+# Compiler-private PDS carriers.  BASE identifies the semantic field and
+# RANGE_BASE is the byte offset within that field.  Keeping the field identity
+# here prevents continuation analysis from inferring semantics from an escaped
+# PDS address.
+intrinsic("ventus_rt_load_pds_field", dest_comp=1,
+          indices=[BASE, RANGE_BASE], bit_sizes=[32], flags=[CAN_ELIMINATE])
+intrinsic("ventus_rt_store_pds_field", src_comp=[1],
+          indices=[BASE, RANGE_BASE])
+# Address of the compiler-private continuation stack backing immediately after
+# the V5 PDS.  It is reconstructible state, not an address into a PDS field.
+intrinsic("ventus_rt_continuation_stack_address", dest_comp=1,
+          bit_sizes=[64], flags=[CAN_ELIMINATE])
 # Typed parent-invocation hit-attribute input.  BASE is the byte offset and
 # COMPONENT distinguishes the fixed triangle-barycentric carrier from a
 # custom hit attribute.  Both are compiler metadata rather than operands so

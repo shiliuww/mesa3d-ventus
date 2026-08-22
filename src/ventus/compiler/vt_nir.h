@@ -37,6 +37,15 @@ enum vt_rt_shader_layout {
    VT_RT_LAYOUT_COUNT = 5,
 };
 
+/* Compiler-private semantic identities for PDS accesses that must remain
+ * recognizable through continuation planning.  RANGE_BASE on the associated
+ * NIR intrinsic is a byte offset within the selected field. */
+enum vt_nir_rt_pds_field {
+   VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME = 0,
+   VT_NIR_RT_PDS_FIELD_CALL_DATA = 1,
+   VT_NIR_RT_PDS_FIELD_CALLBACK_STAGING = 2,
+};
+
 enum vt_rt_payload_word {
    VT_RT_PAYLOAD_DEPTH = 0,
    VT_RT_PAYLOAD_WEIGHT = 1,

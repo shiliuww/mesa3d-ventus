@@ -1591,14 +1591,42 @@ vtvk_rt_global_store_u32(nir_builder *b, nir_def *base, uint32_t offset,
                     .write_mask = 0x1, .align_mul = 4);
 }
 
+static nir_def *
+vtvk_rt_load_call_data_word(nir_builder *b, uint32_t byte_offset)
+{
+   return nir_ventus_rt_load_pds_field(
+      b, .base = VT_NIR_RT_PDS_FIELD_CALL_DATA,
+      .range_base = byte_offset);
+}
+
 static void
-vtvk_rt_copy_callable_words(nir_builder *b, nir_def *src, uint32_t src_offset,
-                            nir_def *dst, uint32_t dst_offset, uint32_t bytes)
+vtvk_rt_store_call_data_word(nir_builder *b, uint32_t byte_offset,
+                             nir_def *value)
+{
+   nir_ventus_rt_store_pds_field(
+      b, nir_u2u32(b, value), .base = VT_NIR_RT_PDS_FIELD_CALL_DATA,
+      .range_base = byte_offset);
+}
+
+static void
+vtvk_rt_save_callable_words(nir_builder *b, nir_def *frame,
+                            uint32_t frame_offset, uint32_t bytes)
 {
    for (uint32_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
       vtvk_rt_global_store_u32(
-         b, dst, dst_offset + offset,
-         vtvk_rt_global_load_u32(b, src, src_offset + offset));
+         b, frame, frame_offset + offset,
+         vtvk_rt_load_call_data_word(b, offset));
+   }
+}
+
+static void
+vtvk_rt_restore_callable_words(nir_builder *b, nir_def *frame,
+                               uint32_t frame_offset, uint32_t bytes)
+{
+   for (uint32_t offset = 0; offset < bytes; offset += sizeof(uint32_t)) {
+      vtvk_rt_store_call_data_word(
+         b, offset,
+         vtvk_rt_global_load_u32(b, frame, frame_offset + offset));
    }
 }
 
@@ -1676,8 +1704,6 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
    }
 
    nir_push_if(b, valid_entry);
-   nir_def *pds = nir_u2u64(
-      b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
    struct vt_nir_rt_stack_cursor cursor;
    vt_nir_rt_v5_load_stack_cursor(b, &cursor);
    nir_def *stack_available = nir_ult(
@@ -1686,34 +1712,33 @@ vtvk_lower_rt_execute_callable_entry(nir_builder *b,
       b, cursor.callable_depth, cursor.callable_capacity);
    nir_push_if(b, nir_iand(b, stack_available, callable_available));
    nir_def *frame = cursor.next_frame;
-   vtvk_rt_copy_callable_words(
-      b, pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE, frame,
-      VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
+   vtvk_rt_save_callable_words(
+      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
       VTVK_RT_CALLABLE_PARENT_DATA_BYTES);
    vt_nir_rt_v5_publish_stack_push(
       b, &cursor, nir_imm_int(b, VT_NIR_RT_FRAME_CALLABLE),
       nir_imm_int(b, 0), nir_iadd_imm(b, record, 32), true);
 
    nir_def *call_data = nir_load_var(b, payload);
-   nir_store_global(
-      b, call_data,
-      nir_iadd_imm(b, pds,
-                   VENTUS_RT_V5_PDS_CALL_DATA_BASE + payload_offset),
-      .write_mask = BITFIELD_MASK(components), .align_mul = 4);
+   for (unsigned component = 0; component < components; ++component) {
+      vtvk_rt_store_call_data_word(
+         b, payload_offset + component * sizeof(uint32_t),
+         nir_channel(b, call_data, component));
+   }
    for (const vtvk_rt_callback_shader_entry &entry : *state->callables) {
       nir_push_if(b, nir_ieq_imm(b, entry_ref, entry.group_index));
       nir_ventus_rt_call_shader_entry(
          b, nir_imm_int(b, entry.executable_index));
       nir_pop_if(b, NULL);
    }
-   nir_def *returned_data = nir_load_global(
-      b, components, 32,
-      nir_iadd_imm(b, pds,
-                   VENTUS_RT_V5_PDS_CALL_DATA_BASE + payload_offset),
-      .align_mul = 4);
-   vtvk_rt_copy_callable_words(
-      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET, pds,
-      VENTUS_RT_V5_PDS_CALL_DATA_BASE,
+   nir_def *returned_components[4];
+   for (unsigned component = 0; component < components; ++component) {
+      returned_components[component] = vtvk_rt_load_call_data_word(
+         b, payload_offset + component * sizeof(uint32_t));
+   }
+   nir_def *returned_data = nir_vec(b, returned_components, components);
+   vtvk_rt_restore_callable_words(
+      b, frame, VTVK_RT_CALLABLE_PARENT_DATA_OFFSET,
       VTVK_RT_CALLABLE_PARENT_DATA_BYTES);
    vt_nir_rt_v5_publish_stack_pop(b, true);
    nir_store_var(b, payload, returned_data, BITFIELD_MASK(components));
@@ -2267,8 +2292,8 @@ vtvk_lower_rt_v5_intersection_report_entry(nir_builder *b,
 
    nir_def *pds = nir_u2u64(
       b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
-   nir_def *staging = vtvk_rt_global_load_u32(
-      b, pds, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING);
+   nir_def *staging = nir_ventus_rt_load_pds_field(
+      b, .base = VT_NIR_RT_PDS_FIELD_CALLBACK_STAGING, .range_base = 0);
    nir_def *already_terminated = nir_ine_imm(
       b, nir_iand_imm(b, staging,
                       VENTUS_RT_V5_SHADER_RETURN_TERMINATE), 0);
@@ -2337,18 +2362,19 @@ vtvk_lower_rt_v5_intersection_report_entry(nir_builder *b,
       b, nir_iand_imm(b, staging,
                       VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED), 0);
    nir_def *has_commit = nir_ior(b, previous_commit, accepted);
-   vtvk_rt_global_store_u32(
-      b, pds, VENTUS_RT_V5_COMPILER_CALLBACK_STAGING,
+   nir_ventus_rt_store_pds_field(
+      b,
       nir_ior(
          b,
          nir_bcsel(
             b, has_commit,
             nir_imm_int(b, VENTUS_RT_V5_COMPILER_CALLBACK_COMMITTED),
             nir_imm_int(b, 0)),
-         nir_bcsel(
-            b, has_terminated,
-            nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_TERMINATE),
-            nir_imm_int(b, 0))));
+            nir_bcsel(
+               b, has_terminated,
+               nir_imm_int(b, VENTUS_RT_V5_SHADER_RETURN_TERMINATE),
+               nir_imm_int(b, 0))),
+      .base = VT_NIR_RT_PDS_FIELD_CALLBACK_STAGING, .range_base = 0);
 
    nir_def_rewrite_uses(&intrin->def, accepted);
    nir_instr_remove(&intrin->instr);

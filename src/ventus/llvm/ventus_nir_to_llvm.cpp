@@ -546,6 +546,35 @@ private:
          builder.CreateAdd(frameOffset, asInt32(offset)));
    }
 
+   bool rtPdsFieldByteOffset(const nir_intrinsic_instr *intrin,
+                             uint32_t *byteOffset)
+   {
+      uint32_t base = 0;
+      uint32_t size = 0;
+      switch ((enum vt_nir_rt_pds_field)nir_intrinsic_base(intrin)) {
+      case VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME:
+         base = VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS;
+         size = sizeof(uint64_t);
+         break;
+      case VT_NIR_RT_PDS_FIELD_CALL_DATA:
+         base = VENTUS_RT_V5_PDS_CALL_DATA_BASE;
+         size = VENTUS_RT_V5_CALL_DATA_CAPACITY_BYTES;
+         break;
+      case VT_NIR_RT_PDS_FIELD_CALLBACK_STAGING:
+         base = VENTUS_RT_V5_COMPILER_CALLBACK_STAGING;
+         size = sizeof(uint32_t);
+         break;
+      default:
+         return false;
+      }
+
+      const uint32_t relative = nir_intrinsic_range_base(intrin);
+      if ((relative & 3) != 0 || relative > size - sizeof(uint32_t))
+         return false;
+      *byteOffset = base + relative;
+      return true;
+   }
+
    Value *rtCanonicalSharedAddress(Value *offset)
    {
       return builder.CreateAdd(readVentusCsrI32("CSR_LDS"),
@@ -2192,6 +2221,35 @@ private:
       }
       case nir_intrinsic_ventus_rt_hot_pds_address: {
          return rtHotPdsAddress(value(intrin->src[0]));
+      }
+      case nir_intrinsic_ventus_rt_load_pds_field: {
+         uint32_t byteOffset = 0;
+         if (!rtPdsFieldByteOffset(intrin, &byteOffset)) {
+            fprintf(stderr, "ventus-nir-to-llvm: invalid named PDS load\n");
+            translationFailed = true;
+            return nullptr;
+         }
+         return loadI32Global(
+            rtHotPdsAddress(ConstantInt::get(i32, byteOffset)), 0);
+      }
+      case nir_intrinsic_ventus_rt_store_pds_field: {
+         uint32_t byteOffset = 0;
+         if (!rtPdsFieldByteOffset(intrin, &byteOffset)) {
+            fprintf(stderr, "ventus-nir-to-llvm: invalid named PDS store\n");
+            translationFailed = true;
+            return nullptr;
+         }
+         StoreInst *store = builder.CreateStore(
+            asInt32(value(intrin->src[0])),
+            globalPtr(rtHotPdsAddress(ConstantInt::get(i32, byteOffset))));
+         store->setAlignment(Align(4));
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_continuation_stack_address: {
+         return builder.CreateZExt(
+            rtHotPdsAddress(ConstantInt::get(i32,
+                                             VENTUS_RT_V5_PDS_SIZE_BYTES)),
+            i64);
       }
       case nir_intrinsic_ventus_rt_entry_frame_address: {
          return builder.CreateZExt(

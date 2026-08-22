@@ -96,6 +96,31 @@ build_parent_dynamic_hit_attribute_probe(
 }
 
 static nir_shader *
+build_parent_named_pds_carrier_probe(
+   const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_CLOSEST_HIT, options,
+      "vt_parent_named_pds_carrier_probe");
+   nir_variable *payload = nir_variable_create(
+      b.shader, nir_var_shader_temp, glsl_uint_type(), "child_payload");
+   payload->data.explicit_location = true;
+   payload->data.location = 0;
+
+   nir_def *parent_value = nir_ventus_rt_load_pds_field(
+      &b, .base = VT_NIR_RT_PDS_FIELD_CALL_DATA, .range_base = 8);
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *zero64 = nir_imm_int64(&b, 0);
+   nir_def *zero3 = nir_replicate(&b, zero, 3);
+   nir_trace_ray(&b, zero64, zero, zero, zero, zero, zero,
+                 zero3, zero, zero3, zero,
+                 &nir_build_deref_var(&b, payload)->def);
+   nir_store_global(&b, parent_value, nir_imm_int64(&b, 0x1000),
+                    .write_mask = 0x1, .align_mul = 4);
+   return b.shader;
+}
+
+static nir_shader *
 build_parent_state_direct_pds_probe(
    const nir_shader_compiler_options *options)
 {
@@ -435,6 +460,8 @@ main(int argc, char **argv)
       build_parent_state_continuation_probe(&options, true);
    nir_shader *parent_dynamic_hit_attribute_probe =
       build_parent_dynamic_hit_attribute_probe(&options);
+   nir_shader *parent_named_pds_carrier_probe =
+      build_parent_named_pds_carrier_probe(&options);
    nir_shader *parent_state_fallback_probe =
       build_parent_state_direct_pds_probe(&options);
 
@@ -626,6 +653,24 @@ main(int argc, char **argv)
    VT_RT_CHECK(
       parent_dynamic_hit_attribute.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_dynamic_hit_attribute.sites[0].ssa_spill_bytes > 0);
+
+   bool parent_named_pds_carrier_complete = false;
+   VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
+      parent_named_pds_carrier_probe, &parent_state_config,
+      &parent_named_pds_carrier_complete));
+   VT_RT_CHECK(parent_named_pds_carrier_complete);
+   VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
+      parent_named_pds_carrier_probe, &parent_state_config));
+   struct vt_nir_rt_resident_continuation_info parent_named_pds_carrier = {};
+   VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
+      parent_named_pds_carrier_probe, 2, linked_payload_size, 0,
+      parent_named_pds_carrier_complete, &parent_named_pds_carrier,
+      cps_mem_ctx));
+   VT_RT_CHECK(parent_named_pds_carrier.parent_state_ssa_complete);
+   VT_RT_CHECK(parent_named_pds_carrier.site_count == 1);
+   VT_RT_CHECK(
+      parent_named_pds_carrier.sites[0].parent_pds_save_bytes == 0);
+   VT_RT_CHECK(parent_named_pds_carrier.sites[0].ssa_spill_bytes > 0);
 
    bool parent_state_fallback_complete = true;
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
@@ -1142,6 +1187,7 @@ main(int argc, char **argv)
    ralloc_free(parent_state_ssa_probe);
    ralloc_free(parent_hit_attribute_probe);
    ralloc_free(parent_dynamic_hit_attribute_probe);
+   ralloc_free(parent_named_pds_carrier_probe);
    ralloc_free(parent_state_fallback_probe);
    ralloc_free(cps_mem_ctx);
    ralloc_free(global_raygen);
