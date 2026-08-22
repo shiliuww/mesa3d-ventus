@@ -550,7 +550,8 @@ bool vt_nir_prepare_rt_resident_continuations(
  * when the shader contains a parent-state access which is not covered by the
  * SSA contract; callers must then retain the conservative PDS snapshot.
  */
-bool vt_nir_opt_rt_parent_state_ssa(nir_shader *shader, bool *complete);
+bool vt_nir_opt_rt_parent_state_ssa(
+   nir_shader *shader, const struct vt_nir_rt_config *config, bool *complete);
 
 /* Lower resident trace calls in place.  Mesa's shader-call liveness pass
  * provides selective SSA spill/reload while preserving the original CFG. */

@@ -3029,7 +3029,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       for (const auto &resident_shader : resident_trace_shaders) {
          bool shader_complete = false;
          if (!vt_nir_opt_rt_parent_state_ssa(
-                resident_shader.shader, &shader_complete)) {
+                resident_shader.shader, &resident_config,
+                &shader_complete)) {
             mesa_loge("ventus-vk: V5 parent-state SSA preparation failed "
                       "for %s",
                       _mesa_shader_stage_to_string(

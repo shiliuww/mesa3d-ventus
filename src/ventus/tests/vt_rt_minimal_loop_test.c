@@ -27,12 +27,12 @@ build_resident_callable_probe(const nir_shader_compiler_options *options)
 
 static nir_shader *
 build_parent_state_continuation_probe(
-   const nir_shader_compiler_options *options, bool uncertain_hit_attribute)
+   const nir_shader_compiler_options *options, bool use_hit_attribute)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_CLOSEST_HIT, options,
-      uncertain_hit_attribute ? "vt_parent_state_fallback_probe" :
-                                "vt_parent_state_ssa_probe");
+      use_hit_attribute ? "vt_parent_hit_attribute_ssa_probe" :
+                          "vt_parent_state_ssa_probe");
    nir_variable *payload = nir_variable_create(
       b.shader, nir_var_shader_temp, glsl_uint_type(), "child_payload");
    payload->data.explicit_location = true;
@@ -46,7 +46,7 @@ build_parent_state_continuation_probe(
                  &nir_build_deref_var(&b, payload)->def);
 
    nir_def *parent_value;
-   if (uncertain_hit_attribute) {
+   if (use_hit_attribute) {
       nir_variable *attrib = nir_variable_create(
          b.shader, nir_var_ray_hit_attrib, glsl_vec2_type(),
          "parent_hit_attribute");
@@ -56,6 +56,66 @@ build_parent_state_continuation_probe(
    } else {
       parent_value = nir_load_primitive_id(&b);
    }
+   nir_store_global(&b, parent_value, nir_imm_int64(&b, 0x1000),
+                    .write_mask = 0x1, .align_mul = 4);
+   return b.shader;
+}
+
+static nir_shader *
+build_parent_dynamic_hit_attribute_probe(
+   const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_CLOSEST_HIT, options,
+      "vt_parent_dynamic_hit_attribute_ssa_probe");
+   nir_variable *payload = nir_variable_create(
+      b.shader, nir_var_shader_temp, glsl_uint_type(), "child_payload");
+   payload->data.explicit_location = true;
+   payload->data.location = 0;
+
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *zero64 = nir_imm_int64(&b, 0);
+   nir_def *zero3 = nir_replicate(&b, zero, 3);
+   nir_trace_ray(&b, zero64, zero, zero, zero, zero, zero,
+                 zero3, zero, zero3, zero,
+                 &nir_build_deref_var(&b, payload)->def);
+
+   nir_variable *attrib = nir_variable_create(
+      b.shader, nir_var_ray_hit_attrib,
+      glsl_array_type(glsl_uint_type(), 4, 0),
+      "parent_dynamic_hit_attribute");
+   attrib->data.explicit_location = true;
+   attrib->data.location = 0;
+   nir_def *index = nir_iand_imm(&b, nir_load_primitive_id(&b), 3);
+   nir_deref_instr *element = nir_build_deref_array(
+      &b, nir_build_deref_var(&b, attrib), index);
+   nir_def *parent_value = nir_load_deref(&b, element);
+   nir_store_global(&b, parent_value, nir_imm_int64(&b, 0x1000),
+                    .write_mask = 0x1, .align_mul = 4);
+   return b.shader;
+}
+
+static nir_shader *
+build_parent_state_direct_pds_probe(
+   const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_CLOSEST_HIT, options, "vt_parent_state_direct_pds_probe");
+   nir_variable *payload = nir_variable_create(
+      b.shader, nir_var_shader_temp, glsl_uint_type(), "child_payload");
+   payload->data.explicit_location = true;
+   payload->data.location = 0;
+
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *zero64 = nir_imm_int64(&b, 0);
+   nir_def *zero3 = nir_replicate(&b, zero, 3);
+   nir_trace_ray(&b, zero64, zero, zero, zero, zero, zero,
+                 zero3, zero, zero3, zero,
+                 &nir_build_deref_var(&b, payload)->def);
+
+   nir_def *parent_value = nir_ventus_rt_load_slot(
+      &b, 1, 32,
+      nir_u2u64(&b, nir_ventus_rt_hot_pds_address(&b, zero)));
    nir_store_global(&b, parent_value, nir_imm_int64(&b, 0x1000),
                     .write_mask = 0x1, .align_mul = 4);
    return b.shader;
@@ -371,8 +431,12 @@ main(int argc, char **argv)
       build_payload_location_probe(&options);
    nir_shader *parent_state_ssa_probe =
       build_parent_state_continuation_probe(&options, false);
-   nir_shader *parent_state_fallback_probe =
+   nir_shader *parent_hit_attribute_probe =
       build_parent_state_continuation_probe(&options, true);
+   nir_shader *parent_dynamic_hit_attribute_probe =
+      build_parent_dynamic_hit_attribute_probe(&options);
+   nir_shader *parent_state_fallback_probe =
+      build_parent_state_direct_pds_probe(&options);
 
    struct vt_nir_rt_abi_layout abi = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES >=
@@ -500,7 +564,8 @@ main(int argc, char **argv)
 
    bool parent_state_ssa_complete = false;
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
-      parent_state_ssa_probe, &parent_state_ssa_complete));
+      parent_state_ssa_probe, &parent_state_config,
+      &parent_state_ssa_complete));
    VT_RT_CHECK(parent_state_ssa_complete);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_state_ssa_probe, &parent_state_config));
@@ -515,9 +580,57 @@ main(int argc, char **argv)
    VT_RT_CHECK(parent_state_ssa.sites[0].parent_pds_save_bytes == 0);
    VT_RT_CHECK(parent_state_ssa.sites[0].ssa_spill_bytes > 0);
 
+   bool parent_hit_attribute_complete = false;
+   VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
+      parent_hit_attribute_probe, &parent_state_config,
+      &parent_hit_attribute_complete));
+   VT_RT_CHECK(parent_hit_attribute_complete);
+   VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
+      parent_hit_attribute_probe, &parent_state_config));
+   VT_RT_CHECK(vt_nir_lower_rt_abi(
+      parent_hit_attribute_probe, &parent_state_config));
+   struct vt_nir_rt_resident_continuation_info parent_hit_attribute = {};
+   VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
+      parent_hit_attribute_probe, 2, linked_payload_size, 0,
+      parent_hit_attribute_complete, &parent_hit_attribute, cps_mem_ctx));
+   VT_RT_CHECK(parent_hit_attribute.parent_state_ssa_complete);
+   VT_RT_CHECK(parent_hit_attribute.site_count == 1);
+   VT_RT_CHECK(parent_hit_attribute.sites[0].parent_pds_save_bytes == 0);
+   VT_RT_CHECK(parent_hit_attribute.sites[0].ssa_spill_bytes > 0);
+
+   struct vt_nir_rt_abi_layout dynamic_hit_abi = abi;
+   VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(
+      &dynamic_hit_abi, 4 * sizeof(uint32_t), false));
+   struct vt_nir_rt_config dynamic_hit_config = vt_nir_rt_default_config();
+   vt_nir_rt_config_apply_abi_layout(&dynamic_hit_config, &dynamic_hit_abi);
+   dynamic_hit_config.use_v5_pds = true;
+   dynamic_hit_config.enable_monolithic_shader_callbacks = true;
+
+   bool parent_dynamic_hit_attribute_complete = false;
+   VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
+      parent_dynamic_hit_attribute_probe, &dynamic_hit_config,
+      &parent_dynamic_hit_attribute_complete));
+   VT_RT_CHECK(parent_dynamic_hit_attribute_complete);
+   VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
+      parent_dynamic_hit_attribute_probe, &dynamic_hit_config));
+   VT_RT_CHECK(vt_nir_lower_rt_abi(
+      parent_dynamic_hit_attribute_probe, &dynamic_hit_config));
+   struct vt_nir_rt_resident_continuation_info
+      parent_dynamic_hit_attribute = {};
+   VT_RT_CHECK(vt_nir_lower_rt_resident_continuations(
+      parent_dynamic_hit_attribute_probe, 2, linked_payload_size, 0,
+      parent_dynamic_hit_attribute_complete,
+      &parent_dynamic_hit_attribute, cps_mem_ctx));
+   VT_RT_CHECK(parent_dynamic_hit_attribute.parent_state_ssa_complete);
+   VT_RT_CHECK(parent_dynamic_hit_attribute.site_count == 1);
+   VT_RT_CHECK(
+      parent_dynamic_hit_attribute.sites[0].parent_pds_save_bytes == 0);
+   VT_RT_CHECK(parent_dynamic_hit_attribute.sites[0].ssa_spill_bytes > 0);
+
    bool parent_state_fallback_complete = true;
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
-      parent_state_fallback_probe, &parent_state_fallback_complete));
+      parent_state_fallback_probe, &parent_state_config,
+      &parent_state_fallback_complete));
    VT_RT_CHECK(!parent_state_fallback_complete);
    VT_RT_CHECK(vt_nir_prepare_rt_resident_continuations(
       parent_state_fallback_probe, &parent_state_config));
@@ -670,7 +783,8 @@ main(int argc, char **argv)
    resident_config.enable_monolithic_shader_callbacks = true;
    bool resident_parent_state_ssa_complete = false;
    VT_RT_CHECK(vt_nir_opt_rt_parent_state_ssa(
-      resident_raygen, &resident_parent_state_ssa_complete));
+      resident_raygen, &resident_config,
+      &resident_parent_state_ssa_complete));
    VT_RT_CHECK(resident_parent_state_ssa_complete);
    nir_foreach_variable_in_shader(var, resident_raygen) {
       if (var->data.mode == nir_var_shader_temp ||
@@ -1026,6 +1140,8 @@ main(int argc, char **argv)
    ralloc_free(v5_raygen);
    ralloc_free(resident_raygen);
    ralloc_free(parent_state_ssa_probe);
+   ralloc_free(parent_hit_attribute_probe);
+   ralloc_free(parent_dynamic_hit_attribute_probe);
    ralloc_free(parent_state_fallback_probe);
    ralloc_free(cps_mem_ctx);
    ralloc_free(global_raygen);

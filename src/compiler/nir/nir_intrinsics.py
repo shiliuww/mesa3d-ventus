@@ -782,6 +782,12 @@ intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
           bit_sizes=[32])
 intrinsic("ventus_rt_hot_pds_address", src_comp=[1], dest_comp=1,
           bit_sizes=[32])
+# Typed parent-invocation hit-attribute input.  BASE is the byte offset and
+# COMPONENT distinguishes the fixed triangle-barycentric carrier from a
+# custom hit attribute.  Both are compiler metadata rather than operands so
+# the load can move with other parent-invocation system values.
+intrinsic("ventus_rt_load_hit_attrib", dest_comp=1,
+          indices=[BASE, COMPONENT], bit_sizes=[32], flags=[CAN_ELIMINATE])
 # Compiler-private address of the bounded resident RT entry frame.  The
 # pipeline linker fixes its per-thread offset after trace-continuation sizing;
 # it is not part of the public PDS or RTcore ABI.

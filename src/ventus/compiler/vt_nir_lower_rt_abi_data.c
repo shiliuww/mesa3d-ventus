@@ -987,6 +987,33 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
    b->cursor = nir_before_instr(&intrin->instr);
 
    switch (intrin->intrinsic) {
+   case nir_intrinsic_ventus_rt_load_hit_attrib: {
+      const uint32_t byte_offset = nir_intrinsic_base(intrin);
+      const bool barycentrics = nir_intrinsic_component(intrin);
+      nir_def *replacement = NULL;
+      if (barycentrics) {
+         if (byte_offset < 8) {
+            replacement = vt_nir_load_hit_record_word(
+               b, config, layout,
+               (enum vt_rt_hit_record_word)(
+                  VT_RT_HIT_RECORD_BARYCENTRICS_X + byte_offset / 4),
+               32);
+         } else {
+            replacement = nir_imm_int(b, 0);
+         }
+      } else if (config->use_v5_pds) {
+         replacement = load_v5_pds_u32(
+            b, config->scratchpad[layout].hit_attrib_base_bytes +
+                  byte_offset);
+      } else {
+         replacement = load_rt_slot_word(
+            b, config, layout,
+            config->scratchpad[layout].hit_attrib_base_bytes + byte_offset);
+      }
+      nir_def_rewrite_uses(&intrin->def, replacement);
+      nir_instr_remove(&intrin->instr);
+      return true;
+   }
    case nir_intrinsic_ignore_ray_intersection:
       vt_nir_store_control_word(b, config, layout,
                                 VT_RT_CONTROL_CALLBACK_DECISION,

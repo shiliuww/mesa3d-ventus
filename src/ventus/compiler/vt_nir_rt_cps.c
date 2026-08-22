@@ -8,6 +8,8 @@
 #include <limits.h>
 #include <string.h>
 
+#include "compiler/glsl_types.h"
+#include "nir/nir_deref.h"
 #include "util/ralloc.h"
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_v5.h"
@@ -251,16 +253,149 @@ is_rt_parent_state_system_value(nir_intrinsic_op op)
    case nir_intrinsic_load_instance_id:
    case nir_intrinsic_load_front_face:
    case nir_intrinsic_load_front_face_fsign:
+   case nir_intrinsic_ventus_rt_load_hit_attrib:
       return true;
    default:
       return false;
    }
 }
 
-bool
-vt_nir_opt_rt_parent_state_ssa(nir_shader *shader, bool *complete)
+struct parent_hit_attrib_state {
+   const struct vt_nir_rt_config *config;
+};
+
+static bool
+is_parent_barycentric_var(const struct parent_hit_attrib_state *state,
+                          const nir_variable *var)
 {
-   if (!shader || !complete)
+   if (!state->config->scratchpad[VT_RT_LAYOUT_ANY_HIT]
+           .hit_attrib_barycentrics ||
+       var->data.driver_location != 0)
+      return false;
+
+   unsigned size = 0, align = 0;
+   glsl_get_natural_size_align_bytes(var->type, &size, &align);
+   return size >= 8 && align >= 4;
+}
+
+static nir_def *
+load_parent_hit_attrib_word(nir_builder *b, uint32_t byte_offset,
+                            bool barycentrics)
+{
+   if (barycentrics && byte_offset >= 8)
+      return nir_imm_int(b, 0);
+
+   return nir_ventus_rt_load_hit_attrib(
+      b, .base = byte_offset, .component = barycentrics);
+}
+
+static bool
+lower_parent_hit_attrib_load(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   if (intrin->intrinsic != nir_intrinsic_load_deref)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+   if (!deref || !nir_deref_mode_is(deref, nir_var_ray_hit_attrib) ||
+       deref->deref_type == nir_deref_type_cast)
+      return false;
+
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var)
+      return false;
+
+   struct parent_hit_attrib_state *state = data;
+   const uint32_t location =
+      var->data.driver_location +
+      nir_deref_instr_get_const_offset(deref,
+                                       glsl_get_natural_size_align_bytes);
+   const bool barycentrics = is_parent_barycentric_var(state, var);
+
+   b->cursor = nir_after_instr(instr);
+   nir_def *components[NIR_MAX_VEC_COMPONENTS];
+   for (uint32_t comp = 0; comp < intrin->def.num_components; comp++) {
+      const uint32_t component_offset =
+         location + comp * DIV_ROUND_UP(intrin->def.bit_size, 8);
+      const uint32_t word_offset = component_offset & ~3u;
+      const uint32_t byte_in_word = component_offset & 3u;
+
+      if (intrin->def.bit_size == 64) {
+         components[comp] = nir_pack_64_2x32_split(
+            b, load_parent_hit_attrib_word(b, word_offset, barycentrics),
+            load_parent_hit_attrib_word(b, word_offset + 4,
+                                        barycentrics));
+      } else if (intrin->def.bit_size == 32) {
+         components[comp] =
+            load_parent_hit_attrib_word(b, word_offset, barycentrics);
+      } else if (intrin->def.bit_size == 16) {
+         components[comp] = nir_channel(
+            b, nir_unpack_32_2x16(
+                  b, load_parent_hit_attrib_word(b, word_offset,
+                                                 barycentrics)),
+            byte_in_word / 2);
+      } else if (intrin->def.bit_size == 8) {
+         components[comp] = nir_channel(
+            b, nir_unpack_bits(
+                  b, load_parent_hit_attrib_word(b, word_offset,
+                                                 barycentrics),
+                  8),
+            byte_in_word);
+      } else {
+         assert(intrin->def.bit_size == 1);
+         components[comp] = nir_i2b(
+            b, load_parent_hit_attrib_word(b, word_offset, barycentrics));
+      }
+   }
+
+   nir_def_rewrite_uses(
+      &intrin->def,
+      nir_vec(b, components, intrin->def.num_components));
+   nir_instr_remove(instr);
+   return true;
+}
+
+static bool
+prepare_parent_hit_attrib_ssa(nir_shader *shader,
+                              const struct vt_nir_rt_config *config,
+                              bool *complete)
+{
+   bool progress = false;
+   progress |= nir_lower_vars_to_explicit_types(
+      shader, nir_var_ray_hit_attrib, glsl_get_natural_size_align_bytes);
+   progress |= nir_lower_indirect_derefs_to_if_else_trees(
+      shader, nir_var_ray_hit_attrib, UINT32_MAX);
+
+   struct parent_hit_attrib_state state = {.config = config};
+   progress |= nir_shader_instructions_pass(
+      shader, lower_parent_hit_attrib_load, nir_metadata_control_flow,
+      &state);
+   if (progress)
+      nir_remove_dead_derefs(shader);
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (nir_deref_mode_is(deref, nir_var_ray_hit_attrib))
+               *complete = false;
+         }
+      }
+   }
+   return progress;
+}
+
+bool
+vt_nir_opt_rt_parent_state_ssa(nir_shader *shader,
+                               const struct vt_nir_rt_config *config,
+                               bool *complete)
+{
+   if (!shader || !config || !complete)
       return false;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
@@ -285,7 +420,7 @@ vt_nir_opt_rt_parent_state_ssa(nir_shader *shader, bool *complete)
    if (!has_trace)
       return true;
 
-   bool progress = false;
+   bool progress = prepare_parent_hit_attrib_ssa(shader, config, complete);
    nir_foreach_block(block, impl) {
       nir_foreach_instr_safe(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
