@@ -761,7 +761,10 @@ vt_nir_lower_rt_resident_continuations(
    const nir_lower_shader_calls_options options = {
       .address_format = nir_address_format_32bit_offset,
       .stack_alignment = VENTUS_RT_V5_CONTINUATION_ALIGNMENT_BYTES,
-      .localized_loads = true,
+      /* Materialization pops the resident frame at the explicit return
+       * marker. Keep every CPS reload at that boundary so no reload can be
+       * moved past the pop and address the parent or an inactive frame. */
+      .localized_loads = false,
       .preserve_inline_resume = true,
    };
    if (!nir_lower_shader_calls(shader, &options, &unused_resume_shaders,

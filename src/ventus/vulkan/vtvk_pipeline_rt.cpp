@@ -3061,22 +3061,17 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->rt_uses_rv64 = device->rt_uses_rv64;
    pipeline->retain_generated_artifacts =
       vtvk_env_enabled("VENTUS_VK_RETAIN_SHADER_ARTIFACTS");
-   const bool v5_requested = vtvk_env_enabled("VENTUS_VK_RT_ABI_V5");
+   const bool legacy_v4_requested =
+      vtvk_env_enabled("VENTUS_VK_RT_LEGACY_V4");
    const bool v5_megakernel =
-      v5_requested &&
-      profile_config.profile == VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL;
-   const bool single_elf_multi_entry =
-      vtvk_env_enabled("VENTUS_VK_RT_SBT_MULTI_ENTRY");
+      profile_config.profile == VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL &&
+      !legacy_v4_requested;
+   const bool single_elf_multi_entry = v5_megakernel;
    pipeline->rt_v5_enabled = v5_megakernel;
-   if (v5_requested && !v5_megakernel) {
-      mesa_loge("ventus-vk: V5 resident ABI is only available for the "
-                "MegaKernel execution profile");
-      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-   }
-   if (single_elf_multi_entry && !v5_megakernel) {
-      mesa_loge("ventus-vk: single-ELF SBT entries require the V5 "
-                "MegaKernel profile");
+   if (legacy_v4_requested &&
+       profile_config.profile != VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL) {
+      mesa_loge("ventus-vk: the legacy V4 compatibility path only applies "
+                "to the MegaKernel execution profile");
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }

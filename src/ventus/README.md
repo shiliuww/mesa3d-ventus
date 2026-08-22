@@ -52,22 +52,25 @@ vkCreateRayTracingPipelinesKHR
   -> one pipeline-owned RISC-V ELF
 ```
 
-The common architecture names the hard-operation roles:
+MegaKernel pipelines use the V5 resident ABI and one pipeline-owned ELF by
+default. SBT handles resolve independent miss, hit, intersection and callable
+entries inside that ELF. The V5 hard-operation roles are:
 
 ```text
-RT_TRAVERSE(result_out, handoff_addr)
-RT_RELEASE(handoff_addr)
+RT_TRAVERSE(result_out, pds_addr, private_state_addr)
+RT_RELEASE(pds_addr)
 ```
 
-The current scratch-V2 compatibility encoding is still:
+The generated Ventus instruction interface is:
 
 ```text
-vt.rt.traverse vd:vreg32, vs2:vreg32_slot
-vt.rt.release             vs2:vreg32_slot
+vt.rt.traverse.v5 vd:vreg32, vs1:vreg32_pds, vs2:vreg32_shared_private
+vt.rt.release              vs2:vreg32_pds
 ```
 
-The 32-bit slot is an implementation carrier, not a frozen Ventus V0.2
-handoff-address layout.
+`VENTUS_VK_RT_LEGACY_V4=1` selects the retained MegaKernel V4 compatibility
+path for regression diagnosis. Staged Dispatch remains a separate explicit
+pipeline profile and does not use the V5 MegaKernel lowering.
 
 Ray, AS, SBT, payload, hit and launch data remain in the shader-visible data
 plane. They are not extra hard-operation operands.
@@ -81,6 +84,10 @@ The verified `raytracingshadows` path currently performs all of the following:
   parent-replay metadata validated before publication;
 - materializes SBT regions and a restricted descriptor table;
 - collects dispatch state in `vkCmdTraceRaysKHR`;
+- reports per-group stack requirements through
+  `vkGetRayTracingShaderGroupStackSizeKHR`, records static or dynamic pipeline
+  stack state, and allocates per-dispatch continuation backing without going
+  below the compiler-emitted V5 minimum;
 - emits and links the generated Ventus ELF;
 - uploads ELF, BVH, descriptors, SBT, camera data and storage image through
   `vtvk_driver_bridge`;
@@ -106,6 +113,7 @@ Relevant runtime controls include:
 | `VENTUS_VK_EMIT_ELF=1` | Compile/link a generated RT ELF |
 | `VENTUS_VK_SHADER_ARTIFACT_DIR` | Directory for generated LLVM/ELF artifacts |
 | `VENTUS_VK_RETAIN_SHADER_ARTIFACTS=1` | Keep pipeline ELF and compiler intermediates after pipeline destruction for debugging |
+| `VENTUS_VK_RT_LEGACY_V4=1` | Select the retained MegaKernel V4 compatibility path; V5 is the default |
 | `VENTUS_VK_DUMP_IMAGE` | PPM path for storage-image readback |
 | `VENTUS_VK_DRIVER_LIB` | Optional explicit driver shared library |
 
