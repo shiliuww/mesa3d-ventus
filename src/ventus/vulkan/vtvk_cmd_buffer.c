@@ -132,6 +132,8 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
    memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
    cmd->push_constants_size = 0;
    cmd->push_constants_stages = 0;
+   cmd->rt_pipeline_stack_size = 0;
+   cmd->rt_pipeline_stack_size_valid = false;
    vk_command_buffer_reset(cmd_buffer);
 }
 

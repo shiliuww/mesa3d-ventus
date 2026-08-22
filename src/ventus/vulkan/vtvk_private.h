@@ -74,6 +74,8 @@ struct vtvk_cmd_buffer {
    uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
    uint32_t push_constants_size;
    VkShaderStageFlags push_constants_stages;
+   uint32_t rt_pipeline_stack_size;
+   bool rt_pipeline_stack_size_valid;
    struct vtvk_recorded_command *commands_head;
    struct vtvk_recorded_command *commands_tail;
    uint32_t command_count;

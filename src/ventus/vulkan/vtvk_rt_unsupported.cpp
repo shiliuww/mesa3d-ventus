@@ -1,4 +1,4 @@
-#include "vtvk_private.h"
+#include "vtvk_pipeline.h"
 
 #include "vk_common_entrypoints.h"
 #include "vtvk_entrypoints.h"
@@ -109,18 +109,41 @@ vtvk_GetRayTracingShaderGroupStackSizeKHR(
    VkShaderGroupShaderKHR groupShader)
 {
    (void)device;
-   (void)pipeline;
-   (void)group;
-   (void)groupShader;
-   return 0;
+   struct vtvk_pipeline *rt_pipeline = vtvk_pipeline_from_handle(pipeline);
+   if (!rt_pipeline || group >= rt_pipeline->group_count ||
+       !rt_pipeline->rt_group_stack_sizes)
+      return 0;
+
+   uint32_t slot = 0;
+   switch (groupShader) {
+   case VK_SHADER_GROUP_SHADER_GENERAL_KHR:
+      slot = 0;
+      break;
+   case VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR:
+      slot = 1;
+      break;
+   case VK_SHADER_GROUP_SHADER_ANY_HIT_KHR:
+      slot = 2;
+      break;
+   case VK_SHADER_GROUP_SHADER_INTERSECTION_KHR:
+      slot = 3;
+      break;
+   default:
+      return 0;
+   }
+   return rt_pipeline->rt_group_stack_sizes[group * 4 + slot];
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vtvk_CmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer,
                                           uint32_t pipelineStackSize)
 {
-   (void)commandBuffer;
-   (void)pipelineStackSize;
+   struct vtvk_cmd_buffer *cmd =
+      (struct vtvk_cmd_buffer *)(uintptr_t)commandBuffer;
+   if (!cmd)
+      return;
+   cmd->rt_pipeline_stack_size = pipelineStackSize;
+   cmd->rt_pipeline_stack_size_valid = true;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

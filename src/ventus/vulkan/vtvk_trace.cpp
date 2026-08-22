@@ -39,6 +39,8 @@ struct vtvk_rt_recorded_command {
    uint32_t width;
    uint32_t height;
    uint32_t depth;
+   uint32_t pipeline_stack_size;
+   bool pipeline_stack_size_valid;
 };
 
 static VkResult vtvk_execute_recorded_rt_command(
@@ -62,6 +64,15 @@ vtvk_record_rt_command(VkCommandBuffer command_buffer,
 
    record->type = type;
    record->pipeline = cmd->bound_rt_pipeline;
+   struct vtvk_pipeline *pipeline =
+      vtvk_pipeline_from_handle(record->pipeline);
+   if (pipeline && !pipeline->rt_stack_size_dynamic) {
+      record->pipeline_stack_size = pipeline->rt_vulkan_default_stack_size;
+      record->pipeline_stack_size_valid = true;
+   } else {
+      record->pipeline_stack_size = cmd->rt_pipeline_stack_size;
+      record->pipeline_stack_size_valid = cmd->rt_pipeline_stack_size_valid;
+   }
    memcpy(record->descriptor_sets, cmd->bound_descriptor_sets,
           sizeof(record->descriptor_sets));
    memcpy(record->push_constants, cmd->push_constants,
@@ -240,6 +251,11 @@ vtvk_execute_trace_rays(
                 storage_image_data, camera_data);
       return false;
    }
+   if (pipeline->rt_v5_enabled && !record->pipeline_stack_size_valid) {
+      mesa_loge("ventus-vk: dynamic RT pipeline stack size was not set before "
+                "vkCmdTraceRaysKHR");
+      return false;
+   }
    if (!vtvk_validate_sbt_entries(
           pipeline, pMissShaderBindingTable, MESA_SHADER_MISS, "miss") ||
        !vtvk_validate_sbt_entries(
@@ -251,11 +267,12 @@ vtvk_execute_trace_rays(
       logged = true;
       mesa_logi("ventus-vk: vkCmdTraceRaysKHR collected Spike dispatch state "
                 "%ux%ux%u tlas=0x%" PRIx64 " image=%ux%u format=%u "
-                "descriptors=%zu scratch=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
+                "descriptors=%zu scratch=%u stack=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
                 ",hit:0x%" PRIx64 "} push=%u",
                 width, height, depth, (uint64_t)tlas->address,
                 image_extent.width, image_extent.height, image_format,
                 descriptors.size(), pipeline->per_lane_scratch_size,
+                record->pipeline_stack_size,
                 pRaygenShaderBindingTable ?
                    (uint64_t)pRaygenShaderBindingTable->deviceAddress : 0,
                 pMissShaderBindingTable ?
@@ -284,6 +301,8 @@ vtvk_execute_trace_rays(
    trace.per_lane_scratch_size = pipeline->per_lane_scratch_size;
    trace.hit_attribute_size_bytes = pipeline->hit_attribute_size_bytes;
    trace.continuation_frame_size = pipeline->continuation_frame_size;
+   trace.pipeline_stack_size = record->pipeline_stack_size;
+   trace.pipeline_stack_size_valid = record->pipeline_stack_size_valid;
    trace.max_ray_recursion_depth = pipeline->max_ray_recursion_depth;
    trace.execution_profile = pipeline->rt_execution_profile;
    trace.stage_role = pipeline->rt_stage_role;

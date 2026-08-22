@@ -1384,6 +1384,51 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    }
 
    if (!wavefront_global && resource_envelope.has_rt_contract) {
+      if (!info->pipeline_stack_size_valid) {
+         mesa_loge("ventus-vk: V5 dispatch has no Vulkan pipeline stack "
+                   "size state");
+         goto out;
+      }
+      uint64_t requested_continuation_bytes = 0;
+      if (__builtin_add_overflow(
+             (uint64_t)VT_NIR_RT_STACK_HEADER_BYTES,
+             (uint64_t)info->pipeline_stack_size,
+             &requested_continuation_bytes) ||
+          !vtvk_bridge_align_u64_checked(
+             requested_continuation_bytes,
+             VT_NIR_RT_STACK_FRAME_ALIGNMENT_BYTES,
+             &requested_continuation_bytes)) {
+         mesa_loge("ventus-vk: Vulkan RT pipeline stack size overflow");
+         goto out;
+      }
+
+      const uint64_t continuation_bytes = MAX2(
+         requested_continuation_bytes,
+         (uint64_t)resource_envelope.rt_contract.
+            rt_continuation_bytes_per_thread);
+      uint64_t continuation_end = 0;
+      uint64_t runtime_pds_static = 0;
+      if (__builtin_add_overflow(
+             (uint64_t)resource_envelope.rt_contract.
+                rt_continuation_offset_per_thread,
+             continuation_bytes, &continuation_end) ||
+          !vtvk_bridge_align_u64_checked(
+             continuation_end, 128, &runtime_pds_static)) {
+         mesa_loge("ventus-vk: runtime continuation allocation overflow");
+         goto out;
+      }
+      resource_envelope.pds_static_per_thread = MAX2(
+         resource_envelope.pds_static_per_thread, runtime_pds_static);
+      mesa_logi("ventus-vk: Vulkan RT stack requested=%u compiler-min=%u "
+                "allocated=%" PRIu64 " pds-static=%" PRIu64,
+                info->pipeline_stack_size,
+                resource_envelope.rt_contract.
+                   rt_continuation_bytes_per_thread,
+                continuation_bytes,
+                resource_envelope.pds_static_per_thread);
+   }
+
+   if (!wavefront_global && resource_envelope.has_rt_contract) {
       struct ventus_rt_v5_private_placement placement = {};
       if (!ventus_rt_v5_private_placement(
              kernel_lds_size, 1, VTVK_MAX_COMPUTE_SHARED_MEMORY_SIZE,

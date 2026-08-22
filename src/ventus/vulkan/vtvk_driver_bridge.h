@@ -110,6 +110,8 @@ struct vtvk_driver_trace_rays_info {
    uint32_t per_lane_scratch_size;
    uint32_t hit_attribute_size_bytes;
    uint32_t continuation_frame_size;
+   uint32_t pipeline_stack_size;
+   bool pipeline_stack_size_valid;
    uint32_t max_ray_recursion_depth;
    VkVentusRtExecutionProfile execution_profile;
    VkVentusRtStageRole stage_role;

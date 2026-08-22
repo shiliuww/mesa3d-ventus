@@ -2779,6 +2779,99 @@ vtvk_fill_group_handles(struct vtvk_pipeline *pipeline,
    }
 }
 
+static bool
+vtvk_rt_stack_size_is_dynamic(
+   const VkRayTracingPipelineCreateInfoKHR *info)
+{
+   if (!info || !info->pDynamicState)
+      return false;
+
+   for (uint32_t i = 0; i < info->pDynamicState->dynamicStateCount; i++) {
+      if (info->pDynamicState->pDynamicStates[i] ==
+          VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR)
+         return true;
+   }
+   return false;
+}
+
+static uint32_t
+vtvk_rt_group_shader_index(
+   const VkRayTracingShaderGroupCreateInfoKHR *group,
+   VkShaderGroupShaderKHR group_shader)
+{
+   switch (group_shader) {
+   case VK_SHADER_GROUP_SHADER_GENERAL_KHR:
+      return group->generalShader;
+   case VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR:
+      return group->closestHitShader;
+   case VK_SHADER_GROUP_SHADER_ANY_HIT_KHR:
+      return group->anyHitShader;
+   case VK_SHADER_GROUP_SHADER_INTERSECTION_KHR:
+      return group->intersectionShader;
+   default:
+      return VK_SHADER_UNUSED_KHR;
+   }
+}
+
+static bool
+vtvk_rt_finalize_stack_sizes(
+   struct vtvk_pipeline *pipeline,
+   const VkRayTracingPipelineCreateInfoKHR *info,
+   const VkDeviceSize stage_stack_sizes[MESA_VULKAN_SHADER_STAGES])
+{
+   static const VkShaderGroupShaderKHR group_shaders[] = {
+      VK_SHADER_GROUP_SHADER_GENERAL_KHR,
+      VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR,
+      VK_SHADER_GROUP_SHADER_ANY_HIT_KHR,
+      VK_SHADER_GROUP_SHADER_INTERSECTION_KHR,
+   };
+
+   for (uint32_t group_index = 0; group_index < info->groupCount;
+        group_index++) {
+      const VkRayTracingShaderGroupCreateInfoKHR *group =
+         &info->pGroups[group_index];
+      for (uint32_t slot = 0; slot < ARRAY_SIZE(group_shaders); slot++) {
+         const uint32_t shader_index =
+            vtvk_rt_group_shader_index(group, group_shaders[slot]);
+         if (shader_index == VK_SHADER_UNUSED_KHR ||
+             shader_index >= info->stageCount)
+            continue;
+
+         const mesa_shader_stage stage =
+            vk_to_mesa_shader_stage(info->pStages[shader_index].stage);
+         if (stage < MESA_VULKAN_SHADER_STAGES) {
+            pipeline->rt_group_stack_sizes[
+               group_index * ARRAY_SIZE(group_shaders) + slot] =
+                  stage_stack_sizes[stage];
+         }
+      }
+   }
+
+   const uint64_t raygen = stage_stack_sizes[MESA_SHADER_RAYGEN];
+   const uint64_t closest = stage_stack_sizes[MESA_SHADER_CLOSEST_HIT];
+   const uint64_t miss = stage_stack_sizes[MESA_SHADER_MISS];
+   const uint64_t intersection = stage_stack_sizes[MESA_SHADER_INTERSECTION];
+   const uint64_t any_hit = stage_stack_sizes[MESA_SHADER_ANY_HIT];
+   const uint64_t callable = stage_stack_sizes[MESA_SHADER_CALLABLE];
+   const uint64_t depth = info->maxPipelineRayRecursionDepth;
+   const uint64_t first_trace =
+      MAX3(closest, miss, intersection + any_hit);
+   const uint64_t deeper_trace = MAX2(closest, miss);
+   const uint64_t stack_size =
+      raygen + MIN2(1ull, depth) * first_trace +
+      (depth > 1 ? depth - 1 : 0) * deeper_trace + 2 * callable;
+   if (stack_size > UINT32_MAX)
+      return false;
+
+   /* A non-dynamic pipeline must publish a nonzero default.  The value one
+    * mirrors Mesa common behavior for a pipeline whose shaders require no
+    * application-visible stack bytes. */
+   pipeline->rt_vulkan_default_stack_size =
+      stack_size ? (uint32_t)stack_size : 1;
+   pipeline->rt_stack_size_dynamic = vtvk_rt_stack_size_is_dynamic(info);
+   return true;
+}
+
 static void
 vtvk_collect_rt_callback_shaders(const VkRayTracingPipelineCreateInfoKHR *info,
                                 nir_shader **shaders, uint32_t stage_count,
@@ -2974,6 +3067,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       profile_config.profile == VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL;
    const bool single_elf_multi_entry =
       vtvk_env_enabled("VENTUS_VK_RT_SBT_MULTI_ENTRY");
+   pipeline->rt_v5_enabled = v5_megakernel;
    if (v5_requested && !v5_megakernel) {
       mesa_loge("ventus-vk: V5 resident ABI is only available for the "
                 "MegaKernel execution profile");
@@ -2995,8 +3089,14 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       (uint8_t *)vk_zalloc2(&device->vk.alloc, pAllocator,
                             32 * info->groupCount, 8,
                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   pipeline->rt_group_stack_sizes =
+      (VkDeviceSize *)vk_zalloc2(
+         &device->vk.alloc, pAllocator,
+         sizeof(VkDeviceSize) * 4 * info->groupCount, 8,
+         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
 
-   if (!pipeline->nir_mem_ctx || !pipeline->shaders || !pipeline->group_handles) {
+   if (!pipeline->nir_mem_ctx || !pipeline->shaders ||
+       !pipeline->group_handles || !pipeline->rt_group_stack_sizes) {
       vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
@@ -3035,6 +3135,17 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    std::vector<struct vt_nir_rt_resident_continuation_info>
       resident_continuations;
    uint32_t callable_frame_bytes = 0;
+   VkDeviceSize stage_stack_sizes[MESA_VULKAN_SHADER_STAGES] = {};
+   bool stage_uses_callable[MESA_VULKAN_SHADER_STAGES] = {};
+
+   for (uint32_t s = 0; s < pipeline->shader_count; s++) {
+      nir_shader *shader = pipeline->shaders[s];
+      if (shader && shader->info.stage < MESA_VULKAN_SHADER_STAGES &&
+          vtvk_rt_shader_has_intrinsic(
+             shader, nir_intrinsic_execute_callable)) {
+         stage_uses_callable[shader->info.stage] = true;
+      }
+   }
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -3399,6 +3510,9 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          pipeline->rt_v5_max_trace_frame_bytes = MAX2(
             pipeline->rt_v5_max_trace_frame_bytes,
             resident.max_trace_frame_bytes);
+         stage_stack_sizes[shader->info.stage] = MAX2(
+            stage_stack_sizes[shader->info.stage],
+            (VkDeviceSize)resident.max_trace_frame_bytes);
          frame_stride = MAX2(frame_stride,
                              resident.state_frame_stride_bytes);
       }
@@ -3422,6 +3536,18 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
              &pipeline->rt_v5_continuation_frame_capacity,
              &pipeline->rt_v5_continuation_stack_bytes)) {
          mesa_loge("ventus-vk: V5 continuation stack resource overflow");
+         vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+      for (uint32_t stage = 0; stage < MESA_VULKAN_SHADER_STAGES; stage++) {
+         if (stage_uses_callable[stage]) {
+            stage_stack_sizes[stage] = MAX2(
+               stage_stack_sizes[stage],
+               (VkDeviceSize)callable_frame_bytes);
+         }
+      }
+      if (!vtvk_rt_finalize_stack_sizes(pipeline, info, stage_stack_sizes)) {
+         mesa_loge("ventus-vk: Vulkan RT pipeline stack size overflow");
          vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       }

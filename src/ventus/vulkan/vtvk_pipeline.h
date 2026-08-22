@@ -52,6 +52,7 @@ struct vtvk_pipeline {
    uint32_t callback_kernel_count;
 
    uint8_t *group_handles;
+   VkDeviceSize *rt_group_stack_sizes;
    uint32_t group_count;
 
    uint32_t per_lane_scratch_size;
@@ -66,6 +67,7 @@ struct vtvk_pipeline {
    uint32_t rt_v5_continuation_frame_stride;
    uint32_t rt_v5_continuation_frame_capacity;
    uint32_t rt_v5_callable_depth_capacity;
+   uint32_t rt_vulkan_default_stack_size;
    uint32_t *rt_shader_entry_refs;
    uint64_t *rt_shader_entry_targets;
    uint32_t *rt_shader_entry_stages;
@@ -77,6 +79,8 @@ struct vtvk_pipeline {
    uint32_t rt_state_descriptor_binding;
    bool rt_uses_rv64;
    bool retain_generated_artifacts;
+   bool rt_v5_enabled;
+   bool rt_stack_size_dynamic;
    bool rt_single_elf_multi_entry;
    struct vt_nir_pipeline_scratch_info scratch_info;
 

@@ -59,6 +59,7 @@ vtvk_pipeline_destroy(struct vk_device *device,
    ralloc_free(pipeline->nir_mem_ctx);
    vk_free2(&device->alloc, pAllocator, pipeline->shaders);
    vk_free2(&device->alloc, pAllocator, pipeline->group_handles);
+   vk_free2(&device->alloc, pAllocator, pipeline->rt_group_stack_sizes);
    vk_pipeline_free(device, pAllocator, vk_pipeline);
 }
 
