@@ -504,6 +504,7 @@ struct vt_nir_rt_resident_continuation_info {
    uint32_t scratch_offset_bytes;
    uint32_t state_frame_stride_bytes;
    uint32_t stack_bytes_per_thread;
+   bool parent_state_ssa_complete;
 };
 
 nir_def *vt_nir_rt_v5_continuation_stack_base(nir_builder *b);
@@ -543,11 +544,20 @@ bool vt_nir_plan_rt_resident_continuations(
 bool vt_nir_prepare_rt_resident_continuations(
    nir_shader *shader, const struct vt_nir_rt_config *config);
 
+/*
+ * Hoist immutable parent-invocation RT system values into SSA before a
+ * resident trace call can replace the active PDS image.  complete is false
+ * when the shader contains a parent-state access which is not covered by the
+ * SSA contract; callers must then retain the conservative PDS snapshot.
+ */
+bool vt_nir_opt_rt_parent_state_ssa(nir_shader *shader, bool *complete);
+
 /* Lower resident trace calls in place.  Mesa's shader-call liveness pass
  * provides selective SSA spill/reload while preserving the original CFG. */
 bool vt_nir_lower_rt_resident_continuations(
    nir_shader *shader, uint32_t max_ray_recursion_depth,
    uint32_t payload_size_bytes, uint32_t callable_data_size_bytes,
+   bool parent_state_ssa_complete,
    struct vt_nir_rt_resident_continuation_info *info, void *mem_ctx);
 
 /* Bind compiler-private scratch and parent-PDS frames to the per-thread V5

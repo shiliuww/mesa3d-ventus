@@ -2791,6 +2791,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    std::vector<vtvk_rt_resident_trace_shader> resident_trace_shaders;
    std::vector<struct vt_nir_rt_resident_continuation_info>
       resident_continuations;
+   bool resident_parent_state_ssa_complete = true;
 
    vtvk_rt_infer_missing_payload_locations(pipeline->shaders,
                                            pipeline->shader_count);
@@ -3026,6 +3027,24 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       }
 
       for (const auto &resident_shader : resident_trace_shaders) {
+         bool shader_complete = false;
+         if (!vt_nir_opt_rt_parent_state_ssa(
+                resident_shader.shader, &shader_complete)) {
+            mesa_loge("ventus-vk: V5 parent-state SSA preparation failed "
+                      "for %s",
+                      _mesa_shader_stage_to_string(
+                         resident_shader.shader->info.stage));
+            vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+            return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+         resident_parent_state_ssa_complete &= shader_complete;
+      }
+      if (!resident_parent_state_ssa_complete) {
+         mesa_logi("ventus-vk: V5 resident continuation retains the "
+                   "conservative parent-PDS snapshot");
+      }
+
+      for (const auto &resident_shader : resident_trace_shaders) {
          resident_config.callback_data = resident_shader.callbacks;
          if (!vt_nir_prepare_rt_resident_continuations(
                 resident_shader.shader, &resident_config)) {
@@ -3095,7 +3114,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          if (!vt_nir_lower_rt_resident_continuations(
                 shader,
                 pipeline->max_ray_recursion_depth, ray_payload_size,
-                callable_data_size, &resident, pipeline->nir_mem_ctx)) {
+                callable_data_size, resident_parent_state_ssa_complete,
+                &resident, pipeline->nir_mem_ctx)) {
             mesa_loge("ventus-vk: V5 resident trace continuation lowering "
                       "failed for %s",
                       _mesa_shader_stage_to_string(shader->info.stage));

@@ -326,21 +326,25 @@ finalize_v5_candidate_callback(nir_builder *b,
 }
 
 static void
-resident_save_parent_pds(nir_builder *b,
-                         const struct vt_nir_rt_config *config,
-                         nir_def *pds, nir_def *frame)
+resident_save_parent_state(
+   nir_builder *b, const struct vt_nir_rt_continuation_site *site,
+   nir_def *pds, nir_def *frame)
 {
    const uint32_t header = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
-   resident_copy_words(b, pds, 0, frame, header,
-                       VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
-   resident_copy_words(b, pds, VENTUS_RT_V5_PDS_COMMITTED_BASE, frame,
-                       header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
-                       VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+   if (site->parent_pds_save_bytes) {
+      assert(site->parent_pds_save_bytes ==
+             VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+      resident_copy_words(b, pds, 0, frame, header,
+                          VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
+      resident_copy_words(b, pds, VENTUS_RT_V5_PDS_COMMITTED_BASE, frame,
+                          header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
+                          VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+   }
    resident_copy_words(
       b, pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE, frame,
-      header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-         VENTUS_RT_V5_TRACE_COMMITTED_BYTES,
-      config->v5_payload_size_bytes);
+      header + site->parent_pds_save_bytes,
+      site->parent_payload_save_bytes);
 }
 
 static bool
@@ -956,6 +960,19 @@ materialize_resident_intrinsic(nir_builder *b,
          state->failed = true;
          return false;
       }
+      const uint32_t call_site = state->token_to_call[token];
+      if (call_site >= state->info->site_count) {
+         state->failed = true;
+         return false;
+      }
+      const struct vt_nir_rt_continuation_site *site =
+         &state->info->sites[call_site];
+      if (site->kind != VT_NIR_RT_TRACE_CONTINUATION ||
+          site->parent_payload_save_bytes !=
+             state->config->v5_payload_size_bytes) {
+         state->failed = true;
+         return false;
+      }
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def *pds = nir_u2u64(
          b, nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0)));
@@ -965,8 +982,8 @@ materialize_resident_intrinsic(nir_builder *b,
       struct vt_nir_rt_stack_cursor cursor;
       vt_nir_rt_v5_load_stack_cursor(b, &cursor);
       nir_push_if(b, has_parent);
-      resident_save_parent_pds(
-         b, state->config, pds, cursor.next_frame);
+      resident_save_parent_state(
+         b, site, pds, cursor.next_frame);
       nir_pop_if(b, NULL);
       vt_nir_rt_v5_publish_stack_push(
          b, &cursor,
@@ -1028,6 +1045,14 @@ materialize_resident_intrinsic(nir_builder *b,
       state->failed = true;
       return false;
    }
+   const struct vt_nir_rt_continuation_site *site =
+      &state->info->sites[call_site];
+   if (site->kind != VT_NIR_RT_TRACE_CONTINUATION ||
+       site->parent_payload_save_bytes !=
+          state->config->v5_payload_size_bytes) {
+      state->failed = true;
+      return false;
+   }
 
    b->cursor = nir_before_instr(&intrin->instr);
    nir_def *pds = nir_ventus_rt_hot_pds_address(b, nir_imm_int(b, 0));
@@ -1043,18 +1068,22 @@ materialize_resident_intrinsic(nir_builder *b,
    nir_push_if(b, nir_ieq_imm(
                      b, frame_state, VT_NIR_RT_FRAME_TRACE_NESTED));
    const uint32_t header = VENTUS_RT_V5_CONTINUATION_HEADER_BYTES;
-   resident_copy_words(b, frame, header, pds, 0,
-                       VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
-   resident_copy_words(b, frame,
-                       header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
-                       pds, VENTUS_RT_V5_PDS_COMMITTED_BASE,
-                       VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+   if (site->parent_pds_save_bytes) {
+      assert(site->parent_pds_save_bytes ==
+             VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
+                VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+      resident_copy_words(b, frame, header, pds, 0,
+                          VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES);
+      resident_copy_words(b, frame,
+                          header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES,
+                          pds, VENTUS_RT_V5_PDS_COMMITTED_BASE,
+                          VENTUS_RT_V5_TRACE_COMMITTED_BYTES);
+   }
    resident_copy_words(
       b, frame,
-      header + VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES +
-         VENTUS_RT_V5_TRACE_COMMITTED_BYTES,
+      header + site->parent_pds_save_bytes,
       pds, VENTUS_RT_V5_PDS_CALL_DATA_BASE,
-      state->config->v5_payload_size_bytes);
+      site->parent_payload_save_bytes);
    for (uint32_t word = 0; word < payload_words; word++) {
       resident_global_store_u32(
          b, pds,
