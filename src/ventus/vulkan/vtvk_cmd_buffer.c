@@ -1,5 +1,6 @@
 #include "vtvk_private.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "vk_command_buffer.h"
@@ -17,6 +18,41 @@ static uint64_t
 vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
+}
+
+static void
+vtvk_cmd_buffer_discard_commands(struct vtvk_cmd_buffer *cmd)
+{
+   for (uint32_t i = 0; i < cmd->recorded_command_count; i++) {
+      struct vtvk_recorded_command *record = &cmd->recorded_commands[i];
+      if (record->type == VTVK_RECORDED_COMMAND_BUILD_AS) {
+         free(record->u.build_as.infos);
+         free(record->u.build_as.geometries);
+         free(record->u.build_as.ranges);
+      }
+   }
+   free(cmd->recorded_commands);
+   cmd->recorded_commands = NULL;
+   cmd->recorded_command_count = 0;
+   cmd->recorded_command_capacity = 0;
+}
+
+static VkResult
+vtvk_cmd_buffer_append_command(struct vtvk_cmd_buffer *cmd,
+                               const struct vtvk_recorded_command *record)
+{
+   if (cmd->recorded_command_count == cmd->recorded_command_capacity) {
+      uint32_t capacity = cmd->recorded_command_capacity ?
+         cmd->recorded_command_capacity * 2 : 8;
+      struct vtvk_recorded_command *commands = realloc(
+         cmd->recorded_commands, sizeof(*commands) * capacity);
+      if (!commands)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      cmd->recorded_commands = commands;
+      cmd->recorded_command_capacity = capacity;
+   }
+   cmd->recorded_commands[cmd->recorded_command_count++] = *record;
+   return VK_SUCCESS;
 }
 static VkPipelineBindPoint
 vtvk_bind_point_from_shader_stages(VkShaderStageFlags stage_flags)
@@ -60,6 +96,131 @@ vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
       *size_out = cmd ? cmd->push_constants_size : 0;
    return cmd ? cmd->push_constants : NULL;
 }
+
+VkResult
+vtvk_cmd_buffer_record_as_build(
+   VkCommandBuffer commandBuffer,
+   uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (!cmd || !infoCount || !pInfos || !ppBuildRangeInfos)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   struct vtvk_recorded_command record = {
+      .type = VTVK_RECORDED_COMMAND_BUILD_AS,
+   };
+   struct vtvk_recorded_as_build *build = &record.u.build_as;
+   build->info_count = infoCount;
+   build->infos = calloc(infoCount, sizeof(*build->infos));
+   build->geometries = calloc(infoCount, sizeof(*build->geometries));
+   build->ranges = calloc(infoCount, sizeof(*build->ranges));
+   if (!build->infos || !build->geometries || !build->ranges)
+      goto oom;
+
+   for (uint32_t i = 0; i < infoCount; i++) {
+      if (pInfos[i].geometryCount != 1 || !ppBuildRangeInfos[i])
+         goto unsupported;
+      const VkAccelerationStructureGeometryKHR *geometry =
+         pInfos[i].pGeometries ? &pInfos[i].pGeometries[0] :
+         (pInfos[i].ppGeometries ? pInfos[i].ppGeometries[0] : NULL);
+      if (!geometry)
+         goto unsupported;
+      build->infos[i] = pInfos[i];
+      build->geometries[i] = *geometry;
+      build->infos[i].pGeometries = &build->geometries[i];
+      build->infos[i].ppGeometries = NULL;
+      build->ranges[i] = *ppBuildRangeInfos[i];
+   }
+
+   VkResult result = vtvk_cmd_buffer_append_command(cmd, &record);
+   if (result == VK_SUCCESS)
+      return VK_SUCCESS;
+oom:
+   free(build->infos);
+   free(build->geometries);
+   free(build->ranges);
+   return VK_ERROR_OUT_OF_HOST_MEMORY;
+unsupported:
+   free(build->infos);
+   free(build->geometries);
+   free(build->ranges);
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+VkResult
+vtvk_cmd_buffer_record_trace_rays(
+   VkCommandBuffer commandBuffer,
+   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+   uint32_t width, uint32_t height, uint32_t depth)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (!cmd)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   struct vtvk_recorded_command record = {
+      .type = VTVK_RECORDED_COMMAND_TRACE_RAYS,
+      .u.trace_rays = {
+         .pipeline = cmd->bound_rt_pipeline,
+         .descriptor_set = cmd->bound_descriptor_sets[0],
+         .push_constants_size = cmd->push_constants_size,
+         .width = width,
+         .height = height,
+         .depth = depth,
+      },
+   };
+   struct vtvk_recorded_trace_rays *trace = &record.u.trace_rays;
+   memcpy(trace->push_constants, cmd->push_constants,
+          sizeof(trace->push_constants));
+   if (pRaygenShaderBindingTable) {
+      trace->raygen_sbt = *pRaygenShaderBindingTable;
+      trace->has_raygen_sbt = true;
+   }
+   if (pMissShaderBindingTable) {
+      trace->miss_sbt = *pMissShaderBindingTable;
+      trace->has_miss_sbt = true;
+   }
+   if (pHitShaderBindingTable) {
+      trace->hit_sbt = *pHitShaderBindingTable;
+      trace->has_hit_sbt = true;
+   }
+   if (pCallableShaderBindingTable) {
+      trace->callable_sbt = *pCallableShaderBindingTable;
+      trace->has_callable_sbt = true;
+   }
+   return vtvk_cmd_buffer_append_command(cmd, &record);
+}
+
+VkResult
+vtvk_cmd_buffer_execute(VkCommandBuffer commandBuffer)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   if (!cmd)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   struct vtvk_device *device =
+      container_of(cmd->vk.base.device, struct vtvk_device, vk);
+
+   for (uint32_t i = 0; i < cmd->recorded_command_count; i++) {
+      struct vtvk_recorded_command *record = &cmd->recorded_commands[i];
+      if (record->type == VTVK_RECORDED_COMMAND_BUILD_AS) {
+         struct vtvk_recorded_as_build *build = &record->u.build_as;
+         const VkAccelerationStructureBuildRangeInfoKHR *ranges[build->info_count];
+         for (uint32_t j = 0; j < build->info_count; j++)
+            ranges[j] = &build->ranges[j];
+         VkResult result = vtvk_execute_build_acceleration_structures(
+            device, build->info_count, build->infos, ranges);
+         if (result != VK_SUCCESS)
+            return result;
+      } else if (record->type == VTVK_RECORDED_COMMAND_TRACE_RAYS) {
+         vtvk_execute_trace_rays(&record->u.trace_rays);
+      }
+   }
+   return VK_SUCCESS;
+}
 static VkResult
 vtvk_cmd_buffer_create(struct vk_command_pool *pool,
                        VkCommandBufferLevel level,
@@ -90,6 +251,7 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
    vk_command_buffer_reset(cmd_buffer);
    struct vtvk_cmd_buffer *cmd =
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
+   vtvk_cmd_buffer_discard_commands(cmd);
    cmd->bound_rt_pipeline = VK_NULL_HANDLE;
    memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
    memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
@@ -103,6 +265,7 @@ vtvk_cmd_buffer_destroy(struct vk_command_buffer *cmd_buffer)
       container_of(cmd_buffer, struct vtvk_cmd_buffer, vk);
    struct vk_command_pool *pool = cmd_buffer->pool;
 
+   vtvk_cmd_buffer_discard_commands(cmd);
    vk_command_buffer_finish(cmd_buffer);
    vk_free(&pool->alloc, cmd);
 }
@@ -117,6 +280,8 @@ vtvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                         const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(vk_command_buffer, cmd_buffer, commandBuffer);
+   vtvk_cmd_buffer_discard_commands(
+      container_of(cmd_buffer, struct vtvk_cmd_buffer, vk));
    vk_command_buffer_begin(cmd_buffer, pBeginInfo);
    return VK_SUCCESS;
 }

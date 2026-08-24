@@ -53,6 +53,44 @@ struct vtvk_sampler {
    VkSamplerAddressMode address_mode_v;
 };
 
+enum vtvk_recorded_command_type {
+   VTVK_RECORDED_COMMAND_BUILD_AS,
+   VTVK_RECORDED_COMMAND_TRACE_RAYS,
+};
+
+struct vtvk_recorded_as_build {
+   uint32_t info_count;
+   VkAccelerationStructureBuildGeometryInfoKHR *infos;
+   VkAccelerationStructureGeometryKHR *geometries;
+   VkAccelerationStructureBuildRangeInfoKHR *ranges;
+};
+
+struct vtvk_recorded_trace_rays {
+   VkPipeline pipeline;
+   VkDescriptorSet descriptor_set;
+   uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
+   uint32_t push_constants_size;
+   VkStridedDeviceAddressRegionKHR raygen_sbt;
+   VkStridedDeviceAddressRegionKHR miss_sbt;
+   VkStridedDeviceAddressRegionKHR hit_sbt;
+   VkStridedDeviceAddressRegionKHR callable_sbt;
+   bool has_raygen_sbt;
+   bool has_miss_sbt;
+   bool has_hit_sbt;
+   bool has_callable_sbt;
+   uint32_t width;
+   uint32_t height;
+   uint32_t depth;
+};
+
+struct vtvk_recorded_command {
+   enum vtvk_recorded_command_type type;
+   union {
+      struct vtvk_recorded_as_build build_as;
+      struct vtvk_recorded_trace_rays trace_rays;
+   } u;
+};
+
 struct vtvk_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -60,6 +98,10 @@ struct vtvk_cmd_buffer {
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
    uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
    uint32_t push_constants_size;
+
+   struct vtvk_recorded_command *recorded_commands;
+   uint32_t recorded_command_count;
+   uint32_t recorded_command_capacity;
 };
 
 struct vtvk_acceleration_structure {
@@ -107,6 +149,25 @@ VkDescriptorSet vtvk_cmd_buffer_bound_descriptor_set(VkCommandBuffer commandBuff
                                                      uint32_t set);
 const void *vtvk_cmd_buffer_push_constants(VkCommandBuffer commandBuffer,
                                            uint32_t *size_out);
+VkResult vtvk_cmd_buffer_record_as_build(
+   VkCommandBuffer commandBuffer,
+   uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos);
+VkResult vtvk_cmd_buffer_record_trace_rays(
+   VkCommandBuffer commandBuffer,
+   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+   uint32_t width, uint32_t height, uint32_t depth);
+VkResult vtvk_cmd_buffer_execute(VkCommandBuffer commandBuffer);
+VkResult vtvk_execute_build_acceleration_structures(
+   struct vtvk_device *device,
+   uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos);
+void vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record);
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding);

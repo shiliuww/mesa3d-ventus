@@ -9,9 +9,9 @@
 #include <stdint.h>
 
 #define VENTUS_AS_MAGIC 0x53415456u /* "VTAS" little-endian */
-#define VENTUS_AS_VERSION 1u
+#define VENTUS_AS_VERSION 2u
 
-#define VENTUS_AS_HEADER_SIZE 80u
+#define VENTUS_AS_HEADER_SIZE 128u
 #define VENTUS_AS_BOX4_NODE_SIZE 128u
 #define VENTUS_AS_TRIANGLE_NODE_SIZE 64u
 #define VENTUS_AS_AABB_NODE_SIZE 64u

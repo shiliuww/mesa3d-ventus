@@ -100,8 +100,13 @@ vtvk_QueueSubmit(VkQueue queue,
                  VkFence fence)
 {
    (void)queue;
-   (void)submitCount;
-   (void)pSubmits;
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].commandBufferCount; j++) {
+         VkResult result = vtvk_cmd_buffer_execute(pSubmits[i].pCommandBuffers[j]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    vtvk_signal_fence(fence);
    return VK_SUCCESS;
 }
@@ -113,8 +118,14 @@ vtvk_QueueSubmit2(VkQueue queue,
                   VkFence fence)
 {
    (void)queue;
-   (void)submitCount;
-   (void)pSubmits;
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
+         VkResult result = vtvk_cmd_buffer_execute(
+            pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    vtvk_signal_fence(fence);
    return VK_SUCCESS;
 }
@@ -158,4 +169,3 @@ vtvk_DestroySemaphore(VkDevice _device,
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    vk_free(alloc, vtvk_handle_to_ptr((uint64_t)semaphore));
 }
-

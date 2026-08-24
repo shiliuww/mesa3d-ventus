@@ -194,8 +194,8 @@ vtvk_write_box4(uint8_t *dst, uint32_t offset,
 static uint32_t
 vtvk_next_node_offset(uint32_t *cursor, uint32_t size)
 {
-   uint32_t offset = *cursor;
-   *cursor += size;
+   uint32_t offset = (*cursor + size - 1) & ~(size - 1);
+   *cursor = offset + size;
    return offset;
 }
 
@@ -211,6 +211,53 @@ vtvk_internal_box_count(uint64_t leaf_count)
    }
 
    return total;
+}
+
+static uint32_t
+vtvk_morton_expand_10(uint32_t value)
+{
+   value = (value | (value << 16)) & 0x030000ff;
+   value = (value | (value << 8)) & 0x0300f00f;
+   value = (value | (value << 4)) & 0x030c30c3;
+   value = (value | (value << 2)) & 0x09249249;
+   return value;
+}
+
+static uint32_t
+vtvk_morton_key(const struct vtvk_build_node &node,
+                const struct vtvk_aabb &scene_bounds)
+{
+   uint32_t coord[3] = {};
+   for (uint32_t axis = 0; axis < 3; axis++) {
+      float extent = scene_bounds.max[axis] - scene_bounds.min[axis];
+      if (extent <= 0.0f)
+         continue;
+      float centroid = 0.5f * (node.bounds.min[axis] + node.bounds.max[axis]);
+      float normalized = (centroid - scene_bounds.min[axis]) / extent;
+      normalized = std::max(0.0f, std::min(normalized, 0.999999f));
+      coord[axis] = static_cast<uint32_t>(normalized * 1024.0f);
+   }
+   return vtvk_morton_expand_10(coord[0]) |
+          (vtvk_morton_expand_10(coord[1]) << 1) |
+          (vtvk_morton_expand_10(coord[2]) << 2);
+}
+
+static void
+vtvk_sort_leaves_morton(std::vector<struct vtvk_build_node> *leaves)
+{
+   if (leaves->size() < 2)
+      return;
+
+   struct vtvk_aabb scene_bounds;
+   vtvk_aabb_empty(&scene_bounds);
+   for (const struct vtvk_build_node &leaf : *leaves)
+      vtvk_aabb_include_aabb(&scene_bounds, &leaf.bounds);
+
+   std::stable_sort(leaves->begin(), leaves->end(),
+                    [&scene_bounds](const struct vtvk_build_node &a,
+                                    const struct vtvk_build_node &b) {
+      return vtvk_morton_key(a, scene_bounds) < vtvk_morton_key(b, scene_bounds);
+   });
 }
 
 static struct vtvk_build_node
@@ -500,6 +547,7 @@ vtvk_build_blas(struct vtvk_device *device,
          });
       }
 
+      vtvk_sort_leaves_morton(&leaves);
       struct vtvk_build_node root =
          vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
       vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
@@ -521,10 +569,15 @@ vtvk_build_blas(struct vtvk_device *device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    VkDeviceAddress index_addr = triangles->indexData.deviceAddress;
+   uint32_t primitive_id_base = 0;
    if (range) {
       if (UINT64_MAX - index_addr < range->primitiveOffset)
          return vk_error(device, VK_ERROR_UNKNOWN);
+      if (range->primitiveOffset % (3 * sizeof(uint32_t)) != 0 ||
+          range->primitiveOffset / (3 * sizeof(uint32_t)) > UINT32_MAX)
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       index_addr += range->primitiveOffset;
+      primitive_id_base = range->primitiveOffset / (3 * sizeof(uint32_t));
    }
    uint32_t *index_base = (uint32_t *)vtvk_buffer_host_ptr_from_addr(
       index_addr, sizeof(uint32_t) * primitive_count * 3);
@@ -556,6 +609,8 @@ vtvk_build_blas(struct vtvk_device *device,
    std::vector<struct vtvk_build_node> leaves;
 
    for (uint32_t p = 0; p < primitive_count; p++) {
+      if (primitive_id_base > UINT32_MAX - p)
+         return vk_error(device, VK_ERROR_UNKNOWN);
       uint32_t i0 = index_base[p * 3 + 0] + first_vertex;
       uint32_t i1 = index_base[p * 3 + 1] + first_vertex;
       uint32_t i2 = index_base[p * 3 + 2] + first_vertex;
@@ -572,7 +627,8 @@ vtvk_build_blas(struct vtvk_device *device,
 
       uint32_t offset =
          vtvk_next_node_offset(&cursor, VENTUS_AS_TRIANGLE_NODE_SIZE);
-      vtvk_write_triangle_leaf(dst, offset, v0, v1, v2, p, 0, 0,
+      vtvk_write_triangle_leaf(dst, offset, v0, v1, v2,
+                               primitive_id_base + p, 0, 0,
                                geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
                                index_addr + (VkDeviceAddress)p * 3 *
                                   sizeof(uint32_t));
@@ -583,6 +639,7 @@ vtvk_build_blas(struct vtvk_device *device,
       });
    }
 
+   vtvk_sort_leaves_morton(&leaves);
    struct vtvk_build_node root =
       vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
    vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
@@ -669,6 +726,7 @@ vtvk_build_tlas(struct vtvk_device *device,
       });
    }
 
+   vtvk_sort_leaves_morton(&leaves);
    struct vtvk_build_node root =
       vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
    vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, root.ref, node_count,
@@ -733,6 +791,21 @@ vtvk_build_as(struct vtvk_device *device,
                 root_offset < as->snapshot_size ?
                    vtvk_load_u64(as->snapshot + root_offset,
                                  VENTUS_INSTANCE_BLAS_ADDR_LO) : 0);
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+vtvk_execute_build_acceleration_structures(
+   struct vtvk_device *device,
+   uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
+{
+   for (uint32_t i = 0; i < infoCount; i++) {
+      VkResult result = vtvk_build_as(device, &pInfos[i], ppBuildRangeInfos + i);
+      if (result != VK_SUCCESS)
+         return result;
    }
    return VK_SUCCESS;
 }
@@ -845,22 +918,11 @@ vtvk_CmdBuildAccelerationStructuresKHR(
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
 {
-   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
-   struct vtvk_device *device =
-      container_of(vk_cmd->base.device, struct vtvk_device, vk);
-
-   for (uint32_t i = 0; i < infoCount; i++) {
-      VkResult result =
-         vtvk_build_as(device, &pInfos[i], ppBuildRangeInfos + i);
-      if (result != VK_SUCCESS) {
-         mesa_loge("ventus-vk: AS build failed for Ventus BVH ABI v1 (%d)",
-                   result);
-         return;
-      }
-   }
-
-   mesa_logi("ventus-vk: AS build wrote Ventus BVH ABI v1 objects=%u",
-             infoCount);
+   VkResult result = vtvk_cmd_buffer_record_as_build(
+      commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+   if (result != VK_SUCCESS)
+      mesa_loge("ventus-vk: failed to record vkCmdBuildAccelerationStructuresKHR (%d)",
+                result);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -892,11 +954,6 @@ vtvk_BuildAccelerationStructuresKHR(
    (void)deferredOperation;
    VK_FROM_HANDLE(vtvk_device, vdevice, device);
 
-   for (uint32_t i = 0; i < infoCount; i++) {
-      VkResult result =
-         vtvk_build_as(vdevice, &pInfos[i], ppBuildRangeInfos + i);
-      if (result != VK_SUCCESS)
-         return result;
-   }
-   return VK_SUCCESS;
+   return vtvk_execute_build_acceleration_structures(
+      vdevice, infoCount, pInfos, ppBuildRangeInfos);
 }
