@@ -112,7 +112,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 5);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 6);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
    VT_RT_CHECK(layout.payload_base_bytes == 276);
    VT_RT_CHECK(layout.region_size_bytes == 276);

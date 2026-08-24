@@ -569,15 +569,10 @@ vtvk_build_blas(struct vtvk_device *device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    VkDeviceAddress index_addr = triangles->indexData.deviceAddress;
-   uint32_t primitive_id_base = 0;
    if (range) {
       if (UINT64_MAX - index_addr < range->primitiveOffset)
          return vk_error(device, VK_ERROR_UNKNOWN);
-      if (range->primitiveOffset % (3 * sizeof(uint32_t)) != 0 ||
-          range->primitiveOffset / (3 * sizeof(uint32_t)) > UINT32_MAX)
-         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       index_addr += range->primitiveOffset;
-      primitive_id_base = range->primitiveOffset / (3 * sizeof(uint32_t));
    }
    uint32_t *index_base = (uint32_t *)vtvk_buffer_host_ptr_from_addr(
       index_addr, sizeof(uint32_t) * primitive_count * 3);
@@ -609,8 +604,6 @@ vtvk_build_blas(struct vtvk_device *device,
    std::vector<struct vtvk_build_node> leaves;
 
    for (uint32_t p = 0; p < primitive_count; p++) {
-      if (primitive_id_base > UINT32_MAX - p)
-         return vk_error(device, VK_ERROR_UNKNOWN);
       uint32_t i0 = index_base[p * 3 + 0] + first_vertex;
       uint32_t i1 = index_base[p * 3 + 1] + first_vertex;
       uint32_t i2 = index_base[p * 3 + 2] + first_vertex;
@@ -628,7 +621,7 @@ vtvk_build_blas(struct vtvk_device *device,
       uint32_t offset =
          vtvk_next_node_offset(&cursor, VENTUS_AS_TRIANGLE_NODE_SIZE);
       vtvk_write_triangle_leaf(dst, offset, v0, v1, v2,
-                               primitive_id_base + p, 0, 0,
+                               p, 0, 0,
                                geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
                                index_addr + (VkDeviceAddress)p * 3 *
                                   sizeof(uint32_t));

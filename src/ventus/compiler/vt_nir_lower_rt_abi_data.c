@@ -679,6 +679,10 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_INSTANCE_ID, 32);
       break;
+   case nir_intrinsic_load_ray_instance_custom_index:
+      replacement = load_active_hit_record_word(
+         b, config, layout, VT_RT_HIT_RECORD_INSTANCE_CUSTOM_INDEX, 32);
+      break;
    case nir_intrinsic_load_ray_geometry_index:
       replacement = load_active_hit_record_word(b, config, layout,
                                                 VT_RT_HIT_RECORD_GEOMETRY_ID, 32);

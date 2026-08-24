@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 5
+#define VT_RT_ABI_VERSION 6
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -79,12 +79,11 @@ enum vt_rt_hit_record_word {
    VT_RT_HIT_RECORD_FRONT_FACE = 15,
    VT_RT_HIT_RECORD_OPAQUE = 16,
    VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST = 17,
-   /*
-    * Vulkan hit SBT split field. This lives in the 8-byte gap after the
-    * 72-byte hit record storage and does not move the following regions.
-    */
+   /* These two fields occupy the 8-byte inter-record gaps, preserving the
+    * fixed 276-byte PDS header. */
    VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET = 18,
-   VT_RT_HIT_RECORD_WORD_COUNT = 19,
+   VT_RT_HIT_RECORD_INSTANCE_CUSTOM_INDEX = 19,
+   VT_RT_HIT_RECORD_WORD_COUNT = 20,
 };
 
 enum vt_rt_hit_record_status {

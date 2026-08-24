@@ -384,7 +384,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 5);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 6);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
    VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
    VT_RT_CHECK(abi.control_base_bytes == 112);
@@ -399,6 +399,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.total_size_bytes == VT_RT_ABI_REGION_SIZE_BYTES);
    VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
                abi.candidate_hit_record_size_bytes);
+   VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_CUSTOM_INDEX * 4 ==
+               abi.candidate_hit_record_size_bytes + 4);
 
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
