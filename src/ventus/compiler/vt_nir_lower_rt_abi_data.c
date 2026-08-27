@@ -141,6 +141,57 @@ vt_nir_load_ray_state_word(nir_builder *b,
 }
 
 static nir_def *
+load_packed_u32_field(nir_builder *b, nir_def *word, uint32_t shift,
+                      uint32_t bits)
+{
+   assert(bits > 0 && bits <= 32);
+   if (shift)
+      word = nir_ushr_imm(b, word, shift);
+   return bits == 32 ? word : nir_iand_imm(b, word, (1u << bits) - 1);
+}
+
+static nir_def *
+update_packed_u32_field(nir_builder *b, nir_def *old_word, uint32_t shift,
+                        uint32_t bits, nir_def *value)
+{
+   assert(bits > 0 && bits <= 32);
+   const uint32_t value_mask = bits == 32 ? UINT32_MAX : (1u << bits) - 1;
+   const uint32_t field_mask = value_mask << shift;
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   value = nir_iand_imm(b, value, value_mask);
+   if (shift)
+      value = nir_ishl_imm(b, value, shift);
+   return nir_ior(b, nir_iand_imm(b, old_word, ~field_mask), value);
+}
+
+nir_def *
+vt_nir_load_trace_meta_field(nir_builder *b,
+                             const struct vt_nir_rt_config *config,
+                             enum vt_rt_shader_layout layout,
+                             enum vt_rt_slot_word meta_word,
+                             uint32_t shift, uint32_t bits)
+{
+   return load_packed_u32_field(
+      b, vt_nir_load_ray_state_word(b, config, layout, meta_word), shift, bits);
+}
+
+void
+vt_nir_store_trace_meta_field(nir_builder *b,
+                              const struct vt_nir_rt_config *config,
+                              enum vt_rt_shader_layout layout,
+                              enum vt_rt_slot_word meta_word,
+                              uint32_t shift, uint32_t bits, nir_def *value)
+{
+   nir_def *old_word = vt_nir_load_ray_state_word(b, config, layout, meta_word);
+   nir_ventus_rt_store_slot(
+      b, update_packed_u32_field(b, old_word, shift, bits, value),
+      vt_nir_scratchpad_addr(
+         b, config, layout,
+         config->scratchpad[layout].ray_state_base_bytes + meta_word * 4));
+}
+
+static nir_def *
 load_ray_state_vec3(nir_builder *b, const struct vt_nir_rt_config *config,
                     enum vt_rt_shader_layout layout, enum vt_rt_slot_word first_word)
 {
@@ -590,16 +641,6 @@ vt_nir_lower_rt_payload(nir_shader *shader,
    return progress;
 }
 
-static nir_def *
-load_hit_record_u64(nir_builder *b, const struct vt_nir_rt_config *config,
-                    enum vt_rt_shader_layout layout,
-                    enum vt_rt_hit_record_word lo_word)
-{
-   return nir_pack_64_2x32_split(b,
-      vt_nir_load_hit_record_word(b, config, layout, lo_word, 32),
-      vt_nir_load_hit_record_word(b, config, layout, lo_word + 1, 32));
-}
-
 static bool
 uses_candidate_hit_record(mesa_shader_stage stage)
 {
@@ -620,6 +661,21 @@ load_active_hit_record_word(nir_builder *b, const struct vt_nir_rt_config *confi
    return vt_nir_load_hit_record_word(b, config, layout, word, bit_size);
 }
 
+static nir_def *
+load_active_hit_record_meta_field(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout, enum vt_rt_hit_record_word meta_word,
+   uint32_t shift, uint32_t bits)
+{
+   if (uses_candidate_hit_record(b->shader->info.stage)) {
+      return vt_nir_load_candidate_hit_record_meta_field(
+         b, config, layout, meta_word, shift, bits);
+   }
+
+   return vt_nir_load_hit_record_meta_field(b, config, layout, meta_word,
+                                            shift, bits);
+}
+
 /* A procedural report is evaluated before any committed hit exists.  Reading
  * committed HIT_T unconditionally makes the first report compare against the
  * zero-filled record and reject every positive intersection. */
@@ -628,8 +684,9 @@ load_committed_tmax(nir_builder *b, const struct vt_nir_rt_config *config,
                    enum vt_rt_shader_layout layout)
 {
    nir_def *committed_valid = nir_ieq_imm(
-      b, vt_nir_load_hit_record_word(b, config, layout,
-                                     VT_RT_HIT_RECORD_STATUS, 32),
+      b, vt_nir_load_hit_record_meta_field(
+            b, config, layout, VT_RT_HIT_RECORD_META0,
+            VT_RT_HIT_RECORD_META0_VALID_SHIFT, 1),
       VT_RT_HIT_RECORD_STATUS_VALID);
    nir_def *committed_t = vt_nir_load_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
@@ -666,10 +723,14 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
       break;
    case nir_intrinsic_load_ray_flags:
-      replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_FLAGS);
+      replacement = vt_nir_load_trace_meta_field(
+         b, config, layout, VT_RT_SLOT_TRACE_META0,
+         VT_RT_TRACE_META0_FLAGS_SHIFT, VT_RT_TRACE_META0_FLAGS_BITS);
       break;
    case nir_intrinsic_load_cull_mask:
-      replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_CULL_MASK);
+      replacement = vt_nir_load_trace_meta_field(
+         b, config, layout, VT_RT_SLOT_TRACE_META0,
+         VT_RT_TRACE_META0_CULL_MASK_SHIFT, VT_RT_TRACE_META0_CULL_MASK_BITS);
       break;
    case nir_intrinsic_load_primitive_id:
       replacement = load_active_hit_record_word(b, config, layout,
@@ -680,8 +741,10 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                                 VT_RT_HIT_RECORD_INSTANCE_ID, 32);
       break;
    case nir_intrinsic_load_ray_instance_custom_index:
-      replacement = load_active_hit_record_word(
-         b, config, layout, VT_RT_HIT_RECORD_INSTANCE_CUSTOM_INDEX, 32);
+      replacement = load_active_hit_record_meta_field(
+         b, config, layout, VT_RT_HIT_RECORD_META0,
+         VT_RT_HIT_RECORD_META0_INSTANCE_CUSTOM_INDEX_SHIFT,
+         VT_RT_HIT_RECORD_META0_INSTANCE_CUSTOM_INDEX_BITS);
       break;
    case nir_intrinsic_load_ray_geometry_index:
       replacement = load_active_hit_record_word(b, config, layout,
@@ -693,13 +756,15 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
       break;
    case nir_intrinsic_load_front_face:
       replacement =
-         nir_i2b(b, load_active_hit_record_word(b, config, layout,
-                                                VT_RT_HIT_RECORD_FRONT_FACE, 32));
+         nir_i2b(b, load_active_hit_record_meta_field(
+            b, config, layout, VT_RT_HIT_RECORD_META0,
+            VT_RT_HIT_RECORD_META0_FRONT_FACE_SHIFT, 1));
       break;
    case nir_intrinsic_load_front_face_fsign:
       replacement =
-         nir_bcsel(b, nir_i2b(b, load_active_hit_record_word(b, config, layout,
-                                                            VT_RT_HIT_RECORD_FRONT_FACE, 32)),
+         nir_bcsel(b, nir_i2b(b, load_active_hit_record_meta_field(
+                      b, config, layout, VT_RT_HIT_RECORD_META0,
+                      VT_RT_HIT_RECORD_META0_FRONT_FACE_SHIFT, 1)),
                    nir_imm_float(b, 1.0f), nir_imm_float(b, -1.0f));
       break;
    default:
@@ -765,18 +830,22 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                 nir_bcsel(b, accepted,
                                           nir_imm_int(b, VT_RT_CALLBACK_ACCEPT),
                                           nir_imm_int(b, VT_RT_CALLBACK_IGNORE)));
-      vt_nir_store_candidate_hit_record_word(b, config, layout,
-                                             VT_RT_HIT_RECORD_STATUS,
-                                             nir_bcsel(b, accepted,
-                                                       nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
-                                                       nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID)));
+      vt_nir_store_candidate_hit_record_meta_field(
+         b, config, layout, VT_RT_HIT_RECORD_META0,
+         VT_RT_HIT_RECORD_META0_VALID_SHIFT, 1, accepted);
+      vt_nir_store_candidate_hit_record_meta_field(
+         b, config, layout, VT_RT_HIT_RECORD_META0,
+         VT_RT_HIT_RECORD_META0_STATUS_SHIFT,
+         VT_RT_HIT_RECORD_META0_STATUS_BITS,
+         nir_imm_int(b, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB));
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_HIT_T, hit_t);
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
-      vt_nir_store_candidate_hit_record_word(b, config, layout,
-                                             VT_RT_HIT_RECORD_FRONT_FACE,
-                                             nir_ieq_imm(b, hit_kind, 0xfe));
+      vt_nir_store_candidate_hit_record_meta_field(
+         b, config, layout, VT_RT_HIT_RECORD_META0,
+         VT_RT_HIT_RECORD_META0_FRONT_FACE_SHIFT, 1,
+         nir_ieq_imm(b, hit_kind, 0xfe));
 
       nir_def_rewrite_uses(&intrin->def, accepted);
       nir_instr_remove(&intrin->instr);
@@ -831,8 +900,10 @@ lower_shader_record_ptr_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          b, load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_RAYGEN_SBT_ADDR, 64),
          config->shader_group_handle_size);
    } else if (layout == VT_RT_LAYOUT_MISS) {
-      nir_def *miss_index = nir_u2u64(
-         b, vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_MISS_INDEX));
+      nir_def *miss_index = nir_u2u64(b, vt_nir_load_trace_meta_field(
+         b, config, layout, VT_RT_SLOT_TRACE_META1,
+         VT_RT_TRACE_META1_MISS_INDEX_SHIFT,
+         VT_RT_TRACE_META1_MISS_INDEX_BITS));
       nir_def *miss_stride =
          load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_MISS_SBT_STRIDE, 64);
       nir_def *miss_offset = nir_iadd_imm(
@@ -843,8 +914,26 @@ lower_shader_record_ptr_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                        64),
                      miss_offset);
    } else {
-      ptr = load_hit_record_u64(b, config, layout,
-                                VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO);
+      nir_def *instance_sbt_record_offset =
+         load_active_hit_record_meta_field(
+            b, config, layout, VT_RT_HIT_RECORD_META1,
+            VT_RT_HIT_RECORD_META1_INSTANCE_SBT_RECORD_OFFSET_SHIFT,
+            VT_RT_HIT_RECORD_META1_INSTANCE_SBT_RECORD_OFFSET_BITS);
+      nir_def *geometry_index = load_active_hit_record_word(
+         b, config, layout, VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
+      ptr = vt_nir_build_hit_shader_record_ptr(
+         b, config,
+         load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HIT_SBT_ADDR, 64),
+         load_dispatch_arg(b, VT_NIR_RT_DISPATCH_ARG_HIT_SBT_STRIDE, 64),
+         vt_nir_load_trace_meta_field(
+            b, config, layout, VT_RT_SLOT_TRACE_META0,
+            VT_RT_TRACE_META0_SBT_OFFSET_SHIFT,
+            VT_RT_TRACE_META0_SBT_OFFSET_BITS),
+         vt_nir_load_trace_meta_field(
+            b, config, layout, VT_RT_SLOT_TRACE_META0,
+            VT_RT_TRACE_META0_SBT_STRIDE_SHIFT,
+            VT_RT_TRACE_META0_SBT_STRIDE_BITS),
+         instance_sbt_record_offset, geometry_index);
    }
    nir_def_rewrite_uses(&intrin->def, ptr);
    nir_instr_remove(&intrin->instr);

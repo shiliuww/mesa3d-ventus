@@ -195,9 +195,15 @@ emit_nested_liveness_callback(nir_builder *b,
    }
    nir_def *launch_x = nir_channel(b, nir_load_ray_launch_id(b), 0);
    nir_push_if(b, nir_ine_imm(b, launch_x, 0));
-   nir_ventus_rt_load_slot(b, 1, 32, nir_imm_int(b, 196));
+   nir_ventus_rt_load_slot(
+      b, 1, 32, nir_imm_int(
+         b, VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES +
+               VT_RT_HIT_RECORD_META0 * sizeof(uint32_t)));
    nir_push_else(b, NULL);
-   nir_ventus_rt_load_slot(b, 1, 32, nir_imm_int(b, 200));
+   nir_ventus_rt_load_slot(
+      b, 1, 32, nir_imm_int(
+         b, VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES +
+               VT_RT_HIT_RECORD_META1 * sizeof(uint32_t)));
    nir_pop_if(b, NULL);
 }
 
@@ -341,23 +347,28 @@ main(int argc, char **argv)
    VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(nested_liveness_raygen,
                                               &nested_liveness_config));
    NIR_PASS(_, nested_liveness_raygen, nir_opt_constant_folding);
-   /* 196 and 200 are restored from distinct parent SSA defs.  Candidate word
-    * 116 is not live after the child and therefore has no save/restore store. */
-   const unsigned baseline_restore_196 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 196);
-   const unsigned baseline_restore_200 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 200);
-   const unsigned baseline_restore_116 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, 116);
-   const unsigned nested_restore_196 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 196);
-   const unsigned nested_restore_200 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 200);
-   const unsigned nested_restore_116 =
-      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, 116);
-   VT_RT_CHECK(nested_restore_196 == baseline_restore_196 + 1);
-   VT_RT_CHECK(nested_restore_200 == baseline_restore_200 + 1);
-   VT_RT_CHECK(nested_restore_116 == baseline_restore_116);
+   const uint32_t committed_meta0 = VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES;
+   const uint32_t committed_meta1 = committed_meta0 + sizeof(uint32_t);
+   const uint32_t candidate_meta0 = VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES;
+   /* The two committed metadata words are restored from distinct parent SSA
+    * defs. Candidate meta0 is not live after the child. */
+   const unsigned baseline_restore_committed_meta0 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, committed_meta0);
+   const unsigned baseline_restore_committed_meta1 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, committed_meta1);
+   const unsigned baseline_restore_candidate_meta0 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_baseline, candidate_meta0);
+   const unsigned nested_restore_committed_meta0 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, committed_meta0);
+   const unsigned nested_restore_committed_meta1 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, committed_meta1);
+   const unsigned nested_restore_candidate_meta0 =
+      count_slot_ssa_restores_to_const_addr(nested_liveness_raygen, candidate_meta0);
+   VT_RT_CHECK(nested_restore_committed_meta0 == baseline_restore_committed_meta0 + 1);
+   VT_RT_CHECK(nested_restore_committed_meta1 == baseline_restore_committed_meta1 + 1);
+   /* Packed meta0 is read-modify-written, so it is live across the nested
+    * trace just like the committed words above. */
+   VT_RT_CHECK(nested_restore_candidate_meta0 == baseline_restore_candidate_meta0 + 1);
    nir_validate_shader(nested_liveness_raygen,
                        "after nested PDS liveness lowering");
 
@@ -378,29 +389,30 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.payload_size_bytes == 0);
    VT_RT_CHECK(VT_RT_CONTROL_WORD_COUNT == 1);
    VT_RT_CHECK(abi.control_size_bytes == VT_RT_CONTROL_WORD_COUNT * 4);
-   VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 72);
-   VT_RT_CHECK(abi.hit_record_size_bytes == 72);
+   VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 36);
+   VT_RT_CHECK(abi.hit_record_size_bytes == 36);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 80);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 84);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 88);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 6);
-   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_BASE_BYTES == 96);
-   VT_RT_CHECK(VT_RT_ABI_CPS_HEADER_SIZE_BYTES == 16);
-   VT_RT_CHECK(abi.control_base_bytes == 112);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 60);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 64);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 68);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 9);
+   VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_SIZE_BYTES == 76);
+   VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT == 19);
+   VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT ==
+               VT_RT_HIT_RECORD_WORD_COUNT);
+   VT_RT_CHECK(abi.control_base_bytes == 72);
    VT_RT_CHECK(abi.control_size_bytes == 4);
-   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 116);
-   VT_RT_CHECK(abi.hit_record_base_bytes == 196);
-   VT_RT_CHECK(abi.hit_attrib_base_bytes == 276);
-   VT_RT_CHECK(abi.committed_hit_attrib_base_bytes == 276);
-   VT_RT_CHECK(abi.payload_base_bytes == 276);
-   VT_RT_CHECK(abi.region_size_bytes == 276);
-   VT_RT_CHECK(abi.total_size_bytes == 276);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 76);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 112);
+   VT_RT_CHECK(abi.hit_attrib_base_bytes == 148);
+   VT_RT_CHECK(abi.committed_hit_attrib_base_bytes == 148);
+   VT_RT_CHECK(abi.payload_base_bytes == 148);
+   VT_RT_CHECK(abi.region_size_bytes == 148);
+   VT_RT_CHECK(abi.total_size_bytes == 148);
    VT_RT_CHECK(abi.total_size_bytes == VT_RT_ABI_REGION_SIZE_BYTES);
-   VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_SBT_RECORD_OFFSET * 4 ==
+   VT_RT_CHECK(VT_RT_HIT_RECORD_WORD_COUNT * 4 ==
                abi.candidate_hit_record_size_bytes);
-   VT_RT_CHECK(VT_RT_HIT_RECORD_INSTANCE_CUSTOM_INDEX * 4 ==
-               abi.candidate_hit_record_size_bytes + 4);
+   VT_RT_CHECK(VT_RT_HIT_RECORD_META1 * 4 == 4);
 
    struct vt_rt_intrinsic_counts before;
    vt_rt_count_intrinsics(raygen, &before);
@@ -483,6 +495,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.trace_ray == 0);
    VT_RT_CHECK(vt_rt_count_loops(raygen) >= 1);
    VT_RT_CHECK(after.jump_break >= 1);
+   VT_RT_CHECK(after.ventus_rt_pds_warp_tid_base == 2);
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
    VT_RT_CHECK(after.ventus_rt_release == 1);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(raygen));

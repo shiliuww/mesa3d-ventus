@@ -47,6 +47,7 @@ struct vt_rt_intrinsic_counts {
    unsigned report_ray_intersection;
    unsigned ignore_ray_intersection;
    unsigned terminate_ray;
+   unsigned ventus_rt_pds_warp_tid_base;
    unsigned ventus_rt_traverse;
    unsigned ventus_rt_release;
    unsigned ventus_rt_enqueue;
@@ -223,6 +224,9 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_terminate_ray:
                counts->terminate_ray++;
+               break;
+            case nir_intrinsic_ventus_rt_pds_warp_tid_base:
+               counts->ventus_rt_pds_warp_tid_base++;
                break;
             case nir_intrinsic_ventus_rt_traverse:
                counts->ventus_rt_traverse++;

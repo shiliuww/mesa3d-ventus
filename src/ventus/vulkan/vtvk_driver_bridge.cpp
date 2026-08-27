@@ -1494,26 +1494,6 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
 
    if (!wavefront_global) {
       pds_image.assign(pds_size, 0);
-      if (continuation_dev_addr) {
-         const uint64_t header_offset = VT_RT_ABI_RAY_STATE_BASE_BYTES +
-            VT_RT_ABI_CPS_HEADER_BASE_BYTES +
-            VT_RT_CPS_FRAME_BASE * VT_RT_ABI_WORD_BYTES;
-         const uint64_t aligned = header_offset & ~3ull;
-         for (uint64_t context = 0; context < pds_resident_lanes; context++) {
-            const uint64_t byte_offset = aligned * pds_resident_lanes + context * 4;
-            if (byte_offset + 4 > pds_image.size()) {
-               mesa_loge("ventus-vk: CPS frame pointer exceeds PDS allocation");
-               goto out;
-            }
-            uint32_t frame_base = 0;
-            if (!vtvk_bridge_checked_u32("legacy CPS frame",
-                                        continuation_dev_addr +
-                                           context * info->continuation_frame_size,
-                                        &frame_base))
-               goto out;
-            memcpy(pds_image.data() + byte_offset, &frame_base, sizeof(frame_base));
-         }
-      }
       if (!vtvk_driver_alloc_copy(&driver, pds_image.data(), pds_image.size(),
                                   &pds_dev_addr)) {
          mesa_loge("ventus-vk: driver bridge failed to allocate PDS");
@@ -1744,8 +1724,6 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                uint32_t primitive_id = 0;
                float hit_t = -1.0f;
                uint64_t hit_attribute_address = 0;
-               uint64_t hit_shader_record_address = 0;
-               uint32_t hit_shader_record_group = UINT32_MAX;
                uint32_t completion_status = UINT32_MAX;
                float hit_attributes[2] = {};
                if (request.completed_stage == 1) {
@@ -1756,12 +1734,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                         VT_RT_HIT_RECORD_PRIMITIVE_ID,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_LO,
                      VT_RT_GLOBAL_COMPLETION_HIT_ATTRIBUTE_ADDR_HI,
-                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
-                        VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO,
-                     VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
-                        VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI,
                   };
-                  uint32_t hit_words[6] = {};
+                  uint32_t hit_words[4] = {};
                   for (uint32_t field = 0; field < ARRAY_SIZE(fields); ++field) {
                      const uint64_t address = global_completion_dev_addr +
                         VT_RT_GLOBAL_QUEUE_HEADER_SIZE_BYTES +
@@ -1785,17 +1759,6 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                   primitive_id = hit_words[1];
                   hit_attribute_address = (uint64_t)hit_words[2] |
                                           ((uint64_t)hit_words[3] << 32);
-                  hit_shader_record_address = (uint64_t)hit_words[4] |
-                                              ((uint64_t)hit_words[5] << 32);
-                  if (hit_shader_record_address &&
-                      driver.vt_copy_from_dev(driver.device,
-                                              hit_shader_record_address - 28,
-                                              &hit_shader_record_group,
-                                              sizeof(hit_shader_record_group),
-                                              0, 0) != 0) {
-                     mesa_loge("ventus-vk: global RT SBT group probe read failed "
-                               "ray_ref=%u", request.ray_ref);
-                  }
                   if (hit_attribute_address &&
                       driver.vt_copy_from_dev(driver.device,
                                               hit_attribute_address,
@@ -1823,12 +1786,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                if (request.completed_stage == 1)
                   mesa_logi("ventus-vk: global RT committed hit ray_ref=%u "
                           "primitive=%u t=%.6f attr_addr=%" PRIx64
-                            " attr=(%.6f,%.6f) shader_record=%" PRIx64
-                            " group=%u completion_status=%u", request.ray_ref,
+                            " attr=(%.6f,%.6f) completion_status=%u", request.ray_ref,
                             primitive_id, hit_t, hit_attribute_address,
-                            hit_attributes[0], hit_attributes[1],
-                            hit_shader_record_address, hit_shader_record_group,
-                            completion_status);
+                            hit_attributes[0], hit_attributes[1], completion_status);
             }
          };
 

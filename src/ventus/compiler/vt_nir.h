@@ -129,7 +129,6 @@ struct vt_nir_rt_result {
    nir_def *status;
    nir_def *hit;
    nir_def *hit_t;
-   nir_def *sbt_index;
    nir_def *instance_sbt_record_offset;
    nir_def *geometry_index;
    nir_def *hit_shader_record_ptr;
@@ -294,6 +293,18 @@ nir_def *vt_nir_load_ray_state_word(nir_builder *b,
                                     enum vt_rt_shader_layout layout,
                                     enum vt_rt_slot_word word);
 
+nir_def *vt_nir_load_trace_meta_field(nir_builder *b,
+                                      const struct vt_nir_rt_config *config,
+                                      enum vt_rt_shader_layout layout,
+                                      enum vt_rt_slot_word meta_word,
+                                      uint32_t shift, uint32_t bits);
+void vt_nir_store_trace_meta_field(nir_builder *b,
+                                   const struct vt_nir_rt_config *config,
+                                   enum vt_rt_shader_layout layout,
+                                   enum vt_rt_slot_word meta_word,
+                                   uint32_t shift, uint32_t bits,
+                                   nir_def *value);
+
 void vt_nir_store_payload_word(nir_builder *b,
                                const struct vt_nir_rt_config *config,
                                enum vt_rt_shader_layout layout,
@@ -323,6 +334,34 @@ void vt_nir_store_candidate_hit_record_word(nir_builder *b,
                                             enum vt_rt_shader_layout layout,
                                             enum vt_rt_hit_record_word word,
                                             nir_def *value);
+
+nir_def *vt_nir_load_hit_record_meta_field(nir_builder *b,
+                                            const struct vt_nir_rt_config *config,
+                                            enum vt_rt_shader_layout layout,
+                                            enum vt_rt_hit_record_word meta_word,
+                                            uint32_t shift, uint32_t bits);
+
+void vt_nir_store_hit_record_meta_field(nir_builder *b,
+                                        const struct vt_nir_rt_config *config,
+                                        enum vt_rt_shader_layout layout,
+                                        enum vt_rt_hit_record_word meta_word,
+                                        uint32_t shift, uint32_t bits,
+                                        nir_def *value);
+
+nir_def *vt_nir_load_candidate_hit_record_meta_field(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout, enum vt_rt_hit_record_word meta_word,
+   uint32_t shift, uint32_t bits);
+
+void vt_nir_store_candidate_hit_record_meta_field(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout, enum vt_rt_hit_record_word meta_word,
+   uint32_t shift, uint32_t bits, nir_def *value);
+
+nir_def *vt_nir_build_hit_shader_record_ptr(
+   nir_builder *b, const struct vt_nir_rt_config *config, nir_def *record_base,
+   nir_def *record_stride_bytes, nir_def *trace_offset, nir_def *trace_stride,
+   nir_def *instance_sbt_record_offset, nir_def *geometry_index);
 
 nir_def *vt_nir_load_control_word(nir_builder *b,
                                   const struct vt_nir_rt_config *config,

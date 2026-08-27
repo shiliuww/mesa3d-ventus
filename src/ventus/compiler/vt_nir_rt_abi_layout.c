@@ -86,7 +86,8 @@ bool
 vt_nir_rt_abi_layout_set_recursion_depth(
    struct vt_nir_rt_abi_layout *layout, uint32_t max_ray_recursion_depth)
 {
-   if (!layout || max_ray_recursion_depth > UINT32_MAX)
+   if (!layout ||
+       max_ray_recursion_depth > VT_RT_TRACE_META1_MAX_RECURSION_DEPTH)
       return false;
 
    /* Depth zero is the first P-byte payload frame already included in

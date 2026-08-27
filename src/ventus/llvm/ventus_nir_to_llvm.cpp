@@ -374,6 +374,19 @@ private:
       return privatePtr(builder.CreateAdd(rtScratchBase(), asInt32(offset)));
    }
 
+   Value *rtHitRecordPtr(Value *logicalOffset)
+   {
+      /* The high-bit tag selects the RT hit-record PDS mode in the LSU.
+       * Do not route this through rtScratchPtr: ordinary slots retain the
+       * addrspace(5) field-major mapping, whereas the tagged logical offset
+       * is translated at the PDS boundary to
+       * prefix_words * T + tid * record_words + record_word. */
+      Value *tagged = builder.CreateOr(
+         asInt32(logicalOffset),
+         ConstantInt::get(i32, VT_RT_ABI_HIT_RECORD_ADDR_TAG));
+      return privatePtr(tagged);
+   }
+
    Value *rtSlotOffset(enum vt_rt_slot_word word)
    {
       return ConstantInt::get(i32,
@@ -1997,6 +2010,21 @@ private:
                              rtScratchPtr(value(intrin->src[1])));
          return nullptr;
       }
+      case nir_intrinsic_ventus_rt_hit_record_load: {
+         LoadInst *load = builder.CreateLoad(defType(&intrin->def),
+                                             rtHitRecordPtr(value(intrin->src[0])));
+         load->setAlignment(Align(4));
+         return load;
+      }
+      case nir_intrinsic_ventus_rt_hit_record_store: {
+         StoreInst *store = builder.CreateStore(
+            asInt32(value(intrin->src[0])),
+            rtHitRecordPtr(value(intrin->src[1])));
+         store->setAlignment(Align(4));
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_pds_warp_tid_base:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.pds.warp.tid.base");
       case nir_intrinsic_ventus_rt_traverse: {
          if (noopRtIntrinsics)
             return ConstantInt::get(i32, 0);

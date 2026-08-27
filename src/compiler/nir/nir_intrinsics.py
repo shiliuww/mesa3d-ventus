@@ -774,6 +774,10 @@ intrinsic("ventus_rt_dispatch_arg", src_comp=[1], dest_comp=1,
 # Globally unique resident worker/warp identity.  It is not a Vulkan launch
 # ID and is used only to select bounded RT submission staging storage.
 intrinsic("ventus_rt_worker_id", dest_comp=1, bit_sizes=[32])
+# Smallest PDS thread ID owned by the issuing hardware warp.  This is a warp
+# value, not the Vulkan local-invocation index: RTcore derives each header's
+# PDS index as pds_warp_tid_base + lane.
+intrinsic("ventus_rt_pds_warp_tid_base", dest_comp=1, bit_sizes=[32])
 # Compact global callback/resume dispatch index.  Unlike a Vulkan launch ID it
 # names an entry in the RTcore-owned ray_ref list for this kernel dispatch.
 intrinsic("ventus_rt_dispatch_index", dest_comp=1, bit_sizes=[32])
@@ -791,6 +795,12 @@ intrinsic("ventus_rt_enqueue", src_comp=[1])
 intrinsic("ventus_rt_load_slot", src_comp=[1], dest_comp=0,
           bit_sizes=[8, 16, 32, 64])
 intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
+# Hit records deliberately do not share the ordinary private/PDS slot
+# addressing rule.  The target maps these accesses to the lane-major record
+# region, while ventus_rt_{load,store}_slot remain field-major.
+intrinsic("ventus_rt_hit_record_load", src_comp=[1], dest_comp=0,
+          bit_sizes=[32])
+intrinsic("ventus_rt_hit_record_store", src_comp=[1, 1])
 # Atomic counters
 #
 # The *_deref variants take an atomic_uint nir_variable, while the other,

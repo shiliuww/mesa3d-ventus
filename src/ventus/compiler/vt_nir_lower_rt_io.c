@@ -459,9 +459,11 @@ emit_trace_callbacks(nir_builder *b,
          nir_ieq_imm(b, load_raygen_callback_decision(b, config),
                      VT_RT_CALLBACK_ACCEPT);
       nir_def *need_software_opacity =
-         nir_ine_imm(b, vt_nir_load_candidate_hit_record_word(
-                           b, config, VT_RT_LAYOUT_RAYGEN,
-                           VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 32), 0);
+         nir_ine_imm(
+            b, vt_nir_load_candidate_hit_record_meta_field(
+                  b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_META0,
+                  VT_RT_HIT_RECORD_META0_NEED_SOFTWARE_OPACITY_TEST_SHIFT, 1),
+            0);
       nir_push_if(b, nir_iand(b, reported, need_software_opacity));
       /* Normal any-hit return accepts; ignore/terminate intrinsics override it. */
       accept_candidate_hit(b, config);
@@ -678,13 +680,15 @@ lower_global_root_continuation(nir_builder *b, nir_intrinsic_instr *intrin,
       b, config, VT_RT_LAYOUT_RAYGEN, raygen->ray_state_base_bytes);
    nir_def *status = nir_ventus_rt_load_slot(
       b, 1, 32, nir_iadd_imm(b, ray_state, VT_RT_SLOT_STATUS * 4));
-   nir_def *record_ptr = nir_pack_64_2x32_split(
-      b, vt_nir_load_hit_record_word(
-            b, config, VT_RT_LAYOUT_RAYGEN,
-            VT_RT_HIT_RECORD_SHADER_RECORD_PTR_LO, 32),
+   nir_def *record_ptr = vt_nir_build_hit_shader_record_ptr(
+      b, config, params.sbt_base, params.sbt_stride_bytes,
+      params.sbt_offset, params.sbt_stride,
+      vt_nir_load_hit_record_meta_field(
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_META1,
+         VT_RT_HIT_RECORD_META1_INSTANCE_SBT_RECORD_OFFSET_SHIFT,
+         VT_RT_HIT_RECORD_META1_INSTANCE_SBT_RECORD_OFFSET_BITS),
       vt_nir_load_hit_record_word(
-            b, config, VT_RT_LAYOUT_RAYGEN,
-            VT_RT_HIT_RECORD_SHADER_RECORD_PTR_HI, 32));
+         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_GEOMETRY_ID, 32));
    nir_def *miss_record_ptr = nir_iadd(
       b, params.miss_sbt_base,
       nir_iadd_imm(b,
@@ -693,8 +697,6 @@ lower_global_root_continuation(nir_builder *b, nir_intrinsic_instr *intrin,
          config->shader_group_handle_size));
    struct vt_nir_rt_result result = {
       .status = status,
-      .sbt_index = vt_nir_load_hit_record_word(
-         b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_HIT_RECORD_SBT_INDEX, 32),
       .hit_shader_record_ptr = record_ptr,
       .miss_shader_record_ptr = miss_record_ptr,
    };
@@ -754,9 +756,6 @@ insert_raygen_release_before_returns(nir_shader *shader,
    if (!impl)
       return false;
 
-   const struct vt_nir_scratchpad_layout *raygen =
-      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
-
    nir_builder b = nir_builder_create(impl);
    bool progress = false;
 
@@ -772,10 +771,10 @@ insert_raygen_release_before_returns(nir_shader *shader,
          b.cursor = nir_before_instr(instr);
          nir_def *slot_base =
             vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
-                                   raygen->ray_state_base_bytes);
+                                   config->scratchpad[VT_RT_LAYOUT_RAYGEN].ray_state_base_bytes);
          nir_ventus_rt_store_slot(
             &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
-         nir_ventus_rt_release(&b, slot_base);
+         nir_ventus_rt_release(&b, nir_ventus_rt_pds_warp_tid_base(&b));
          progress = true;
       }
    }

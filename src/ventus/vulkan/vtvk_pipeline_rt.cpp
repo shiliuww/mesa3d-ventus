@@ -1231,8 +1231,9 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
    nir_def *hit_t = intrin->src[0].ssa;
    nir_def *hit_kind = intrin->src[1].ssa;
    nir_def *committed_valid = nir_ieq_imm(
-      b, vt_nir_load_hit_record_word(b, config, layout,
-                                     VT_RT_HIT_RECORD_STATUS, 32),
+      b, vt_nir_load_hit_record_meta_field(
+            b, config, layout, VT_RT_HIT_RECORD_META0,
+            VT_RT_HIT_RECORD_META0_VALID_SHIFT, 1),
       VT_RT_HIT_RECORD_STATUS_VALID);
    nir_def *committed_t = vt_nir_load_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
@@ -1262,16 +1263,21 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
 
    /* Preserve raw AS metadata populated by RTcore, changing only the
     * report-specific fields. */
-   vt_nir_store_candidate_hit_record_word(
-      b, config, layout, VT_RT_HIT_RECORD_STATUS,
-      nir_bcsel(b, eligible, nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_VALID),
-                nir_imm_int(b, VT_RT_HIT_RECORD_STATUS_INVALID)));
+   vt_nir_store_candidate_hit_record_meta_field(
+      b, config, layout, VT_RT_HIT_RECORD_META0,
+      VT_RT_HIT_RECORD_META0_VALID_SHIFT, 1, eligible);
+   vt_nir_store_candidate_hit_record_meta_field(
+      b, config, layout, VT_RT_HIT_RECORD_META0,
+      VT_RT_HIT_RECORD_META0_STATUS_SHIFT,
+      VT_RT_HIT_RECORD_META0_STATUS_BITS,
+      nir_imm_int(b, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB));
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_T, hit_t);
    vt_nir_store_candidate_hit_record_word(
       b, config, layout, VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
-   vt_nir_store_candidate_hit_record_word(
-      b, config, layout, VT_RT_HIT_RECORD_FRONT_FACE,
+   vt_nir_store_candidate_hit_record_meta_field(
+      b, config, layout, VT_RT_HIT_RECORD_META0,
+      VT_RT_HIT_RECORD_META0_FRONT_FACE_SHIFT, 1,
       nir_ieq_imm(b, hit_kind, 0xfe));
    vt_nir_store_control_word(
       b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION,
@@ -1284,8 +1290,9 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
     * intersection shaders cannot otherwise observe instance ForceOpaque /
     * ForceNoOpaque consistently. */
    nir_def *need_software_opacity_test = nir_ine_imm(
-      b, vt_nir_load_candidate_hit_record_word(
-            b, config, layout, VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 32), 0);
+      b, vt_nir_load_candidate_hit_record_meta_field(
+            b, config, layout, VT_RT_HIT_RECORD_META0,
+            VT_RT_HIT_RECORD_META0_NEED_SOFTWARE_OPACITY_TEST_SHIFT, 1), 0);
 
    if (state->any_hit) {
       nir_push_if(b, nir_iand(b, eligible, need_software_opacity_test));
@@ -1362,26 +1369,18 @@ vtvk_load_rt_shader_record_group_index(nir_builder *b, nir_def *shader_record_pt
                                        group_index_offset));
 }
 
-/* The RTcore hit record carries the selected SBT index, but it does not own
- * the application SBT base.  In particular the VTAS private traversal path
- * must not manufacture a pointer from a zero base.  Derive the record from
- * the immutable dispatch snapshot at the callback call site instead. */
+/* This is compiler-transient state derived from the trace SBT inputs and the
+ * packed hit record.  It is never a field in the RTcore-visible PDS ABI. */
 static nir_def *
 vtvk_load_rt_hit_shader_record_ptr(
    nir_builder *b, const struct vt_nir_rt_trace_params *params,
    const struct vt_nir_rt_result *result)
 {
-   if (!b || !params || !result || !result->sbt_index ||
-       !params->sbt_base || !params->sbt_stride_bytes)
+   (void)b;
+   (void)params;
+   if (!result)
       return NULL;
-
-   return nir_iadd(
-      b, params->sbt_base,
-      nir_iadd_imm(
-         b,
-         nir_imul(b, nir_u2u64(b, result->sbt_index),
-                  nir_u2u64(b, params->sbt_stride_bytes)),
-         32)); /* shader-group-handle-size */
+   return result->hit_shader_record_ptr;
 }
 
 static void
