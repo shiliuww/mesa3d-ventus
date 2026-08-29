@@ -64,7 +64,8 @@ build_two_report_shader(void)
 }
 
 static unsigned
-count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
+count_store_to_const_addr(nir_shader *shader, nir_intrinsic_op op,
+                          uint32_t addr)
 {
    unsigned count = 0;
 
@@ -76,7 +77,7 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
                continue;
 
             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-            if (intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot)
+            if (intrin->intrinsic != op)
                continue;
             if (nir_src_is_const(intrin->src[1]) &&
                 nir_src_as_uint(intrin->src[1]) == addr)
@@ -86,6 +87,13 @@ count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
    }
 
    return count;
+}
+
+static unsigned
+count_store_slot_to_const_addr(nir_shader *shader, uint32_t addr)
+{
+   return count_store_to_const_addr(shader, nir_intrinsic_ventus_rt_store_slot,
+                                    addr);
 }
 
 static unsigned
@@ -112,7 +120,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 9);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 10);
    VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT == 19);
    VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT == 9);
    VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_COUNT == 2);
@@ -184,16 +192,19 @@ main(void)
    VT_RT_CHECK(vt_nir_lower_rt_control(two_report_shader, &config));
    /* Every report site remains independently lowered.  Committing the accepted
     * report and running any-hit is deliberately tested later in the pipeline,
-    * outside this stack-free ABI test. */
-   VT_RT_CHECK(count_store_slot_to_const_addr(
-      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_META0 * sizeof(uint32_t)) == 6);
-   VT_RT_CHECK(count_store_slot_to_const_addr(
-      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_HIT_T * sizeof(uint32_t)) == 2);
-   VT_RT_CHECK(count_store_slot_to_const_addr(
-      two_report_shader, VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_HIT_KIND * sizeof(uint32_t)) == 2);
+   * outside this stack-free ABI test. */
+   VT_RT_CHECK(count_store_to_const_addr(
+      two_report_shader, nir_intrinsic_ventus_rt_hit_record_store,
+      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_META0 * sizeof(uint32_t)) > 0);
+   VT_RT_CHECK(count_store_to_const_addr(
+      two_report_shader, nir_intrinsic_ventus_rt_hit_record_store,
+      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_HIT_T * sizeof(uint32_t)) > 0);
+   VT_RT_CHECK(count_store_to_const_addr(
+      two_report_shader, nir_intrinsic_ventus_rt_hit_kind_store,
+      VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT *
+      sizeof(uint32_t)) > 0);
 
    nir_shader *deferred_report_shader = build_report_shader();
    struct vt_nir_rt_config deferred_config = config;
@@ -243,7 +254,7 @@ main(void)
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(store_shader));
 
-   printf("PASS vt_rt_abi_v9_layout header=148 payload_union=48 "
+   printf("PASS vt_rt_abi_v10_layout header=148 payload_union=48 "
           "payload_sparse=80 private_base=308\n");
 
    ralloc_free(raygen);

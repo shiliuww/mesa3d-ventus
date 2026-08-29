@@ -32,6 +32,10 @@ struct vt_rt_intrinsic_counts {
    unsigned store_shared;
    unsigned ventus_rt_load_slot;
    unsigned ventus_rt_store_slot;
+   unsigned ventus_rt_hit_record_load;
+   unsigned ventus_rt_hit_record_store;
+   unsigned ventus_rt_hit_kind_load;
+   unsigned ventus_rt_hit_kind_store;
    unsigned load_deref;
    unsigned store_deref;
    unsigned load_shader_record_ptr;
@@ -179,6 +183,18 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_ventus_rt_store_slot:
                counts->ventus_rt_store_slot++;
+               break;
+            case nir_intrinsic_ventus_rt_hit_record_load:
+               counts->ventus_rt_hit_record_load++;
+               break;
+            case nir_intrinsic_ventus_rt_hit_record_store:
+               counts->ventus_rt_hit_record_store++;
+               break;
+            case nir_intrinsic_ventus_rt_hit_kind_load:
+               counts->ventus_rt_hit_kind_load++;
+               break;
+            case nir_intrinsic_ventus_rt_hit_kind_store:
+               counts->ventus_rt_hit_kind_store++;
                break;
             case nir_intrinsic_load_deref:
                counts->load_deref++;

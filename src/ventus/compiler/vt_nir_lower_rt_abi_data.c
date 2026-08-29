@@ -751,8 +751,9 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                                                 VT_RT_HIT_RECORD_GEOMETRY_ID, 32);
       break;
    case nir_intrinsic_load_ray_hit_kind:
-      replacement = load_active_hit_record_word(b, config, layout,
-                                                VT_RT_HIT_RECORD_HIT_KIND, 32);
+      replacement = uses_candidate_hit_record(b->shader->info.stage) ?
+         vt_nir_load_candidate_hit_kind(b, config, layout) :
+         vt_nir_load_committed_hit_kind(b, config, layout);
       break;
    case nir_intrinsic_load_front_face:
       replacement =
@@ -840,8 +841,7 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          nir_imm_int(b, VT_RT_TRAVERSAL_CANDIDATE_PROCEDURAL_AABB));
       vt_nir_store_candidate_hit_record_word(b, config, layout,
                                              VT_RT_HIT_RECORD_HIT_T, hit_t);
-      vt_nir_store_candidate_hit_record_word(b, config, layout,
-                                             VT_RT_HIT_RECORD_HIT_KIND, hit_kind);
+      vt_nir_store_candidate_hit_kind(b, config, layout, hit_kind);
       vt_nir_store_candidate_hit_record_meta_field(
          b, config, layout, VT_RT_HIT_RECORD_META0,
          VT_RT_HIT_RECORD_META0_FRONT_FACE_SHIFT, 1,

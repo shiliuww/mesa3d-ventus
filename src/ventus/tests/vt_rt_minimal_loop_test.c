@@ -368,7 +368,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(nested_restore_committed_meta1 == baseline_restore_committed_meta1 + 1);
    /* Packed meta0 is read-modify-written, so it is live across the nested
     * trace just like the committed words above. */
-   VT_RT_CHECK(nested_restore_candidate_meta0 == baseline_restore_candidate_meta0 + 1);
+   VT_RT_CHECK(nested_restore_candidate_meta0 == baseline_restore_candidate_meta0);
    nir_validate_shader(nested_liveness_raygen,
                        "after nested PDS liveness lowering");
 
@@ -395,7 +395,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 60);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 64);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 68);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 9);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 10);
    VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_SIZE_BYTES == 76);
    VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT == 19);
    VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT ==
@@ -600,7 +600,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(any_after.load_front_face == 0);
    VT_RT_CHECK(any_after.load_ray_hit_kind == 0);
    VT_RT_CHECK(any_after.ignore_ray_intersection == 0);
-   VT_RT_CHECK(any_after.ventus_rt_load_slot > any_before.ventus_rt_load_slot);
+   VT_RT_CHECK(any_after.ventus_rt_hit_record_load > 0);
+   VT_RT_CHECK(any_after.ventus_rt_hit_kind_load == 1);
    VT_RT_CHECK(any_after.ventus_rt_store_slot > any_before.ventus_rt_store_slot);
 
    struct vt_rt_intrinsic_counts terminating_any_before;

@@ -801,6 +801,12 @@ intrinsic("ventus_rt_store_slot", src_comp=[0, 1])
 intrinsic("ventus_rt_hit_record_load", src_comp=[1], dest_comp=0,
           bit_sizes=[32])
 intrinsic("ventus_rt_hit_record_store", src_comp=[1, 1])
+# hit_kind has an independent field-major physical plane.  It is deliberately
+# not a ninth lane-major hit-record word, even though its logical ABI offset
+# immediately follows each record body.
+intrinsic("ventus_rt_hit_kind_load", src_comp=[1], dest_comp=0,
+          bit_sizes=[32])
+intrinsic("ventus_rt_hit_kind_store", src_comp=[1, 1])
 # Atomic counters
 #
 # The *_deref variants take an atomic_uint nir_variable, while the other,

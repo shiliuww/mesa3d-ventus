@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 9
+#define VT_RT_ABI_VERSION 10
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -139,30 +139,43 @@ enum vt_rt_callback_decision {
  *
  * Logical ABI offsets above remain lane-private byte offsets used by shader
  * lowering.  The physical PDS mapping intentionally changes at the hit
- * records: ray state and control are field-major, whereas each candidate or
- * committed record is a contiguous lane-major nine-word object.  For global
- * PDS thread ID t and resident PDS-thread count T, physical word indices are:
+ * records: ray state and control are field-major, whereas the first eight
+ * words of each candidate/committed record form one contiguous lane-major
+ * 64-byte object.  The ninth word, hit_kind, is instead retained as two
+ * field-major arrays after the lane-major bodies.  For global PDS thread ID t
+ * and resident PDS-thread count T, physical word indices are:
  *
  *   ray/control word w:             w * T + t
- *   candidate record word r:        prefix_words * T + t * record_words + r
- *   committed record word r:        (prefix_words + record_words) * T
- *                                   + t * record_words + r
+ *   candidate body word r [0, 7]:   prefix_words * T
+ *                                   + t * (body_words * body_record_count) + r
+ *   committed body word r [0, 7]:   prefix_words * T + t * body_words
+ *                                   + body_record_words + r
+ *   candidate hit_kind:             candidate_hit_kind_base_words * T + t
+ *   committed hit_kind:             committed_hit_kind_base_words * T + t
  *
  * This permits an RTcore intersection unit to write a completed lane's whole
- * record without a lane-by-field transpose crossbar.  Payload and ordinary
- * shader-private storage remain outside this fixed-header mapping.
+ * candidate/committed body without a lane-by-field transpose crossbar.  The
+ * two hit_kind arrays retain their independent candidate/committed lifetimes
+ * while allowing one 128-byte field-major transaction across 32 lanes.
+ * Payload and ordinary shader-private storage remain outside this fixed-header
+ * mapping.
  */
 #define VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_SIZE_BYTES \
    VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES
 #define VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT 19
+/* Logical hit-record offsets and words remain stable at nine words.  These
+ * constants describe only the physical PDS placement of that logical record. */
+#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_BODY_WORD_COUNT 8
+#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_BODY_RECORD_COUNT 2
 #define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT \
    VT_RT_HIT_RECORD_WORD_COUNT
 #define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_COUNT 2
+#define VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT 35
+#define VT_RT_ABI_PDS_COMMITTED_HIT_KIND_BASE_WORD_COUNT 36
 
-/* Compiler-to-LSU private-address mode tag.  It is never part of a logical
- * ABI offset: dedicated NIR hit-record accesses set it so the PDS boundary
- * applies the lane-major record mapping rather than normal AS5 field-major
- * addressing. */
+/* Existing compiler-to-LSU private-address mode tag for the lane-major
+ * candidate/committed bodies only.  The separately modelled hit_kind fields
+ * use ordinary, untagged field-major accesses. */
 #define VT_RT_ABI_HIT_RECORD_ADDR_TAG (-2147483647 - 1)
 
 #define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 148

@@ -35,6 +35,9 @@ static nir_def *load_completion_field(
 static nir_def *global_callback_slot_addr(
    nir_builder *b, const struct vt_nir_rt_config *config, uint32_t slot,
    nir_def *ray_ref);
+static nir_def *global_callback_hit_kind_addr(
+   nir_builder *b, const struct vt_nir_rt_config *config, uint32_t slot,
+   nir_def *ray_ref);
 static bool constant_def_u32(nir_def *def, uint32_t *value);
 
 /* Candidate callbacks are separate launches, so only state consumed entirely
@@ -162,11 +165,16 @@ static bool
 lower_global_worker_slot(nir_builder *b, nir_intrinsic_instr *intrin,
                          void *data)
 {
+   const bool hit_load = intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_load ||
+                         intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_load;
+   const bool hit_store = intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_store ||
+                          intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store;
    if (intrin->intrinsic != nir_intrinsic_ventus_rt_load_slot &&
-       intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot)
+       intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot &&
+       !hit_load && !hit_store)
       return false;
 
-   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot;
+   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot || hit_load;
    nir_def *slot_def = intrin->src[load ? 0 : 1].ssa;
    uint32_t slot = 0;
    if (!constant_def_u32(slot_def, &slot))
@@ -176,8 +184,12 @@ lower_global_worker_slot(nir_builder *b, nir_intrinsic_instr *intrin,
    const struct global_lower_state *state = data;
    nir_def *addr = NULL;
    if (state && state->resume_shader)
-      addr = global_callback_slot_addr(b, state->config, slot,
-                                      callback_ray_ref(b));
+      addr = (intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_load ||
+              intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store)
+                ? global_callback_hit_kind_addr(b, state->config, slot,
+                                                callback_ray_ref(b))
+                : global_callback_slot_addr(b, state->config, slot,
+                                            callback_ray_ref(b));
    else
       addr = nir_iadd_imm(b, global_worker_cps_frame_addr(b, state), slot);
    if (!addr)
@@ -611,6 +623,34 @@ global_callback_slot_addr(nir_builder *b, const struct vt_nir_rt_config *config,
    return NULL;
 }
 
+/* hit_kind is physically stored at word 35/36 in PDS, but the global
+ * completion owner retains the normal candidate/committed field identities.
+ * Its dedicated NIR intrinsic preserves that distinction despite the compact
+ * physical field-major offsets. */
+static nir_def *
+global_callback_hit_kind_addr(nir_builder *b,
+                              const struct vt_nir_rt_config *config,
+                              uint32_t slot, nir_def *ray_ref)
+{
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[vt_nir_layout_for_stage(b->shader->info.stage)];
+   const uint32_t candidate_slot = sp->base_bytes +
+      VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT * sizeof(uint32_t);
+   const uint32_t committed_slot = sp->base_bytes +
+      VT_RT_ABI_PDS_COMMITTED_HIT_KIND_BASE_WORD_COUNT * sizeof(uint32_t);
+   if (slot == candidate_slot)
+      return completion_field_addr(
+         b, ray_ref, (enum vt_rt_global_completion_field)(
+            VT_RT_GLOBAL_COMPLETION_CANDIDATE_HIT_BASE +
+            VT_RT_HIT_RECORD_HIT_KIND));
+   if (slot == committed_slot)
+      return completion_field_addr(
+         b, ray_ref, (enum vt_rt_global_completion_field)(
+            VT_RT_GLOBAL_COMPLETION_COMMITTED_HIT_BASE +
+            VT_RT_HIT_RECORD_HIT_KIND));
+   return NULL;
+}
+
 /* Returns a lane-private byte offset in the callback LDS slice.  Candidate
  * records and hit attributes are read-only in an any-hit shader, therefore
  * no epilogue writeback is required.  Control words deliberately remain in
@@ -712,9 +752,13 @@ prepare_callback_lds(nir_shader *shader, struct callback_lds_state *state)
                continue;
             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
             const bool load = intrin->intrinsic ==
-               nir_intrinsic_ventus_rt_load_slot;
+                  nir_intrinsic_ventus_rt_load_slot ||
+               intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_load ||
+               intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_load;
             const bool store = intrin->intrinsic ==
-               nir_intrinsic_ventus_rt_store_slot;
+                  nir_intrinsic_ventus_rt_store_slot ||
+               intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_store ||
+               intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store;
             if (!load && !store)
                continue;
             uint32_t slot = 0, index = 0;
@@ -785,11 +829,22 @@ static bool
 lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
 {
+   const bool hit_record_load =
+      intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_load;
+   const bool hit_record_store =
+      intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_store;
+   const bool hit_kind_load =
+      intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_load;
+   const bool hit_kind_store =
+      intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store;
    if (intrin->intrinsic != nir_intrinsic_ventus_rt_load_slot &&
-       intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot)
+       intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot &&
+       !hit_record_load && !hit_record_store && !hit_kind_load &&
+       !hit_kind_store)
       return false;
 
-   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot;
+   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot ||
+                     hit_record_load || hit_kind_load;
    nir_def *slot_def = intrin->src[load ? 0 : 1].ssa;
    uint32_t slot = 0;
    if (!constant_def_u32(slot_def, &slot))
@@ -809,7 +864,11 @@ lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
    }
 
    nir_def *ray_ref = callback_ray_ref(b);
-   nir_def *addr = global_callback_slot_addr(b, state->config, slot, ray_ref);
+   nir_def *addr = (hit_kind_load || hit_kind_store)
+                     ? global_callback_hit_kind_addr(b, state->config, slot,
+                                                     ray_ref)
+                     : global_callback_slot_addr(b, state->config, slot,
+                                                 ray_ref);
    if (!addr)
       return false;
    if (load)

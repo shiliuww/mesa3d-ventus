@@ -335,6 +335,23 @@ void vt_nir_store_candidate_hit_record_word(nir_builder *b,
                                             enum vt_rt_hit_record_word word,
                                             nir_def *value);
 
+/* hit_kind is a separate ABI field class with a field-major physical PDS
+ * plane.  It is logically associated with the candidate/committed records,
+ * but is never lowered as lane-major record word eight. */
+nir_def *vt_nir_load_committed_hit_kind(nir_builder *b,
+                                        const struct vt_nir_rt_config *config,
+                                        enum vt_rt_shader_layout layout);
+void vt_nir_store_committed_hit_kind(nir_builder *b,
+                                     const struct vt_nir_rt_config *config,
+                                     enum vt_rt_shader_layout layout,
+                                     nir_def *value);
+nir_def *vt_nir_load_candidate_hit_kind(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout);
+void vt_nir_store_candidate_hit_kind(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout, nir_def *value);
+
 nir_def *vt_nir_load_hit_record_meta_field(nir_builder *b,
                                             const struct vt_nir_rt_config *config,
                                             enum vt_rt_shader_layout layout,

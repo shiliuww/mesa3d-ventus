@@ -140,6 +140,21 @@ vt_nir_candidate_hit_record_addr(nir_builder *b,
                                  sp->candidate_hit_record_base_bytes + word * 4);
 }
 
+static nir_def *
+vt_nir_hit_kind_addr(nir_builder *b,
+                     const struct vt_nir_rt_config *config,
+                     enum vt_rt_shader_layout layout, bool candidate)
+{
+   /* hit_kind is a standalone field-major plane, not word eight of the
+    * lane-major record body.  Use the physical field-major word directly so
+    * its ordinary AS5 access needs no layout tag. */
+   return vt_nir_scratchpad_addr(
+      b, config, layout,
+      (candidate ? VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT :
+                   VT_RT_ABI_PDS_COMMITTED_HIT_KIND_BASE_WORD_COUNT) *
+         sizeof(uint32_t));
+}
+
 nir_def *
 vt_nir_control_addr(nir_builder *b,
                     const struct vt_nir_rt_config *config,
@@ -221,6 +236,47 @@ vt_nir_store_candidate_hit_record_word(nir_builder *b,
       value = nir_b2i32(b, value);
    nir_ventus_rt_hit_record_store(
       b, value, vt_nir_candidate_hit_record_addr(b, config, layout, word));
+}
+
+nir_def *
+vt_nir_load_committed_hit_kind(nir_builder *b,
+                               const struct vt_nir_rt_config *config,
+                               enum vt_rt_shader_layout layout)
+{
+   return nir_ventus_rt_hit_kind_load(
+      b, 1, vt_nir_hit_kind_addr(b, config, layout, false));
+}
+
+void
+vt_nir_store_committed_hit_kind(nir_builder *b,
+                                const struct vt_nir_rt_config *config,
+                                enum vt_rt_shader_layout layout,
+                                nir_def *value)
+{
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_ventus_rt_hit_kind_store(
+      b, value, vt_nir_hit_kind_addr(b, config, layout, false));
+}
+
+nir_def *
+vt_nir_load_candidate_hit_kind(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout)
+{
+   return nir_ventus_rt_hit_kind_load(
+      b, 1, vt_nir_hit_kind_addr(b, config, layout, true));
+}
+
+void
+vt_nir_store_candidate_hit_kind(
+   nir_builder *b, const struct vt_nir_rt_config *config,
+   enum vt_rt_shader_layout layout, nir_def *value)
+{
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_ventus_rt_hit_kind_store(
+      b, value, vt_nir_hit_kind_addr(b, config, layout, true));
 }
 
 static nir_def *

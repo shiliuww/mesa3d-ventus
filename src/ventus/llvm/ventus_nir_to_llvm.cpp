@@ -376,11 +376,8 @@ private:
 
    Value *rtHitRecordPtr(Value *logicalOffset)
    {
-      /* The high-bit tag selects the RT hit-record PDS mode in the LSU.
-       * Do not route this through rtScratchPtr: ordinary slots retain the
-       * addrspace(5) field-major mapping, whereas the tagged logical offset
-       * is translated at the PDS boundary to
-       * prefix_words * T + tid * record_words + record_word. */
+      /* Body accesses select the lane-major PDS mapping with the existing
+       * private-address mode tag.  hit_kind deliberately does not use it. */
       Value *tagged = builder.CreateOr(
          asInt32(logicalOffset),
          ConstantInt::get(i32, VT_RT_ABI_HIT_RECORD_ADDR_TAG));
@@ -2020,6 +2017,18 @@ private:
          StoreInst *store = builder.CreateStore(
             asInt32(value(intrin->src[0])),
             rtHitRecordPtr(value(intrin->src[1])));
+         store->setAlignment(Align(4));
+         return nullptr;
+      }
+      case nir_intrinsic_ventus_rt_hit_kind_load: {
+         LoadInst *load = builder.CreateLoad(defType(&intrin->def),
+                                             rtScratchPtr(value(intrin->src[0])));
+         load->setAlignment(Align(4));
+         return load;
+      }
+      case nir_intrinsic_ventus_rt_hit_kind_store: {
+         StoreInst *store = builder.CreateStore(
+            asInt32(value(intrin->src[0])), rtScratchPtr(value(intrin->src[1])));
          store->setAlignment(Align(4));
          return nullptr;
       }
