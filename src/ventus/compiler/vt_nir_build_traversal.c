@@ -145,14 +145,10 @@ vt_nir_hit_kind_addr(nir_builder *b,
                      const struct vt_nir_rt_config *config,
                      enum vt_rt_shader_layout layout, bool candidate)
 {
-   /* hit_kind is a standalone field-major plane, not word eight of the
-    * lane-major record body.  Use the physical field-major word directly so
-    * its ordinary AS5 access needs no layout tag. */
-   return vt_nir_scratchpad_addr(
-      b, config, layout,
-      (candidate ? VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT :
-                   VT_RT_ABI_PDS_COMMITTED_HIT_KIND_BASE_WORD_COUNT) *
-         sizeof(uint32_t));
+   return candidate
+      ? vt_nir_candidate_hit_record_addr(b, config, layout,
+                                         VT_RT_HIT_RECORD_HIT_KIND)
+      : vt_nir_hit_record_addr(b, config, layout, VT_RT_HIT_RECORD_HIT_KIND);
 }
 
 nir_def *

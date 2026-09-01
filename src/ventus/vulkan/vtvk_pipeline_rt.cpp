@@ -1304,7 +1304,7 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
 
    nir_push_if(b, accepted);
    for (uint32_t word = 0;
-        word < VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_BODY_WORD_COUNT;
+        word < VT_RT_HIT_RECORD_WORD_COUNT;
         word++) {
       const enum vt_rt_hit_record_word hit_word =
          static_cast<enum vt_rt_hit_record_word>(word);
@@ -1312,9 +1312,6 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
          b, config, layout, hit_word,
          vt_nir_load_candidate_hit_record_word(b, config, layout, hit_word, 32));
    }
-   vt_nir_store_committed_hit_kind(
-      b, config, layout,
-      vt_nir_load_candidate_hit_kind(b, config, layout));
    if (global_callback) {
       const uint32_t hit_attrib_words =
          config->scratchpad[layout].hit_attrib_size_bytes / sizeof(uint32_t);

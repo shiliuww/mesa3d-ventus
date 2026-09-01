@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 10
+#define VT_RT_ABI_VERSION 11
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -145,38 +145,16 @@ enum vt_rt_callback_decision {
  * field-major arrays after the lane-major bodies.  For global PDS thread ID t
  * and resident PDS-thread count T, physical word indices are:
  *
- *   ray/control word w:             w * T + t
- *   candidate body word r [0, 7]:   prefix_words * T
- *                                   + t * (body_words * body_record_count) + r
- *   committed body word r [0, 7]:   prefix_words * T + t * body_words
- *                                   + body_record_words + r
- *   candidate hit_kind:             candidate_hit_kind_base_words * T + t
- *   committed hit_kind:             committed_hit_kind_base_words * T + t
+ *   fixed-header word w:            w * T + t
  *
- * This permits an RTcore intersection unit to write a completed lane's whole
- * candidate/committed body without a lane-by-field transpose crossbar.  The
- * two hit_kind arrays retain their independent candidate/committed lifetimes
- * while allowing one 128-byte field-major transaction across 32 lanes.
+ * Candidate and committed hit records each retain their nine logical fields,
+ * including hit_kind.  RTcore collects all active lane results and transposes
+ * them into these contiguous field vectors before writeback.
  * Payload and ordinary shader-private storage remain outside this fixed-header
- * mapping.
+ * mapping.  Every fixed-header word is field-major: a warp-wide read or write
+ * of one logical word is one contiguous PDS block.
  */
-#define VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_SIZE_BYTES \
-   VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES
-#define VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT 19
-/* Logical hit-record offsets and words remain stable at nine words.  These
- * constants describe only the physical PDS placement of that logical record. */
-#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_BODY_WORD_COUNT 8
-#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_BODY_RECORD_COUNT 2
-#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT \
-   VT_RT_HIT_RECORD_WORD_COUNT
-#define VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_COUNT 2
-#define VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT 35
-#define VT_RT_ABI_PDS_COMMITTED_HIT_KIND_BASE_WORD_COUNT 36
-
-/* Existing compiler-to-LSU private-address mode tag for the lane-major
- * candidate/committed bodies only.  The separately modelled hit_kind fields
- * use ordinary, untagged field-major accesses. */
-#define VT_RT_ABI_HIT_RECORD_ADDR_TAG (-2147483647 - 1)
+#define VT_RT_ABI_PDS_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT 37
 
 #define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 148
 /* The payload starts after candidate and committed non-barycentric hit

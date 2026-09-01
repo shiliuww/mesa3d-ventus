@@ -120,10 +120,8 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 10);
-   VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_PREFIX_WORD_COUNT == 19);
-   VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_WORD_COUNT == 9);
-   VT_RT_CHECK(VT_RT_ABI_PDS_LANE_MAJOR_HIT_RECORD_COUNT == 2);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 11);
+   VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 37);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
    VT_RT_CHECK(layout.payload_base_bytes == 148);
    VT_RT_CHECK(layout.region_size_bytes == 148);
@@ -203,8 +201,8 @@ main(void)
       VT_RT_HIT_RECORD_HIT_T * sizeof(uint32_t)) > 0);
    VT_RT_CHECK(count_store_to_const_addr(
       two_report_shader, nir_intrinsic_ventus_rt_hit_kind_store,
-      VT_RT_ABI_PDS_CANDIDATE_HIT_KIND_BASE_WORD_COUNT *
-      sizeof(uint32_t)) > 0);
+      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
+      VT_RT_HIT_RECORD_HIT_KIND * sizeof(uint32_t)) > 0);
 
    nir_shader *deferred_report_shader = build_report_shader();
    struct vt_nir_rt_config deferred_config = config;

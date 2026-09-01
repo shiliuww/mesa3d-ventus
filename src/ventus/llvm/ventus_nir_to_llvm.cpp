@@ -374,16 +374,6 @@ private:
       return privatePtr(builder.CreateAdd(rtScratchBase(), asInt32(offset)));
    }
 
-   Value *rtHitRecordPtr(Value *logicalOffset)
-   {
-      /* Body accesses select the lane-major PDS mapping with the existing
-       * private-address mode tag.  hit_kind deliberately does not use it. */
-      Value *tagged = builder.CreateOr(
-         asInt32(logicalOffset),
-         ConstantInt::get(i32, VT_RT_ABI_HIT_RECORD_ADDR_TAG));
-      return privatePtr(tagged);
-   }
-
    Value *rtSlotOffset(enum vt_rt_slot_word word)
    {
       return ConstantInt::get(i32,
@@ -2009,14 +1999,14 @@ private:
       }
       case nir_intrinsic_ventus_rt_hit_record_load: {
          LoadInst *load = builder.CreateLoad(defType(&intrin->def),
-                                             rtHitRecordPtr(value(intrin->src[0])));
+                                             rtScratchPtr(value(intrin->src[0])));
          load->setAlignment(Align(4));
          return load;
       }
       case nir_intrinsic_ventus_rt_hit_record_store: {
          StoreInst *store = builder.CreateStore(
             asInt32(value(intrin->src[0])),
-            rtHitRecordPtr(value(intrin->src[1])));
+            rtScratchPtr(value(intrin->src[1])));
          store->setAlignment(Align(4));
          return nullptr;
       }
