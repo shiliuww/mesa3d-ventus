@@ -772,11 +772,35 @@ insert_raygen_release_before_returns(nir_shader *shader,
          nir_def *slot_base =
             vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
                                    config->scratchpad[VT_RT_LAYOUT_RAYGEN].ray_state_base_bytes);
+         /* release is the terminal session fence: its LLVM intrinsic is a
+          * read-write side effect, so this status store remains visible
+          * before the RTcore release acknowledgement.  It releases only
+          * RTcore-owned state; the PDS frame and compiler spills stay live. */
          nir_ventus_rt_store_slot(
             &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
          nir_ventus_rt_release(&b, nir_ventus_rt_pds_warp_tid_base(&b));
          progress = true;
       }
+   }
+
+   /* NIR entry points may terminate by falling off their final block instead
+    * of carrying an explicit return jump.  Real raygen shaders commonly take
+    * this path after their final image store, so handling only return/halt
+    * silently omits rt.release from the emitted ELF. */
+   nir_block *last_block = nir_impl_last_block(impl);
+   if (last_block && !nir_block_ends_in_jump(last_block)) {
+      b.cursor = nir_after_block_before_jump(last_block);
+      nir_def *slot_base =
+         vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
+                                config->scratchpad[VT_RT_LAYOUT_RAYGEN].ray_state_base_bytes);
+      /* release is the terminal session fence: its LLVM intrinsic is a
+       * read-write side effect, so this status store remains visible before
+       * the RTcore release acknowledgement.  It releases only RTcore-owned
+       * state; the PDS frame and compiler spills stay live. */
+      nir_ventus_rt_store_slot(
+         &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
+      nir_ventus_rt_release(&b, nir_ventus_rt_pds_warp_tid_base(&b));
+      progress = true;
    }
 
    return progress;

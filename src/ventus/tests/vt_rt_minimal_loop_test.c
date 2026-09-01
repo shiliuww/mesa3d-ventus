@@ -499,6 +499,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.ventus_rt_traverse == 1);
    VT_RT_CHECK(after.ventus_rt_release == 1);
    VT_RT_CHECK(vt_rt_all_releases_are_outside_loops(raygen));
+   VT_RT_CHECK(vt_rt_releases_follow_terminated_store(raygen));
    VT_RT_CHECK(after.ventus_rt_store_slot > 0);
    VT_RT_CHECK(after.ventus_rt_load_slot > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));

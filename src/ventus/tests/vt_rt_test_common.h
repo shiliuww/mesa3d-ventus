@@ -150,6 +150,35 @@ vt_rt_all_releases_are_outside_loops(nir_shader *shader)
    return releases > 0 && releases == outside_loop_releases;
 }
 
+/* A raygen release must publish TERMINATED in the same block first.  This
+ * guards the lifecycle ordering without treating compiler private spills as
+ * RT-owned PDS state. */
+static inline bool
+vt_rt_releases_follow_terminated_store(nir_shader *shader)
+{
+   bool saw_release = false;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         bool saw_terminated_store = false;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot &&
+                nir_src_is_const(intrin->src[0]) &&
+                nir_src_as_uint(intrin->src[0]) == VT_RT_SLOT_STATUS_TERMINATED)
+               saw_terminated_store = true;
+            if (intrin->intrinsic != nir_intrinsic_ventus_rt_release)
+               continue;
+            if (!saw_terminated_store)
+               return false;
+            saw_release = true;
+         }
+      }
+   }
+   return saw_release;
+}
+
 static inline void
 vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts)
 {

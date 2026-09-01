@@ -710,9 +710,7 @@ vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
                          (rv64 ? " -mtriple=riscv64-unknown-elf"
                                : " -mtriple=riscv32-unknown-elf") +
                          (rv64 ? " -mcpu=ventus-gpgpu-rv64"
-                               : " -mcpu=ventus-gpgpu")
-                         + (rv64 ? " -target-abi=lp64" : " -target-abi=ilp32") +
-                         " -mattr=+m,+a,+f,+d,+v,+zfh"
+                               : " -mcpu=ventus-gpgpu") +
                          " -filetype=obj " +
                          vtvk_shell_quote(emit_ll_path.c_str()) + " -o " +
                          vtvk_shell_quote(obj_path.c_str());
