@@ -119,63 +119,42 @@ enum vt_rt_callback_decision {
    VT_RT_CALLBACK_TERMINATE = 3,
 };
 
-#define VT_RT_ABI_RAY_STATE_BASE_BYTES 0
-#define VT_RT_ABI_RAY_STATE_SIZE_BYTES \
+#define VT_RT_LOCAL_RAY_STATE_BASE_BYTES 0
+#define VT_RT_LOCAL_RAY_STATE_SIZE_BYTES \
    (VT_RT_SLOT_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 
 /* RTcore-private traversal state is not part of this ABI. */
-#define VT_RT_ABI_CONTROL_BASE_BYTES VT_RT_ABI_RAY_STATE_SIZE_BYTES
-#define VT_RT_ABI_CONTROL_SIZE_BYTES \
+#define VT_RT_LOCAL_CONTROL_BASE_BYTES VT_RT_LOCAL_RAY_STATE_SIZE_BYTES
+#define VT_RT_LOCAL_CONTROL_SIZE_BYTES \
    (VT_RT_CONTROL_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 
-#define VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES 76
-#define VT_RT_ABI_CANDIDATE_HIT_RECORD_SIZE_BYTES 36
+#define VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES 76
+#define VT_RT_LOCAL_CANDIDATE_HIT_RECORD_SIZE_BYTES 36
 
-#define VT_RT_ABI_COMMITTED_HIT_RECORD_BASE_BYTES 112
-#define VT_RT_ABI_COMMITTED_HIT_RECORD_SIZE_BYTES 36
+#define VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES 112
+#define VT_RT_LOCAL_COMMITTED_HIT_RECORD_SIZE_BYTES 36
 
-/*
- * Fixed-header physical PDS layout.
- *
- * Logical ABI offsets above remain lane-private byte offsets used by shader
- * lowering.  The physical PDS mapping intentionally changes at the hit
- * records: ray state and control are field-major, whereas the first eight
- * words of each candidate/committed record form one contiguous lane-major
- * 64-byte object.  The ninth word, hit_kind, is instead retained as two
- * field-major arrays after the lane-major bodies.  For global PDS thread ID t
- * and resident PDS-thread count T, physical word indices are:
- *
- *   fixed-header word w:            w * T + t
- *
- * Candidate and committed hit records each retain their nine logical fields,
- * including hit_kind.  RTcore collects all active lane results and transposes
- * them into these contiguous field vectors before writeback.
- * Payload and ordinary shader-private storage remain outside this fixed-header
- * mapping.  Every fixed-header word is field-major: a warp-wide read or write
- * of one logical word is one contiguous PDS block.
- */
-#define VT_RT_ABI_PDS_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT 37
+/* Fixed RT Local SRAM header.  Its 37 logical words are field-major across a
+ * 32-lane warp; PDS has no physical representation for this region. */
+#define VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT 37
+#define VT_RT_LOCAL_HEADER_SIZE_BYTES \
+   (VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 
-#define VT_RT_ABI_HIT_ATTRIB_BASE_BYTES 148
+/* PDS starts at byte zero.  It contains only variable attributes and payload
+ * frames; no RT Local field is assigned a synthetic PDS offset. */
+#define VT_RT_PDS_CANDIDATE_HIT_ATTRIB_BASE_BYTES 0
 /* The payload starts after candidate and committed non-barycentric hit
  * attributes.  Intersection/any-hit write the candidate half; an accepted
  * report snapshots it into the committed half before closest-hit runs.
  * The two triangle barycentric words live in hit-record words 3 and 4 and
  * are therefore not part of this variable-sized region. */
-#define VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES 0
+#define VT_RT_PDS_HIT_ATTRIB_SIZE_BYTES 0
 
-#define VT_RT_ABI_PAYLOAD_BASE_BYTES_FOR_HIT_ATTRIB_SIZE(hit_attrib_size_bytes) \
-   (VT_RT_ABI_HIT_ATTRIB_BASE_BYTES + 2 * (hit_attrib_size_bytes))
+#define VT_RT_PDS_COMMITTED_HIT_ATTRIB_BASE_BYTES(hit_attrib_size_bytes) \
+   (VT_RT_PDS_CANDIDATE_HIT_ATTRIB_BASE_BYTES + (hit_attrib_size_bytes))
+#define VT_RT_PDS_PAYLOAD_BASE_BYTES(hit_attrib_size_bytes) \
+   (2 * (hit_attrib_size_bytes))
 
-#define VT_RT_ABI_SHADER_REGION_BASE_BYTES VT_RT_ABI_HIT_ATTRIB_BASE_BYTES
-#define VT_RT_ABI_PAYLOAD_BASE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
-/* The linked RT pipeline determines P before lowering:
- * ALIGN16(max(location * 16 + natural_size)).  Megakernel payload storage is
- * D consecutive frames: frame d is [payload_base + d * P,
- * payload_base + (d + 1) * P).  The fixed Header ends at payload_base; P and
- * D are pipeline properties, not fixed RTcore Header constants. */
-#define VT_RT_ABI_DEFAULT_PAYLOAD_SIZE_BYTES 0
-#define VT_RT_ABI_REGION_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
-#define VT_RT_ABI_FIXED_HEADER_SIZE_BYTES VT_RT_ABI_SHADER_REGION_BASE_BYTES
+#define VT_RT_PDS_DEFAULT_PAYLOAD_SIZE_BYTES 0
 
 #endif

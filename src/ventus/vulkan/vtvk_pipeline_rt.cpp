@@ -345,7 +345,7 @@ vtvk_rt_finalize_abi(nir_shader *shader,
 
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
    shader->scratch_size =
-      MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
+      MAX2(shader->scratch_size, config->scratchpad[layout].private_base_bytes);
    if (config->execution_model == VT_RT_EXECUTION_WAVEFRONT_GLOBAL_WORKER)
       vtvk_rt_reserve_global_slot_region(shader);
 
@@ -1945,12 +1945,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
-   /* The fixed RT ABI may reserve nested payload frames that are not
-    * represented by ordinary NIR shader scratch after callback inlining.
-    * Keep the dispatch/PDS frame at least as large as the linked ABI region
-    * and its fixed-depth spill area. */
+   /* Keep PDS large enough for RT attributes, linked payload frames and their
+    * fixed-depth spills.  The fixed 148-byte header is RT Local SRAM. */
    pipeline->per_lane_scratch_size =
-      MAX2(pipeline->per_lane_scratch_size, rt_abi.total_size_bytes);
+      MAX2(pipeline->per_lane_scratch_size, rt_abi.private_base_bytes);
    pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;
 
    struct vt_nir_to_llvm_options llvm_options = {
@@ -1962,9 +1960,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          "e-m:e-p:32:32-i64:64-n32-S128",
       .require_ssa_function_temps = true,
       .global_rt_wavefront = global_wavefront,
-      /* Megakernel private state follows the fixed RT header and all
-       * pipeline-specific payload frames.  The staged/global legacy path keeps its
-       * own CPS storage and must not inherit this PDS prefix. */
+      /* Megakernel private state follows PDS-backed payload frames.  The
+       * staged/global legacy path keeps its own CPS storage. */
       .private_base_bytes = global_wavefront ? 0 : rt_abi.private_base_bytes,
    };
 

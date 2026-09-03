@@ -1082,11 +1082,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                       info->per_lane_scratch_size);
             llvm_private_frame = 0;
          } else {
-            /* Megakernel v3 places the fixed RT header at PDS offset zero and
-             * reserves the linked pipeline payload before LLVM's private
-             * frame.  The resource metadata already describes the complete
-             * post-RA private frame, so there is no legacy 4096-byte prefix
-             * restriction here. */
+            /* RT Local SRAM owns the fixed header.  The resource metadata
+             * describes the complete PDS payload/private frame after register
+             * allocation, so there is no fixed-header PDS prefix. */
          }
       } else {
          /* No launch follows this path, but retain staging-only diagnostics

@@ -33,8 +33,8 @@ struct vt_nir_to_llvm_options {
     * guard, not the root raygen image-extent guard. */
    bool global_rt_compact_resume;
    /* Megakernel PDS layout: ordinary private allocas and backend spills are
-    * placed after the fixed RT region, linked payload, and nested payload
-    * slots.  Zero preserves the legacy LLVM layout (callback/global profiles). */
+    * placed after PDS-backed attributes, linked payload, and nested payload
+    * slots.  The fixed RT header is RT Local SRAM, not a PDS prefix. */
    uint32_t private_base_bytes;
 };
 

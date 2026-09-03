@@ -51,7 +51,7 @@ static bool constant_def_u32(nir_def *def, uint32_t *value);
 struct callback_lds_state {
    const struct vt_nir_rt_config *config;
    bool candidate_word[VT_RT_HIT_RECORD_WORD_COUNT];
-   bool hit_attrib_word[VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES / 4];
+   bool hit_attrib_word[VT_RT_PDS_HIT_ATTRIB_SIZE_BYTES / 4];
    uint32_t lds_size_bytes;
 };
 
@@ -162,20 +162,26 @@ static bool
 lower_global_worker_slot(nir_builder *b, nir_intrinsic_instr *intrin,
                          void *data)
 {
+   const bool local_load = intrin->intrinsic == nir_intrinsic_ventus_rt_local_load;
+   const bool local_store = intrin->intrinsic == nir_intrinsic_ventus_rt_local_store;
    const bool hit_load = intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_load ||
                          intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_load;
    const bool hit_store = intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_store ||
                           intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store;
    if (intrin->intrinsic != nir_intrinsic_ventus_rt_load_slot &&
        intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot &&
+       !local_load && !local_store &&
        !hit_load && !hit_store)
       return false;
 
-   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot || hit_load;
+   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot ||
+                     local_load || hit_load;
    nir_def *slot_def = intrin->src[load ? 0 : 1].ssa;
    uint32_t slot = 0;
    if (!constant_def_u32(slot_def, &slot))
       return false;
+   if (local_load || local_store)
+      slot *= VT_RT_ABI_WORD_BYTES;
 
    b->cursor = nir_before_instr(&intrin->instr);
    const struct global_lower_state *state = data;
@@ -704,7 +710,7 @@ static void
 prepare_callback_lds(nir_shader *shader, struct callback_lds_state *state)
 {
    uint8_t loads[VT_RT_HIT_RECORD_WORD_COUNT +
-                 VT_RT_ABI_HIT_ATTRIB_SIZE_BYTES / 4] = {};
+                 VT_RT_PDS_HIT_ATTRIB_SIZE_BYTES / 4] = {};
    bool writes[ARRAY_SIZE(loads)] = {};
 
    if (shader->info.stage != MESA_SHADER_ANY_HIT)
@@ -794,6 +800,8 @@ static bool
 lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
                            void *data)
 {
+   const bool local_load = intrin->intrinsic == nir_intrinsic_ventus_rt_local_load;
+   const bool local_store = intrin->intrinsic == nir_intrinsic_ventus_rt_local_store;
    const bool hit_record_load =
       intrin->intrinsic == nir_intrinsic_ventus_rt_hit_record_load;
    const bool hit_record_store =
@@ -804,16 +812,20 @@ lower_global_callback_slot(nir_builder *b, nir_intrinsic_instr *intrin,
       intrin->intrinsic == nir_intrinsic_ventus_rt_hit_kind_store;
    if (intrin->intrinsic != nir_intrinsic_ventus_rt_load_slot &&
        intrin->intrinsic != nir_intrinsic_ventus_rt_store_slot &&
+       !local_load && !local_store &&
        !hit_record_load && !hit_record_store && !hit_kind_load &&
        !hit_kind_store)
       return false;
 
    const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot ||
+                     local_load ||
                      hit_record_load || hit_kind_load;
    nir_def *slot_def = intrin->src[load ? 0 : 1].ssa;
    uint32_t slot = 0;
    if (!constant_def_u32(slot_def, &slot))
       return false;
+   if (local_load || local_store)
+      slot *= VT_RT_ABI_WORD_BYTES;
 
    b->cursor = nir_before_instr(&intrin->instr);
    const struct callback_lds_state *state = data;

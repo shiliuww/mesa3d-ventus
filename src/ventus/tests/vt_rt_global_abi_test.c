@@ -28,14 +28,14 @@ main(void)
 
    vt_nir_rt_config_apply_global_cps_layout(&global_config, &abi);
    CHECK(legacy_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes ==
-         VT_RT_ABI_RAY_STATE_BASE_BYTES);
+         VT_RT_LOCAL_RAY_STATE_BASE_BYTES);
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes == 0);
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes ==
-         VT_RT_ABI_PAYLOAD_BASE_BYTES);
+         VT_RT_LOCAL_HEADER_SIZE_BYTES + VT_RT_PDS_PAYLOAD_BASE_BYTES(0));
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes ==
-         VT_RT_ABI_REGION_SIZE_BYTES);
+         VT_RT_LOCAL_HEADER_SIZE_BYTES);
    CHECK(global_config.scratchpad[VT_RT_LAYOUT_RAYGEN].stride_bytes ==
-         VT_RT_ABI_REGION_SIZE_BYTES);
+         VT_RT_LOCAL_HEADER_SIZE_BYTES);
 
    CHECK(VT_RT_GLOBAL_ABI_VERSION == 10);
    CHECK(VT_RT_SUBMISSION_MAILBOX_SIZE_BYTES ==

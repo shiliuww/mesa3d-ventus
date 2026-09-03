@@ -32,6 +32,8 @@ struct vt_rt_intrinsic_counts {
    unsigned store_shared;
    unsigned ventus_rt_load_slot;
    unsigned ventus_rt_store_slot;
+   unsigned ventus_rt_local_load;
+   unsigned ventus_rt_local_store;
    unsigned ventus_rt_hit_record_load;
    unsigned ventus_rt_hit_record_store;
    unsigned ventus_rt_hit_kind_load;
@@ -51,7 +53,7 @@ struct vt_rt_intrinsic_counts {
    unsigned report_ray_intersection;
    unsigned ignore_ray_intersection;
    unsigned terminate_ray;
-   unsigned ventus_rt_pds_warp_tid_base;
+   unsigned ventus_rt_warp_first_tid;
    unsigned ventus_rt_traverse;
    unsigned ventus_rt_release;
    unsigned ventus_rt_enqueue;
@@ -164,7 +166,7 @@ vt_rt_releases_follow_terminated_store(nir_shader *shader)
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-            if (intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot &&
+            if (intrin->intrinsic == nir_intrinsic_ventus_rt_local_store &&
                 nir_src_is_const(intrin->src[0]) &&
                 nir_src_as_uint(intrin->src[0]) == VT_RT_SLOT_STATUS_TERMINATED)
                saw_terminated_store = true;
@@ -212,6 +214,12 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
                break;
             case nir_intrinsic_ventus_rt_store_slot:
                counts->ventus_rt_store_slot++;
+               break;
+            case nir_intrinsic_ventus_rt_local_load:
+               counts->ventus_rt_local_load++;
+               break;
+            case nir_intrinsic_ventus_rt_local_store:
+               counts->ventus_rt_local_store++;
                break;
             case nir_intrinsic_ventus_rt_hit_record_load:
                counts->ventus_rt_hit_record_load++;
@@ -270,8 +278,8 @@ vt_rt_count_intrinsics(nir_shader *shader, struct vt_rt_intrinsic_counts *counts
             case nir_intrinsic_terminate_ray:
                counts->terminate_ray++;
                break;
-            case nir_intrinsic_ventus_rt_pds_warp_tid_base:
-               counts->ventus_rt_pds_warp_tid_base++;
+            case nir_intrinsic_ventus_rt_warp_first_tid:
+               counts->ventus_rt_warp_first_tid++;
                break;
             case nir_intrinsic_ventus_rt_traverse:
                counts->ventus_rt_traverse++;

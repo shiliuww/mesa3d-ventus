@@ -40,7 +40,7 @@ vt_nir_lower_rt_abi(nir_shader *shader,
 
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
    shader->scratch_size =
-      MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
+      MAX2(shader->scratch_size, config->scratchpad[layout].private_base_bytes);
 
    nir_shader_gather_info(shader, impl);
    nir_progress(progress, impl, progress ? nir_metadata_none : nir_metadata_all);

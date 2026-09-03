@@ -15,7 +15,8 @@ vt_nir_lower_shader_scratch(nir_shader *shader,
       enum vt_rt_shader_layout layout =
          vt_nir_layout_for_stage(shader->info.stage);
       shader->scratch_size =
-         MAX2(shader->scratch_size, config->scratchpad[layout].total_size_bytes);
+         MAX2(shader->scratch_size,
+              config->scratchpad[layout].private_base_bytes);
    }
 
    unsigned before = shader->scratch_size;

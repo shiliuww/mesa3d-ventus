@@ -122,11 +122,19 @@ load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
 }
 
 static nir_def *
-load_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
-                  enum vt_rt_shader_layout layout, uint32_t byte_offset)
+load_rt_local_word(nir_builder *b, uint32_t field)
 {
-   return nir_ventus_rt_load_slot(
-      b, 1, 32, vt_nir_scratchpad_addr(b, config, layout, byte_offset));
+   assert(field < VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT);
+   return nir_ventus_rt_local_load(b, 1, nir_imm_int(b, field));
+}
+
+static void
+store_rt_local_word(nir_builder *b, uint32_t field, nir_def *value)
+{
+   assert(field < VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT);
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_ventus_rt_local_store(b, value, nir_imm_int(b, field));
 }
 
 nir_def *
@@ -135,9 +143,9 @@ vt_nir_load_ray_state_word(nir_builder *b,
                            enum vt_rt_shader_layout layout,
                            enum vt_rt_slot_word word)
 {
-   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return load_rt_slot_word(b, config, layout,
-                            sp->ray_state_base_bytes + word * 4);
+   (void)config;
+   (void)layout;
+   return load_rt_local_word(b, VT_RT_LOCAL_RAY_STATE_BASE_BYTES / 4 + word);
 }
 
 static nir_def *
@@ -184,11 +192,11 @@ vt_nir_store_trace_meta_field(nir_builder *b,
                               uint32_t shift, uint32_t bits, nir_def *value)
 {
    nir_def *old_word = vt_nir_load_ray_state_word(b, config, layout, meta_word);
-   nir_ventus_rt_store_slot(
-      b, update_packed_u32_field(b, old_word, shift, bits, value),
-      vt_nir_scratchpad_addr(
-         b, config, layout,
-         config->scratchpad[layout].ray_state_base_bytes + meta_word * 4));
+   (void)config;
+   (void)layout;
+   store_rt_local_word(
+      b, VT_RT_LOCAL_RAY_STATE_BASE_BYTES / 4 + meta_word,
+      update_packed_u32_field(b, old_word, shift, bits, value));
 }
 
 static nir_def *
@@ -199,15 +207,6 @@ load_ray_state_vec3(nir_builder *b, const struct vt_nir_rt_config *config,
                    vt_nir_load_ray_state_word(b, config, layout, first_word),
                    vt_nir_load_ray_state_word(b, config, layout, first_word + 1),
                    vt_nir_load_ray_state_word(b, config, layout, first_word + 2));
-}
-
-static void
-store_rt_slot_word(nir_builder *b, const struct vt_nir_rt_config *config,
-                   enum vt_rt_shader_layout layout, uint32_t byte_offset,
-                   nir_def *value)
-{
-   nir_ventus_rt_store_slot(
-      b, value, vt_nir_scratchpad_addr(b, config, layout, byte_offset));
 }
 
 static nir_def *

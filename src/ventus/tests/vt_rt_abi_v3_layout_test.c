@@ -121,13 +121,13 @@ main(void)
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(VT_RT_ABI_VERSION == 11);
-   VT_RT_CHECK(VT_RT_ABI_PDS_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 37);
+   VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 37);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
-   VT_RT_CHECK(layout.payload_base_bytes == 148);
-   VT_RT_CHECK(layout.region_size_bytes == 148);
-   VT_RT_CHECK(layout.private_base_bytes == 148);
+   VT_RT_CHECK(layout.payload_base_bytes == 0);
+   VT_RT_CHECK(layout.region_size_bytes == 0);
+   VT_RT_CHECK(layout.private_base_bytes == 0);
    VT_RT_CHECK(layout.payload_size_bytes == 0);
-   VT_RT_CHECK(layout.total_size_bytes == 148);
+   VT_RT_CHECK(layout.total_size_bytes == 0);
 
    struct vt_nir_rt_abi_layout direct_barycentrics =
       vt_nir_rt_default_abi_layout();
@@ -135,15 +135,15 @@ main(void)
       &direct_barycentrics, 0, true));
    /* Triangle barycentrics are read from the committed hit record. */
    VT_RT_CHECK(direct_barycentrics.hit_attrib_size_bytes == 0);
-   VT_RT_CHECK(direct_barycentrics.payload_base_bytes == 148);
+   VT_RT_CHECK(direct_barycentrics.payload_base_bytes == 0);
 
    struct vt_nir_rt_abi_layout custom_hit_attribs =
       vt_nir_rt_default_abi_layout();
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_hit_attrib_size(
       &custom_hit_attribs, 12, false));
    VT_RT_CHECK(custom_hit_attribs.payload_base_bytes ==
-               VT_RT_ABI_PAYLOAD_BASE_BYTES_FOR_HIT_ATTRIB_SIZE(12));
-   VT_RT_CHECK(custom_hit_attribs.payload_base_bytes == 148 + 2 * 12);
+               VT_RT_PDS_PAYLOAD_BASE_BYTES(12));
+   VT_RT_CHECK(custom_hit_attribs.payload_base_bytes == 2 * 12);
 
    uint32_t payload_size = UINT32_MAX;
    VT_RT_CHECK(vt_nir_rt_compute_pipeline_payload_size(NULL, 0,
@@ -174,10 +174,10 @@ main(void)
    struct vt_nir_rt_config config = vt_nir_rt_default_config();
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].base_bytes == 0);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes == 148);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes == 228);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].private_base_bytes == 228);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_CLOSEST_HIT].total_size_bytes == 228);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes == 0);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].total_size_bytes == 80);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].private_base_bytes == 80);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_CLOSEST_HIT].total_size_bytes == 80);
 
    nir_shader *report_shader = build_report_shader();
    VT_RT_CHECK(vt_nir_lower_rt_control(report_shader, &config));
@@ -192,17 +192,17 @@ main(void)
     * report and running any-hit is deliberately tested later in the pipeline,
    * outside this stack-free ABI test. */
    VT_RT_CHECK(count_store_to_const_addr(
-      two_report_shader, nir_intrinsic_ventus_rt_hit_record_store,
-      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_META0 * sizeof(uint32_t)) > 0);
+      two_report_shader, nir_intrinsic_ventus_rt_local_store,
+      VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 +
+      VT_RT_HIT_RECORD_META0) > 0);
    VT_RT_CHECK(count_store_to_const_addr(
-      two_report_shader, nir_intrinsic_ventus_rt_hit_record_store,
-      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_HIT_T * sizeof(uint32_t)) > 0);
+      two_report_shader, nir_intrinsic_ventus_rt_local_store,
+      VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 +
+      VT_RT_HIT_RECORD_HIT_T) > 0);
    VT_RT_CHECK(count_store_to_const_addr(
-      two_report_shader, nir_intrinsic_ventus_rt_hit_kind_store,
-      VT_RT_ABI_CANDIDATE_HIT_RECORD_BASE_BYTES +
-      VT_RT_HIT_RECORD_HIT_KIND * sizeof(uint32_t)) > 0);
+      two_report_shader, nir_intrinsic_ventus_rt_local_store,
+      VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 +
+      VT_RT_HIT_RECORD_HIT_KIND) > 0);
 
    nir_shader *deferred_report_shader = build_report_shader();
    struct vt_nir_rt_config deferred_config = config;
@@ -224,17 +224,17 @@ main(void)
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 1));
    /* Depth zero uses the active payload slot in region_size_bytes. */
    VT_RT_CHECK(layout.payload_spill_size_bytes == 0);
-   VT_RT_CHECK(layout.private_base_bytes == 260);
+   VT_RT_CHECK(layout.private_base_bytes == 112);
    VT_RT_CHECK(vt_nir_rt_abi_layout_set_recursion_depth(&layout, 2));
    VT_RT_CHECK(!vt_nir_rt_abi_layout_set_recursion_depth(
       &layout, VT_RT_TRACE_META1_MAX_RECURSION_DEPTH + 1));
-   VT_RT_CHECK(layout.committed_hit_attrib_base_bytes == 180);
-   VT_RT_CHECK(layout.payload_spill_base_bytes == 260);
+   VT_RT_CHECK(layout.committed_hit_attrib_base_bytes == 32);
+   VT_RT_CHECK(layout.payload_spill_base_bytes == 112);
    VT_RT_CHECK(layout.payload_spill_size_bytes == 48);
-   VT_RT_CHECK(layout.private_base_bytes == 308);
-   VT_RT_CHECK(layout.total_size_bytes == 308);
+   VT_RT_CHECK(layout.private_base_bytes == 160);
+   VT_RT_CHECK(layout.total_size_bytes == 160);
    vt_nir_rt_config_apply_abi_layout(&config, &layout);
-   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 260);
+   VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_base_bytes == 112);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].payload_spill_size_bytes == 48);
    VT_RT_CHECK(config.scratchpad[VT_RT_LAYOUT_RAYGEN].max_ray_recursion_depth == 2);
 
@@ -252,8 +252,8 @@ main(void)
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(store_shader));
 
-   printf("PASS vt_rt_abi_v10_layout header=148 payload_union=48 "
-          "payload_sparse=80 private_base=308\n");
+   printf("PASS vt_rt_abi_v10_layout rt_local_header=148 payload_union=48 "
+          "payload_sparse=80 pds_private_base=160\n");
 
    ralloc_free(raygen);
    ralloc_free(closest_hit);

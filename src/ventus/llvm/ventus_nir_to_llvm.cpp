@@ -358,40 +358,41 @@ private:
       return builder.CreateIntToPtr(asAddress(addr), PointerType::get(context, 5));
    }
 
-   Value *rtScratchBase()
+   Value *loadRtLocal(Value *field)
    {
-      /* Current backend lowers addrspace(5) constants relative to the private
-       * frame base. RT scratch offsets are PDS-logical absolute offsets, so use
-       * a runtime zero until RT slot load/store gets a first-class lowering.
-       */
-      Value *a = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
-      Value *b = dispatchArgI32Volatile(VT_NIR_RT_DISPATCH_ARG_WIDTH);
-      return builder.CreateSub(a, b);
+      Function *fn = declare("llvm.riscv.ventus.rt.local.load.i32", i32, {i32});
+      return builder.CreateCall(fn, {asInt32(field)});
    }
 
-   Value *rtScratchPtr(Value *offset)
+   void storeRtLocal(Value *stored, Value *field)
    {
-      return privatePtr(builder.CreateAdd(rtScratchBase(), asInt32(offset)));
+      Function *fn = declare("llvm.riscv.ventus.rt.local.store.i32",
+                             Type::getVoidTy(context), {i32, i32});
+      builder.CreateCall(fn, {asInt32(stored), asInt32(field)});
    }
 
-   Value *rtSlotOffset(enum vt_rt_slot_word word)
+   Value *loadRtSlot(Type *type, Value *byteOffset)
    {
-      return ConstantInt::get(i32,
-                              word * VT_RT_ABI_WORD_BYTES);
-   }
-
-   Value *loadI32PrivateSlot(enum vt_rt_slot_word word)
-   {
-      LoadInst *load = builder.CreateLoad(i32, rtScratchPtr(rtSlotOffset(word)));
+      LoadInst *load = builder.CreateLoad(type, privatePtr(asInt32(byteOffset)));
       load->setAlignment(Align(4));
       return load;
    }
 
+   void storeRtSlot(Value *stored, Value *byteOffset)
+   {
+      StoreInst *store = builder.CreateStore(asInt32(stored),
+                                              privatePtr(asInt32(byteOffset)));
+      store->setAlignment(Align(4));
+   }
+
+   Value *loadI32PrivateSlot(enum vt_rt_slot_word word)
+   {
+      return loadRtLocal(ConstantInt::get(i32, word));
+   }
+
    void storeI32PrivateSlot(enum vt_rt_slot_word word, Value *value)
    {
-      StoreInst *store =
-         builder.CreateStore(asInt32(value), rtScratchPtr(rtSlotOffset(word)));
-      store->setAlignment(Align(4));
+      storeRtLocal(value, ConstantInt::get(i32, word));
    }
 
    Value *loadI32Global(Value *base, uint32_t offset)
@@ -1989,41 +1990,33 @@ private:
          return nullptr;
       }
       case nir_intrinsic_ventus_rt_load_slot: {
-         return builder.CreateLoad(defType(&intrin->def),
-                                   rtScratchPtr(value(intrin->src[0])));
+         return loadRtSlot(defType(&intrin->def), value(intrin->src[0]));
       }
       case nir_intrinsic_ventus_rt_store_slot: {
-         builder.CreateStore(asInt32(value(intrin->src[0])),
-                             rtScratchPtr(value(intrin->src[1])));
+         storeRtSlot(value(intrin->src[0]), value(intrin->src[1]));
          return nullptr;
       }
+      case nir_intrinsic_ventus_rt_local_load:
+         return loadRtLocal(value(intrin->src[0]));
+      case nir_intrinsic_ventus_rt_local_store:
+         storeRtLocal(value(intrin->src[0]), value(intrin->src[1]));
+         return nullptr;
       case nir_intrinsic_ventus_rt_hit_record_load: {
-         LoadInst *load = builder.CreateLoad(defType(&intrin->def),
-                                             rtScratchPtr(value(intrin->src[0])));
-         load->setAlignment(Align(4));
-         return load;
+         return loadRtSlot(defType(&intrin->def), value(intrin->src[0]));
       }
       case nir_intrinsic_ventus_rt_hit_record_store: {
-         StoreInst *store = builder.CreateStore(
-            asInt32(value(intrin->src[0])),
-            rtScratchPtr(value(intrin->src[1])));
-         store->setAlignment(Align(4));
+         storeRtSlot(value(intrin->src[0]), value(intrin->src[1]));
          return nullptr;
       }
       case nir_intrinsic_ventus_rt_hit_kind_load: {
-         LoadInst *load = builder.CreateLoad(defType(&intrin->def),
-                                             rtScratchPtr(value(intrin->src[0])));
-         load->setAlignment(Align(4));
-         return load;
+         return loadRtSlot(defType(&intrin->def), value(intrin->src[0]));
       }
       case nir_intrinsic_ventus_rt_hit_kind_store: {
-         StoreInst *store = builder.CreateStore(
-            asInt32(value(intrin->src[0])), rtScratchPtr(value(intrin->src[1])));
-         store->setAlignment(Align(4));
+         storeRtSlot(value(intrin->src[0]), value(intrin->src[1]));
          return nullptr;
       }
-      case nir_intrinsic_ventus_rt_pds_warp_tid_base:
-         return callI32Intrinsic("llvm.riscv.ventus.rt.pds.warp.tid.base");
+      case nir_intrinsic_ventus_rt_warp_first_tid:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.warp.first.tid");
       case nir_intrinsic_ventus_rt_traverse: {
          if (noopRtIntrinsics)
             return ConstantInt::get(i32, 0);

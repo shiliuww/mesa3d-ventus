@@ -105,17 +105,11 @@ handoff_trace_payload_frame(nir_builder *b,
    }
 }
 
-/* A nested monolithic trace overwrites RTcore's sole hardware-visible PDS
- * context.  Preserve only parent words read after the child returns.  The
+/* A nested monolithic trace overwrites RTcore's sole hardware-visible RT Local
+ * context.  Preserve only parent fields read after the child returns.  The
  * saved values are NIR SSA defs, not another PDS frame: a later nested trace
  * gets its own defs at its own call site and the register allocator decides
  * whether any value must spill. */
-enum pds_context_addr {
-   PDS_CONTEXT_ADDR_WORD,
-   PDS_CONTEXT_ADDR_OUTSIDE,
-   PDS_CONTEXT_ADDR_UNKNOWN,
-};
-
 static bool
 const_u32(nir_def *def, uint32_t *value)
 {
@@ -127,72 +121,31 @@ const_u32(nir_def *def, uint32_t *value)
    return true;
 }
 
-/* The ABI generates payload addresses as
- *   payload_base + word * 4 + active_level * payload_size.
- * The dynamic addend cannot alias the fixed RTcore context.  Other dynamic
- * PDS addresses are conservatively treated as aliases of every context word.
- */
-static enum pds_context_addr
-classify_pds_context_addr(nir_def *addr, uint32_t context_size,
-                          uint32_t *word)
-{
-   uint32_t value;
-   if (const_u32(addr, &value)) {
-      if (value >= context_size || value % VT_RT_ABI_WORD_BYTES)
-         return PDS_CONTEXT_ADDR_OUTSIDE;
-      *word = value / VT_RT_ABI_WORD_BYTES;
-      return PDS_CONTEXT_ADDR_WORD;
-   }
-
-   nir_instr *instr = nir_def_instr(addr);
-   if (instr->type != nir_instr_type_alu)
-      return PDS_CONTEXT_ADDR_UNKNOWN;
-
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   if (alu->op != nir_op_iadd)
-      return PDS_CONTEXT_ADDR_UNKNOWN;
-
-   for (unsigned i = 0; i < 2; i++) {
-      if (!const_u32(alu->src[i].src.ssa, &value))
-         continue;
-      if (value >= context_size)
-         return PDS_CONTEXT_ADDR_OUTSIDE;
-   }
-
-   return PDS_CONTEXT_ADDR_UNKNOWN;
-}
-
 static void
-transfer_pds_context_liveness(const nir_instr *instr, BITSET_WORD *live,
+transfer_rt_local_context_liveness(const nir_instr *instr, BITSET_WORD *live,
                               uint32_t context_words)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return;
 
    const nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_load_slot;
-   const bool store = intrin->intrinsic == nir_intrinsic_ventus_rt_store_slot;
+   const bool load = intrin->intrinsic == nir_intrinsic_ventus_rt_local_load;
+   const bool store = intrin->intrinsic == nir_intrinsic_ventus_rt_local_store;
    if (!load && !store)
       return;
 
    const unsigned addr_src = load ? 0 : 1;
    uint32_t word = 0;
-   switch (classify_pds_context_addr(intrin->src[addr_src].ssa,
-                                     context_words * VT_RT_ABI_WORD_BYTES,
-                                     &word)) {
-   case PDS_CONTEXT_ADDR_WORD:
+   if (const_u32(intrin->src[addr_src].ssa, &word) && word < context_words) {
       if (load)
          BITSET_SET(live, word);
       else
          BITSET_CLEAR(live, word);
-      break;
-   case PDS_CONTEXT_ADDR_UNKNOWN:
-      /* An indirect PDS access may read or overwrite any ABI word. */
+   } else {
+      /* Local fields must be immediate, but remain conservative for malformed
+       * IR until NIR validation rejects it. */
       for (uint32_t i = 0; i < context_words; i++)
          BITSET_SET(live, i);
-      break;
-   case PDS_CONTEXT_ADDR_OUTSIDE:
-      break;
    }
 }
 
@@ -211,16 +164,14 @@ union_successor_liveness(nir_block *block, const BITSET_WORD *live_in,
    }
 }
 
-/* Return the PDS words live immediately after trace.  Backward CFG dataflow
+/* Return the RT Local fields live immediately after trace.  Backward CFG dataflow
  * makes branch paths union naturally and reaches a fixed point for loops. */
 static BITSET_WORD *
 nested_parent_live_words(nir_function_impl *impl, nir_intrinsic_instr *trace,
                          const struct vt_nir_rt_config *config)
 {
    nir_index_blocks(impl);
-   const uint32_t context_words =
-      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
-      VT_RT_ABI_WORD_BYTES;
+   const uint32_t context_words = VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT;
    const unsigned bitset_words = BITSET_WORDS(context_words);
    /* end_block has index num_blocks and is a successor of exit blocks. */
    BITSET_WORD *live_in = calloc((impl->num_blocks + 1) * bitset_words,
@@ -236,7 +187,7 @@ nested_parent_live_words(nir_function_impl *impl, nir_intrinsic_instr *trace,
       nir_foreach_block_reverse(block, impl) {
          union_successor_liveness(block, live_in, bitset_words, next);
          nir_foreach_instr_reverse(instr, block)
-            transfer_pds_context_liveness(instr, next, context_words);
+            transfer_rt_local_context_liveness(instr, next, context_words);
 
          BITSET_WORD *block_live = live_in + block->index * bitset_words;
          if (memcmp(block_live, next, bitset_words * sizeof(*next))) {
@@ -255,7 +206,7 @@ nested_parent_live_words(nir_function_impl *impl, nir_intrinsic_instr *trace,
          found_trace = true;
          break;
       }
-      transfer_pds_context_liveness(instr, live, context_words);
+      transfer_rt_local_context_liveness(instr, live, context_words);
    }
    assert(found_trace);
 
@@ -274,18 +225,15 @@ static nir_def **
 save_nested_parent_context(nir_builder *b, const struct vt_nir_rt_config *config,
                            const BITSET_WORD *live)
 {
-   const uint32_t context_words =
-      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
-      VT_RT_ABI_WORD_BYTES;
+   const uint32_t context_words = VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT;
    nir_def **saved = calloc(context_words, sizeof(*saved));
    assert(saved);
 
    for (uint32_t word = 0; word < context_words; word++) {
       if (!BITSET_TEST(live, word))
          continue;
-      saved[word] = nir_ventus_rt_load_slot(
-         b, 1, 32, vt_nir_scratchpad_addr(
-            b, config, VT_RT_LAYOUT_RAYGEN, word * VT_RT_ABI_WORD_BYTES));
+      saved[word] = nir_ventus_rt_local_load(b, 1,
+                                             nir_imm_int(b, word));
    }
 
    return saved;
@@ -298,9 +246,7 @@ debug_nested_parent_live_words(const struct vt_nir_rt_config *config,
    if (!getenv("VT_NIR_DEBUG_PDS_LIVENESS"))
       return;
 
-   const uint32_t context_words =
-      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
-      VT_RT_ABI_WORD_BYTES;
+   const uint32_t context_words = VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT;
    fprintf(stderr, "ventus: nested parent PDS live words:");
    for (uint32_t word = 0; word < context_words; word++) {
       if (BITSET_TEST(live, word))
@@ -313,15 +259,11 @@ static void
 restore_nested_parent_context(nir_builder *b, const struct vt_nir_rt_config *config,
                               nir_def **saved)
 {
-   const uint32_t context_words =
-      config->scratchpad[VT_RT_LAYOUT_RAYGEN].payload_base_bytes /
-      VT_RT_ABI_WORD_BYTES;
+   const uint32_t context_words = VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT;
    for (uint32_t word = 0; word < context_words; word++) {
       if (!saved[word])
          continue;
-      nir_ventus_rt_store_slot(
-         b, saved[word], vt_nir_scratchpad_addr(
-            b, config, VT_RT_LAYOUT_RAYGEN, word * VT_RT_ABI_WORD_BYTES));
+      nir_ventus_rt_local_store(b, saved[word], nir_imm_int(b, word));
    }
 }
 
@@ -674,12 +616,8 @@ lower_global_root_continuation(nir_builder *b, nir_intrinsic_instr *intrin,
       .tmax = intrin->src[9].ssa,
       .payload = intrin->src[10].ssa,
    };
-   const struct vt_nir_scratchpad_layout *raygen =
-      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
-   nir_def *ray_state = vt_nir_scratchpad_addr(
-      b, config, VT_RT_LAYOUT_RAYGEN, raygen->ray_state_base_bytes);
-   nir_def *status = nir_ventus_rt_load_slot(
-      b, 1, 32, nir_iadd_imm(b, ray_state, VT_RT_SLOT_STATUS * 4));
+   nir_def *status = nir_ventus_rt_local_load(
+      b, 1, nir_imm_int(b, VT_RT_SLOT_STATUS));
    nir_def *record_ptr = vt_nir_build_hit_shader_record_ptr(
       b, config, params.sbt_base, params.sbt_stride_bytes,
       params.sbt_offset, params.sbt_stride,
@@ -769,16 +707,14 @@ insert_raygen_release_before_returns(nir_shader *shader,
             continue;
 
          b.cursor = nir_before_instr(instr);
-         nir_def *slot_base =
-            vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
-                                   config->scratchpad[VT_RT_LAYOUT_RAYGEN].ray_state_base_bytes);
          /* release is the terminal session fence: its LLVM intrinsic is a
           * read-write side effect, so this status store remains visible
           * before the RTcore release acknowledgement.  It releases only
           * RTcore-owned state; the PDS frame and compiler spills stay live. */
-         nir_ventus_rt_store_slot(
-            &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
-         nir_ventus_rt_release(&b, nir_ventus_rt_pds_warp_tid_base(&b));
+         nir_ventus_rt_local_store(
+            &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED),
+            nir_imm_int(&b, VT_RT_SLOT_STATUS));
+         nir_ventus_rt_release(&b, nir_ventus_rt_warp_first_tid(&b));
          progress = true;
       }
    }
@@ -790,16 +726,14 @@ insert_raygen_release_before_returns(nir_shader *shader,
    nir_block *last_block = nir_impl_last_block(impl);
    if (last_block && !nir_block_ends_in_jump(last_block)) {
       b.cursor = nir_after_block_before_jump(last_block);
-      nir_def *slot_base =
-         vt_nir_scratchpad_addr(&b, config, VT_RT_LAYOUT_RAYGEN,
-                                config->scratchpad[VT_RT_LAYOUT_RAYGEN].ray_state_base_bytes);
       /* release is the terminal session fence: its LLVM intrinsic is a
        * read-write side effect, so this status store remains visible before
        * the RTcore release acknowledgement.  It releases only RTcore-owned
        * state; the PDS frame and compiler spills stay live. */
-      nir_ventus_rt_store_slot(
-         &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED), slot_base);
-      nir_ventus_rt_release(&b, nir_ventus_rt_pds_warp_tid_base(&b));
+      nir_ventus_rt_local_store(
+         &b, nir_imm_int(&b, VT_RT_SLOT_STATUS_TERMINATED),
+         nir_imm_int(&b, VT_RT_SLOT_STATUS));
+      nir_ventus_rt_release(&b, nir_ventus_rt_warp_first_tid(&b));
       progress = true;
    }
 

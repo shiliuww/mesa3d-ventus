@@ -151,6 +151,22 @@ vt_nir_hit_kind_addr(nir_builder *b,
       : vt_nir_hit_record_addr(b, config, layout, VT_RT_HIT_RECORD_HIT_KIND);
 }
 
+static nir_def *
+vt_nir_load_rt_local_field(nir_builder *b, uint32_t field)
+{
+   assert(field < VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT);
+   return nir_ventus_rt_local_load(b, 1, nir_imm_int(b, field));
+}
+
+static void
+vt_nir_store_rt_local_field(nir_builder *b, uint32_t field, nir_def *value)
+{
+   assert(field < VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT);
+   if (value->bit_size == 1)
+      value = nir_b2i32(b, value);
+   nir_ventus_rt_local_store(b, value, nir_imm_int(b, field));
+}
+
 nir_def *
 vt_nir_control_addr(nir_builder *b,
                     const struct vt_nir_rt_config *config,
@@ -192,8 +208,10 @@ vt_nir_load_hit_record_word(nir_builder *b,
                             uint32_t bit_size)
 {
    assert(bit_size == 32);
-   return nir_ventus_rt_hit_record_load(
-      b, 1, vt_nir_hit_record_addr(b, config, layout, word));
+   (void)config;
+   (void)layout;
+   return vt_nir_load_rt_local_field(
+      b, VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES / 4 + word);
 }
 
 void
@@ -203,10 +221,10 @@ vt_nir_store_hit_record_word(nir_builder *b,
                              enum vt_rt_hit_record_word word,
                              nir_def *value)
 {
-   if (value->bit_size == 1)
-      value = nir_b2i32(b, value);
-   nir_ventus_rt_hit_record_store(
-      b, value, vt_nir_hit_record_addr(b, config, layout, word));
+   (void)config;
+   (void)layout;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES / 4 + word, value);
 }
 
 nir_def *
@@ -217,8 +235,10 @@ vt_nir_load_candidate_hit_record_word(nir_builder *b,
                                       uint32_t bit_size)
 {
    assert(bit_size == 32);
-   return nir_ventus_rt_hit_record_load(
-      b, 1, vt_nir_candidate_hit_record_addr(b, config, layout, word));
+   (void)config;
+   (void)layout;
+   return vt_nir_load_rt_local_field(
+      b, VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 + word);
 }
 
 void
@@ -228,10 +248,10 @@ vt_nir_store_candidate_hit_record_word(nir_builder *b,
                                        enum vt_rt_hit_record_word word,
                                        nir_def *value)
 {
-   if (value->bit_size == 1)
-      value = nir_b2i32(b, value);
-   nir_ventus_rt_hit_record_store(
-      b, value, vt_nir_candidate_hit_record_addr(b, config, layout, word));
+   (void)config;
+   (void)layout;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 + word, value);
 }
 
 nir_def *
@@ -239,8 +259,11 @@ vt_nir_load_committed_hit_kind(nir_builder *b,
                                const struct vt_nir_rt_config *config,
                                enum vt_rt_shader_layout layout)
 {
-   return nir_ventus_rt_hit_kind_load(
-      b, 1, vt_nir_hit_kind_addr(b, config, layout, false));
+   (void)config;
+   (void)layout;
+   return vt_nir_load_rt_local_field(
+      b, VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES / 4 +
+         VT_RT_HIT_RECORD_HIT_KIND);
 }
 
 void
@@ -249,10 +272,11 @@ vt_nir_store_committed_hit_kind(nir_builder *b,
                                 enum vt_rt_shader_layout layout,
                                 nir_def *value)
 {
-   if (value->bit_size == 1)
-      value = nir_b2i32(b, value);
-   nir_ventus_rt_hit_kind_store(
-      b, value, vt_nir_hit_kind_addr(b, config, layout, false));
+   (void)config;
+   (void)layout;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES / 4 +
+         VT_RT_HIT_RECORD_HIT_KIND, value);
 }
 
 nir_def *
@@ -260,8 +284,11 @@ vt_nir_load_candidate_hit_kind(
    nir_builder *b, const struct vt_nir_rt_config *config,
    enum vt_rt_shader_layout layout)
 {
-   return nir_ventus_rt_hit_kind_load(
-      b, 1, vt_nir_hit_kind_addr(b, config, layout, true));
+   (void)config;
+   (void)layout;
+   return vt_nir_load_rt_local_field(
+      b, VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 +
+         VT_RT_HIT_RECORD_HIT_KIND);
 }
 
 void
@@ -269,10 +296,11 @@ vt_nir_store_candidate_hit_kind(
    nir_builder *b, const struct vt_nir_rt_config *config,
    enum vt_rt_shader_layout layout, nir_def *value)
 {
-   if (value->bit_size == 1)
-      value = nir_b2i32(b, value);
-   nir_ventus_rt_hit_kind_store(
-      b, value, vt_nir_hit_kind_addr(b, config, layout, true));
+   (void)config;
+   (void)layout;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 +
+         VT_RT_HIT_RECORD_HIT_KIND, value);
 }
 
 static nir_def *
@@ -358,8 +386,11 @@ vt_nir_load_control_word(nir_builder *b,
                          enum vt_rt_control_word word,
                          uint32_t bit_size)
 {
-   return nir_ventus_rt_load_slot(b, 1, bit_size,
-                                  vt_nir_control_addr(b, config, layout, word));
+   assert(bit_size == 32);
+   (void)config;
+   (void)layout;
+   return vt_nir_load_rt_local_field(
+      b, VT_RT_LOCAL_CONTROL_BASE_BYTES / 4 + word);
 }
 
 void
@@ -369,16 +400,10 @@ vt_nir_store_control_word(nir_builder *b,
                           enum vt_rt_control_word word,
                           nir_def *value)
 {
-   if (value->bit_size == 1)
-      value = nir_b2i32(b, value);
-   nir_ventus_rt_store_slot(b, value,
-                            vt_nir_control_addr(b, config, layout, word));
-}
-
-static nir_def *
-slot_offset(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
-{
-   return nir_iadd_imm(b, base, word * 4);
+   (void)config;
+   (void)layout;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_CONTROL_BASE_BYTES / 4 + word, value);
 }
 
 static void
@@ -386,14 +411,9 @@ store_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word, nir_def *va
 {
    if (!value)
       return;
-
-   nir_ventus_rt_store_slot(b, value, slot_offset(b, base, word));
-}
-
-static nir_def *
-load_word(nir_builder *b, nir_def *base, enum vt_rt_slot_word word)
-{
-   return nir_ventus_rt_load_slot(b, 1, 32, slot_offset(b, base, word));
+   (void)base;
+   vt_nir_store_rt_local_field(
+      b, VT_RT_LOCAL_RAY_STATE_BASE_BYTES / 4 + word, value);
 }
 
 static void
@@ -474,11 +494,7 @@ vt_nir_build_traversal(nir_builder *b,
       config = &default_config;
    }
 
-   const struct vt_nir_scratchpad_layout *raygen =
-      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
-   nir_def *base =
-      vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
-                             raygen->ray_state_base_bytes);
+   nir_def *base = NULL;
 
    store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
    vt_nir_store_trace_meta_field(
@@ -509,11 +525,11 @@ vt_nir_build_traversal(nir_builder *b,
    store_word(b, base, VT_RT_SLOT_STATUS,
               nir_imm_int(b, VT_RT_SLOT_STATUS_TRACE_REQUEST));
 
-   /* The fixed PDS header itself starts at byte offset zero.  The RTcore
-    * receives the issuing warp's PDS thread-ID base and derives the selected
-    * lane's header as pdsWarpTidBase + lane. */
-   nir_def *pds_warp_tid_base = nir_ventus_rt_pds_warp_tid_base(b);
-   nir_def *status = nir_ventus_rt_traverse(b, pds_warp_tid_base);
+   /* The fixed header is RT Local SRAM.  The RTcore receives the issuing
+    * warp's first thread ID and derives its SRAM bank; lane selects the
+    * corresponding word within that bank. */
+   nir_def *warp_first_tid = nir_ventus_rt_warp_first_tid(b);
+   nir_def *status = nir_ventus_rt_traverse(b, warp_first_tid);
    nir_def *candidate_non_opaque_triangle =
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
    nir_def *candidate_procedural_aabb =

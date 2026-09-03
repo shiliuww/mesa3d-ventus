@@ -199,8 +199,8 @@ main(int argc, char **argv)
    VT_RT_CHECK(after.trace_ray == 0);
    VT_RT_CHECK(vt_rt_count_loops(raygen) >= 1);
    VT_RT_CHECK(after.jump_break >= 1);
-   VT_RT_CHECK(after.ventus_rt_store_slot > 0);
-   VT_RT_CHECK(after.ventus_rt_load_slot > 0);
+   VT_RT_CHECK(after.ventus_rt_local_store > 0);
+   VT_RT_CHECK(after.ventus_rt_local_load > 0);
 
    write_ppm(argv[2], 160, 96);
    printf("PASS vt_rt_image_smoke spirv_input=1 image=%s width=160 height=96\n",
