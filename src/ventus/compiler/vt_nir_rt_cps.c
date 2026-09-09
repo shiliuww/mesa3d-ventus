@@ -58,6 +58,23 @@ store_current_continuation_frame(nir_builder *b, nir_def *frame)
       .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME, .range_base = 4);
 }
 
+static void
+initialize_root_continuation_return(nir_builder *b)
+{
+   /* A resident PDS slot can retain bytes from a previous workgroup.  Root
+    * raygen must therefore establish fresh S2 contents before any trace-depth
+    * check.  Zero is the canonical root frame, parent depth, NONE return
+    * control, and empty compiler callback staging value. */
+   for (uint32_t offset = 0; offset < VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES -
+                                      VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS;
+        offset += sizeof(uint32_t)) {
+      nir_ventus_rt_store_pds_field(
+         b, nir_imm_int(b, 0),
+         .base = VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME,
+         .range_base = offset);
+   }
+}
+
 void
 vt_nir_rt_v5_load_stack_cursor(nir_builder *b,
                                struct vt_nir_rt_stack_cursor *cursor)
@@ -153,7 +170,7 @@ vt_nir_rt_v5_initialize_continuation_stack(
    stack_store_u32(&b, base, VT_NIR_RT_STACK_CALLABLE_CAPACITY_OFFSET,
                    nir_imm_int(&b, callable_capacity));
 
-   store_current_continuation_frame(&b, nir_imm_int64(&b, 0));
+   initialize_root_continuation_return(&b);
    return true;
 }
 

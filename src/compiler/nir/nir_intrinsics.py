@@ -780,6 +780,11 @@ intrinsic("ventus_rt_dispatch_index", dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_traverse_v5", src_comp=[1, 1], dest_comp=1,
           bit_sizes=[32])
+# Compiler-internal completion frontier.  Its result is bit-identical to the
+# compact traversal result, but the target lowers it to a real VGPR read with
+# an ordering chain before completion-sensitive memory and RT operations.
+intrinsic("ventus_rt_completion_frontier", src_comp=[1], dest_comp=1,
+          bit_sizes=[32])
 intrinsic("ventus_rt_hot_pds_address", src_comp=[1], dest_comp=1,
           bit_sizes=[32])
 # Compiler-private PDS carriers.  BASE identifies the semantic field and

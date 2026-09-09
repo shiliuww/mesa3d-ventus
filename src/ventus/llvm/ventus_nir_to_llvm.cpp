@@ -554,7 +554,8 @@ private:
       switch ((enum vt_nir_rt_pds_field)nir_intrinsic_base(intrin)) {
       case VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME:
          base = VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS;
-         size = sizeof(uint64_t);
+         size = VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES -
+                VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS;
          break;
       case VT_NIR_RT_PDS_FIELD_CALL_DATA:
          base = VENTUS_RT_V5_PDS_CALL_DATA_BASE;
@@ -2218,6 +2219,13 @@ private:
                                    {asInt32(value(intrin->src[0])),
                                     rtCanonicalSharedAddress(
                                        value(intrin->src[1]))});
+      }
+      case nir_intrinsic_ventus_rt_completion_frontier: {
+         if (noopRtIntrinsics)
+            return asInt32(value(intrin->src[0]));
+         Function *fn = declare(
+            "llvm.riscv.ventus.rt.completion.frontier.i32", i32, {i32});
+         return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
       }
       case nir_intrinsic_ventus_rt_hot_pds_address: {
          return rtHotPdsAddress(value(intrin->src[0]));

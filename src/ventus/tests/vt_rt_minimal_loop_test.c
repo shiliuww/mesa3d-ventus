@@ -395,6 +395,35 @@ count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
 }
 
 static unsigned
+count_zero_pds_field_store(nir_shader *shader,
+                           enum vt_nir_rt_pds_field field,
+                           uint32_t range_base)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic !=
+                   nir_intrinsic_ventus_rt_store_pds_field ||
+                nir_intrinsic_base(intrin) != field ||
+                nir_intrinsic_range_base(intrin) != range_base ||
+                !nir_src_is_const(intrin->src[0]) ||
+                nir_src_as_uint(intrin->src[0]) != 0)
+               continue;
+            count++;
+         }
+      }
+   }
+
+   return count;
+}
+
+static unsigned
 count_alu_op(nir_shader *shader, nir_op op)
 {
    unsigned count = 0;
@@ -866,8 +895,18 @@ main(int argc, char **argv)
       resident_raygen, &resident_config));
    VT_RT_CHECK(vt_nir_materialize_rt_resident_continuations(
       resident_raygen, &resident_config, &resident));
+   VT_RT_CHECK(vt_nir_rt_v5_initialize_continuation_stack(
+      resident_raygen, resident.state_frame_stride_bytes, 2, 0));
    nir_validate_shader(resident_raygen,
                        "after Ventus resident V5 continuation lowering");
+   for (uint32_t offset = 0; offset < VENTUS_RT_V5_TRACE_PDS_PREFIX_BYTES -
+                                      VENTUS_RT_V5_PDS_CONTINUATION_FRAME_ADDRESS;
+        offset += sizeof(uint32_t)) {
+      VT_RT_CHECK(count_zero_pds_field_store(
+                     resident_raygen,
+                     VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME,
+                     offset) == 1);
+   }
    VT_RT_CHECK(count_intrinsic(resident_raygen,
                                nir_intrinsic_trace_ray) == 0);
    VT_RT_CHECK(count_intrinsic(resident_raygen,
@@ -886,6 +925,9 @@ main(int argc, char **argv)
                                nir_intrinsic_store_scratch) == 0);
    VT_RT_CHECK(count_intrinsic(resident_raygen,
                                nir_intrinsic_ventus_rt_traverse_v5) == 2);
+   VT_RT_CHECK(count_intrinsic(
+                  resident_raygen,
+                  nir_intrinsic_ventus_rt_completion_frontier) == 1);
    VT_RT_CHECK(count_intrinsic(resident_raygen,
                                nir_intrinsic_ventus_rt_release) == 1);
 

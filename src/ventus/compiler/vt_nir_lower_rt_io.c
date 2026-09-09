@@ -399,7 +399,8 @@ lower_trace_ray_v5(nir_builder *b, nir_intrinsic_instr *intrin,
 
    nir_loop *loop = nir_push_loop(b);
    {
-      nir_def *compact_result = nir_load_var(b, compact_result_var);
+      nir_def *compact_result = nir_ventus_rt_completion_frontier(
+         b, nir_load_var(b, compact_result_var));
       nir_def *reason = nir_iand_imm(b, compact_result, 0xff);
       nir_def *valid = nir_ine_imm(
          b, nir_iand_imm(b, compact_result, VENTUS_RT_V5_COMPLETION_VALID), 0);

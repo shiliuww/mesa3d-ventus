@@ -39,7 +39,9 @@ enum vt_rt_shader_layout {
 
 /* Compiler-private semantic identities for PDS accesses that must remain
  * recognizable through continuation planning.  RANGE_BASE on the associated
- * NIR intrinsic is a byte offset within the selected field. */
+ * NIR intrinsic is a byte offset within the selected field.  The continuation
+ * identity covers the complete V5 S2 continuation/return sector so its root
+ * initialization, including reserved words, stays explicit in NIR. */
 enum vt_nir_rt_pds_field {
    VT_NIR_RT_PDS_FIELD_CONTINUATION_FRAME = 0,
    VT_NIR_RT_PDS_FIELD_CALL_DATA = 1,
