@@ -283,6 +283,36 @@ count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
    return count;
 }
 
+static bool
+has_candidate_commit(nir_shader *shader, unsigned word)
+{
+   NIR_PASS(_, shader, nir_opt_constant_folding);
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+            if (store->intrinsic != nir_intrinsic_ventus_rt_local_store ||
+                !nir_src_is_const(store->src[1]) ||
+                nir_src_as_uint(store->src[1]) !=
+                   VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES / 4 + word)
+               continue;
+            nir_instr *def = nir_def_instr(store->src[0].ssa);
+            if (def->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(def);
+            if (load->intrinsic == nir_intrinsic_ventus_rt_local_load &&
+                nir_src_is_const(load->src[0]) &&
+                nir_src_as_uint(load->src[0]) ==
+                   VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES / 4 + word)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static unsigned
 count_variables(nir_shader *shader, nir_variable_mode mode)
 {
@@ -346,6 +376,10 @@ main(int argc, char **argv)
       nested_liveness_baseline, &nested_liveness_baseline_config));
    VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(nested_liveness_raygen,
                                               &nested_liveness_config));
+   for (unsigned word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
+      VT_RT_CHECK(has_candidate_commit(nested_liveness_baseline, word));
+      VT_RT_CHECK(has_candidate_commit(nested_liveness_raygen, word));
+   }
    NIR_PASS(_, nested_liveness_raygen, nir_opt_constant_folding);
    const uint32_t committed_meta0 = VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES;
    const uint32_t committed_meta1 = committed_meta0 + sizeof(uint32_t);
@@ -391,15 +425,18 @@ main(int argc, char **argv)
    VT_RT_CHECK(abi.candidate_hit_record_size_bytes == 36);
    VT_RT_CHECK(abi.hit_record_size_bytes == 36);
    VT_RT_CHECK(abi.ray_state_size_bytes == VT_RT_SLOT_WORD_COUNT * 4);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 60);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 64);
-   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 68);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 11);
-   VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 37);
-   VT_RT_CHECK(abi.control_base_bytes == 72);
+   VT_RT_CHECK(VT_RT_SLOT_INV_X * 4 == 52);
+   VT_RT_CHECK(VT_RT_SLOT_INV_Y * 4 == 56);
+   VT_RT_CHECK(VT_RT_SLOT_INV_Z * 4 == 60);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 72);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 76);
+   VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 80);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 12);
+   VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 40);
+   VT_RT_CHECK(abi.control_base_bytes == 84);
    VT_RT_CHECK(abi.control_size_bytes == 4);
-   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 76);
-   VT_RT_CHECK(abi.hit_record_base_bytes == 112);
+   VT_RT_CHECK(abi.candidate_hit_record_base_bytes == 88);
+   VT_RT_CHECK(abi.hit_record_base_bytes == 124);
    VT_RT_CHECK(abi.hit_attrib_base_bytes == 0);
    VT_RT_CHECK(abi.committed_hit_attrib_base_bytes == 0);
    VT_RT_CHECK(abi.payload_base_bytes == 0);
@@ -482,6 +519,10 @@ main(int argc, char **argv)
 
    bool progress = vt_nir_lower_rt_io_monolithic(raygen, &config);
    VT_RT_CHECK(progress);
+   /* Even the no-any-hit callback accepts a nonopaque triangle in shader
+    * code. RTcore resume consumes committed HitT; it cannot do this copy. */
+   for (unsigned word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++)
+      VT_RT_CHECK(has_candidate_commit(raygen, word));
 
    progress = vt_nir_lower_rt_abi(raygen, &config);
    VT_RT_CHECK(!progress || raygen->scratch_size >= 0);
@@ -499,6 +540,12 @@ main(int argc, char **argv)
    VT_RT_CHECK(vt_rt_releases_follow_terminated_store(raygen));
    VT_RT_CHECK(after.ventus_rt_local_store > 0);
    VT_RT_CHECK(after.ventus_rt_local_load > 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      raygen, VT_RT_SLOT_INV_X * VT_RT_ABI_WORD_BYTES) > 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      raygen, VT_RT_SLOT_INV_Y * VT_RT_ABI_WORD_BYTES) > 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      raygen, VT_RT_SLOT_INV_Z * VT_RT_ABI_WORD_BYTES) > 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
 
    VT_RT_CHECK(count_intrinsic(push_constant_probe,

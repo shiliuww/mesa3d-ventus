@@ -118,39 +118,6 @@ vt_nir_payload_addr(nir_builder *b,
                    depth_offset);
 }
 
-nir_def *
-vt_nir_hit_record_addr(nir_builder *b,
-                       const struct vt_nir_rt_config *config,
-                       enum vt_rt_shader_layout layout,
-                       enum vt_rt_hit_record_word word)
-{
-   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return vt_nir_scratchpad_addr(b, config, layout,
-                                 sp->hit_record_base_bytes + word * 4);
-}
-
-nir_def *
-vt_nir_candidate_hit_record_addr(nir_builder *b,
-                                 const struct vt_nir_rt_config *config,
-                                 enum vt_rt_shader_layout layout,
-                                 enum vt_rt_hit_record_word word)
-{
-   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return vt_nir_scratchpad_addr(b, config, layout,
-                                 sp->candidate_hit_record_base_bytes + word * 4);
-}
-
-static nir_def *
-vt_nir_hit_kind_addr(nir_builder *b,
-                     const struct vt_nir_rt_config *config,
-                     enum vt_rt_shader_layout layout, bool candidate)
-{
-   return candidate
-      ? vt_nir_candidate_hit_record_addr(b, config, layout,
-                                         VT_RT_HIT_RECORD_HIT_KIND)
-      : vt_nir_hit_record_addr(b, config, layout, VT_RT_HIT_RECORD_HIT_KIND);
-}
-
 static nir_def *
 vt_nir_load_rt_local_field(nir_builder *b, uint32_t field)
 {
@@ -165,17 +132,6 @@ vt_nir_store_rt_local_field(nir_builder *b, uint32_t field, nir_def *value)
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
    nir_ventus_rt_local_store(b, value, nir_imm_int(b, field));
-}
-
-nir_def *
-vt_nir_control_addr(nir_builder *b,
-                    const struct vt_nir_rt_config *config,
-                    enum vt_rt_shader_layout layout,
-                    enum vt_rt_control_word word)
-{
-   const struct vt_nir_scratchpad_layout *sp = &config->scratchpad[layout];
-   return vt_nir_scratchpad_addr(b, config, layout,
-                                 sp->control_base_bytes + word * 4);
 }
 
 nir_def *
@@ -520,6 +476,10 @@ vt_nir_build_traversal(nir_builder *b,
    store_word(b, base, VT_RT_SLOT_TMIN, params->tmin);
    store_vec3(b, base, VT_RT_SLOT_DIRECTION_X, params->direction);
    store_word(b, base, VT_RT_SLOT_TMAX, params->tmax);
+   /* Keep reciprocal generation in shader ISA so the existing SFU performs
+    * all three lanes before the RTcore consumes this ray state. */
+   nir_def *inv_direction = nir_frcp(b, params->direction);
+   store_vec3(b, base, VT_RT_SLOT_INV_X, inv_direction);
    store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
    /* Publish the slot only after its complete ray header is visible. */
    store_word(b, base, VT_RT_SLOT_STATUS,

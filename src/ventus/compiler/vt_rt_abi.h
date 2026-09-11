@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 11
+#define VT_RT_ABI_VERSION 12
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -32,13 +32,18 @@ enum vt_rt_slot_word {
    VT_RT_SLOT_DIRECTION_Y = 10,
    VT_RT_SLOT_DIRECTION_Z = 11,
    VT_RT_SLOT_TMAX = 12,
+   /* Precomputed IEEE-754 reciprocals, produced by the shader SFU before
+    * the trace request is published. */
+   VT_RT_SLOT_INV_X = 13,
+   VT_RT_SLOT_INV_Y = 14,
+   VT_RT_SLOT_INV_Z = 15,
    /* Retained for the legacy wavefront mailbox path. */
-   VT_RT_SLOT_PAYLOAD_PTR_LO = 13,
-   VT_RT_SLOT_PAYLOAD_PTR_HI = 14,
-   VT_RT_SLOT_LAUNCH_ID_X = 15,
-   VT_RT_SLOT_LAUNCH_ID_Y = 16,
-   VT_RT_SLOT_LAUNCH_ID_Z = 17,
-   VT_RT_SLOT_WORD_COUNT = 18,
+   VT_RT_SLOT_PAYLOAD_PTR_LO = 16,
+   VT_RT_SLOT_PAYLOAD_PTR_HI = 17,
+   VT_RT_SLOT_LAUNCH_ID_X = 18,
+   VT_RT_SLOT_LAUNCH_ID_Y = 19,
+   VT_RT_SLOT_LAUNCH_ID_Z = 20,
+   VT_RT_SLOT_WORD_COUNT = 21,
 };
 
 /* trace_meta0 packs bounded TraceRay inputs. */
@@ -128,15 +133,15 @@ enum vt_rt_callback_decision {
 #define VT_RT_LOCAL_CONTROL_SIZE_BYTES \
    (VT_RT_CONTROL_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 
-#define VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES 76
+#define VT_RT_LOCAL_CANDIDATE_HIT_RECORD_BASE_BYTES 88
 #define VT_RT_LOCAL_CANDIDATE_HIT_RECORD_SIZE_BYTES 36
 
-#define VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES 112
+#define VT_RT_LOCAL_COMMITTED_HIT_RECORD_BASE_BYTES 124
 #define VT_RT_LOCAL_COMMITTED_HIT_RECORD_SIZE_BYTES 36
 
-/* Fixed RT Local SRAM header.  Its 37 logical words are field-major across a
+/* Fixed RT Local SRAM header.  Its 40 logical words are field-major across a
  * 32-lane warp; PDS has no physical representation for this region. */
-#define VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT 37
+#define VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT 40
 #define VT_RT_LOCAL_HEADER_SIZE_BYTES \
    (VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT * VT_RT_ABI_WORD_BYTES)
 

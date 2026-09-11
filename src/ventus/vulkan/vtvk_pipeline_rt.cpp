@@ -1916,6 +1916,12 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
                                "raygen before vt_nir_lower_rt_io_monolithic");
          NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_io_monolithic,
                   &rt_io_config);
+         // The monolithic trace lowering materializes the RT-local fields,
+         // but does not establish their raygen lifecycle state.  In
+         // particular trace_meta1 is a packed word: its first miss-index
+         // update must preserve a defined active-level (zero), rather than
+         // read-modify-write an uninitialized RT-local SRAM word.
+         NIR_PASS(_, cb_shaders.raygen, vt_nir_lower_rt_abi, &rt_io_config);
          vtvk_rt_log_nir_stats(cb_shaders.raygen,
                                "raygen after vt_nir_lower_rt_io_monolithic");
       }
@@ -1946,7 +1952,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
       vt_nir_pipeline_compute_scratch(monolithic_shaders, 1,
                                       &pipeline->scratch_info);
    /* Keep PDS large enough for RT attributes, linked payload frames and their
-    * fixed-depth spills.  The fixed 148-byte header is RT Local SRAM. */
+    * fixed-depth spills.  The fixed 160-byte header is RT Local SRAM. */
    pipeline->per_lane_scratch_size =
       MAX2(pipeline->per_lane_scratch_size, rt_abi.private_base_bytes);
    pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;

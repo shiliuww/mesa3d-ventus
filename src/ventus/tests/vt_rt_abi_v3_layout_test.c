@@ -120,8 +120,8 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    struct vt_nir_rt_abi_layout layout = vt_nir_rt_default_abi_layout();
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 11);
-   VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 37);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 12);
+   VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 40);
    VT_RT_CHECK(layout.ray_state_base_bytes == 0);
    VT_RT_CHECK(layout.payload_base_bytes == 0);
    VT_RT_CHECK(layout.region_size_bytes == 0);
@@ -252,7 +252,7 @@ main(void)
    VT_RT_CHECK(count_store_slots(store_shader) == 4);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(store_shader));
 
-   printf("PASS vt_rt_abi_v10_layout rt_local_header=148 payload_union=48 "
+   printf("PASS vt_rt_abi_v12_layout rt_local_header=160 payload_union=48 "
           "payload_sparse=80 pds_private_base=160\n");
 
    ralloc_free(raygen);

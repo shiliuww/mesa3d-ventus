@@ -72,6 +72,8 @@ trace_payload_binding(const nir_intrinsic_instr *intrin,
    return true;
 }
 
+/* This is a scalar PDS ABI offset passed to the RTcore as PAYLOAD_PTR, not an
+ * AS5/private-memory pointer consumed by the ordinary LLVM stack lowering. */
 static nir_def *
 trace_payload_frame_addr(nir_builder *b,
                          const struct vt_nir_rt_config *config,
@@ -92,16 +94,40 @@ static void
 handoff_trace_payload_frame(nir_builder *b,
                             const struct vt_nir_rt_config *config,
                             const struct trace_payload_binding *binding,
-                            uint32_t source_depth, uint32_t destination_depth)
+                            int32_t source_level_delta,
+                            int32_t destination_level_delta)
 {
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   /*
+    * Do not form these frame pointers from compile-time AS5 constants.  The
+    * backend correctly interprets a constant AS5 pointer relative to TP (the
+    * ordinary private stack), whereas an RT payload lives at a PDS ABI offset.
+    * Keeping active_level in the address produces the normal per-lane PDS
+    * offset form used by the payload variable lowering.
+    */
+   nir_def *active_level = vt_nir_load_active_level(
+      b, config, VT_RT_LAYOUT_RAYGEN);
+   nir_def *source_level = source_level_delta ?
+      nir_iadd_imm(b, active_level, source_level_delta) : active_level;
+   nir_def *destination_level = destination_level_delta ?
+      nir_iadd_imm(b, active_level, destination_level_delta) : active_level;
+
    for (uint32_t offset = 0; offset < binding->size_bytes;
         offset += VT_RT_ABI_WORD_BYTES) {
+      const uint32_t frame_offset = binding->slot_offset + offset;
+      assert(frame_offset <= UINT32_MAX);
+      nir_def *source_addr = nir_iadd(
+         b, vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
+                                   frame_offset),
+         nir_imul_imm(b, source_level, payload_frame_size(sp)));
+      nir_def *destination_addr = nir_iadd(
+         b, vt_nir_scratchpad_addr(b, config, VT_RT_LAYOUT_RAYGEN,
+                                   frame_offset),
+         nir_imul_imm(b, destination_level, payload_frame_size(sp)));
       nir_def *value = nir_ventus_rt_load_slot(
-         b, 1, 32, trace_payload_frame_addr(b, config, binding,
-                                             source_depth, offset));
-      nir_ventus_rt_store_slot(
-         b, value, trace_payload_frame_addr(b, config, binding,
-                                             destination_depth, offset));
+         b, 1, 32, source_addr);
+      nir_ventus_rt_store_slot(b, value, destination_addr);
    }
 }
 
@@ -342,6 +368,31 @@ ignore_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
    store_raygen_callback_decision(b, config, VT_RT_CALLBACK_IGNORE);
 }
 
+/* Callback commits are shader-owned. RTcore resume only consumes the
+ * committed distance on ACCEPT and must not copy a retained candidate. */
+static void
+commit_accepted_candidate(nir_builder *b, const struct vt_nir_rt_config *config)
+{
+   nir_push_if(b, nir_ieq_imm(b, load_raygen_callback_decision(b, config),
+                              VT_RT_CALLBACK_ACCEPT));
+   for (unsigned word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
+      vt_nir_store_hit_record_word(
+         b, config, VT_RT_LAYOUT_RAYGEN, word,
+         vt_nir_load_candidate_hit_record_word(
+            b, config, VT_RT_LAYOUT_RAYGEN, word, 32));
+   }
+   const struct vt_nir_scratchpad_layout *sp =
+      &config->scratchpad[VT_RT_LAYOUT_RAYGEN];
+   for (unsigned offset = 0; offset < sp->hit_attrib_size_bytes; offset += 4) {
+      nir_def *source = vt_nir_scratchpad_addr(
+         b, config, VT_RT_LAYOUT_RAYGEN, sp->hit_attrib_base_bytes + offset);
+      nir_def *destination = vt_nir_scratchpad_addr(
+         b, config, VT_RT_LAYOUT_RAYGEN, sp->committed_hit_attrib_base_bytes + offset);
+      nir_ventus_rt_store_slot(b, nir_ventus_rt_load_slot(b, 1, 32, source), destination);
+   }
+   nir_pop_if(b, NULL);
+}
+
 static void
 emit_trace_callbacks(nir_builder *b,
                      const struct vt_nir_rt_config *config,
@@ -363,6 +414,7 @@ emit_trace_callbacks(nir_builder *b,
    if (!has_callbacks) {
       nir_push_if(b, candidate_non_opaque);
       accept_candidate_hit(b, config);
+      commit_accepted_candidate(b, config);
       nir_push_else(b, NULL);
       nir_push_if(b, candidate_procedural);
       ignore_candidate_hit(b, config);
@@ -386,6 +438,7 @@ emit_trace_callbacks(nir_builder *b,
    accept_candidate_hit(b, config);
    if (config->emit_any_hit)
       config->emit_any_hit(b, params, result, config->callback_data);
+   commit_accepted_candidate(b, config);
    nir_push_else(b, NULL);
 
    nir_push_if(b, candidate_procedural);
@@ -412,6 +465,8 @@ emit_trace_callbacks(nir_builder *b,
       config->emit_any_hit(b, params, result, config->callback_data);
       nir_pop_if(b, NULL);
    }
+   if (!config->defer_intersection_reports)
+      commit_accepted_candidate(b, config);
 
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
@@ -482,8 +537,7 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
     * alloca participates in the ABI. */
    if (has_payload_binding && state->trace_depth > 0)
       handoff_trace_payload_frame(b, config, &payload_binding,
-                                  state->trace_depth - 1,
-                                  state->trace_depth);
+                                  -1, 0);
 
    bool skip_closest_hit =
       trace_ray_has_const_flag(intrin, VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT);
@@ -557,8 +611,7 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    if (has_payload_binding && state->trace_depth > 0)
       handoff_trace_payload_frame(b, config, &payload_binding,
-                                  state->trace_depth,
-                                  state->trace_depth - 1);
+                                  0, -1);
 
    if (saved_parent_context) {
       restore_nested_parent_context(b, config, saved_parent_context);

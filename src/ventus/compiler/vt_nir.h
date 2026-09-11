@@ -266,21 +266,6 @@ nir_def *vt_nir_payload_addr(nir_builder *b,
                              enum vt_rt_shader_layout layout,
                              enum vt_rt_payload_word word);
 
-nir_def *vt_nir_hit_record_addr(nir_builder *b,
-                                const struct vt_nir_rt_config *config,
-                                enum vt_rt_shader_layout layout,
-                                enum vt_rt_hit_record_word word);
-
-nir_def *vt_nir_candidate_hit_record_addr(nir_builder *b,
-                                          const struct vt_nir_rt_config *config,
-                                          enum vt_rt_shader_layout layout,
-                                          enum vt_rt_hit_record_word word);
-
-nir_def *vt_nir_control_addr(nir_builder *b,
-                             const struct vt_nir_rt_config *config,
-                             enum vt_rt_shader_layout layout,
-                             enum vt_rt_control_word word);
-
 nir_def *vt_nir_load_payload_word(nir_builder *b,
                                   const struct vt_nir_rt_config *config,
                                   enum vt_rt_shader_layout layout,

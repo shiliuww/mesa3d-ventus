@@ -373,11 +373,13 @@ vtvk_bridge_extract_elf_section(const std::vector<uint8_t> &bytes,
 
 static bool
 vtvk_bridge_read_kernel_resource(const char *kernel_path,
+                                 struct vtvk_ventus_kernel_resource_v3 *resource_out,
                                  uint64_t *pds_frame_bytes,
                                  std::string *error)
 {
    std::vector<uint8_t> bytes;
-   if (!kernel_path || !kernel_path[0] || !pds_frame_bytes || !error) {
+   if (!kernel_path || !kernel_path[0] || !resource_out ||
+       !pds_frame_bytes || !error) {
       if (error)
          *error = "invalid resource parse input";
       return false;
@@ -440,6 +442,7 @@ vtvk_bridge_read_kernel_resource(const char *kernel_path,
       *error = "Ventus PDS frame size overflows";
       return false;
    }
+   *resource_out = resource;
    *pds_frame_bytes = static_bytes + stack_bytes;
    return true;
 }
@@ -1044,6 +1047,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const bool legacy_cps_mirror = false;
    uint64_t pds_size = 0;
    uint64_t pds_per_lane = 0;
+   uint64_t sgpr_per_wf = 0;
+   uint64_t vgpr_per_wf = 0;
    uint64_t continuation_size = 0;
    const bool rv64 = vtvk_bridge_env_enabled("VENTUS_VK_RT_RV64");
    std::vector<uint8_t> metadata(rv64 ? (size_t)VENTUS_KNL64_MAX_SIZE :
@@ -1068,8 +1073,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if (!wavefront_global) {
       std::string resource_error;
       uint64_t llvm_private_frame = 0;
+      struct vtvk_ventus_kernel_resource_v3 llvm_resource = {};
       if (kernel_path && kernel_path[0]) {
-         if (!vtvk_bridge_read_kernel_resource(kernel_path,
+         if (!vtvk_bridge_read_kernel_resource(kernel_path, &llvm_resource,
                                                 &llvm_private_frame,
                                                 &resource_error)) {
             /* Older delivered ELFs contain the object-local .ventus.resobj
@@ -1084,7 +1090,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          } else {
             /* RT Local SRAM owns the fixed header.  The resource metadata
              * describes the complete PDS payload/private frame after register
-             * allocation, so there is no fixed-header PDS prefix. */
+            * allocation, so there is no fixed-header PDS prefix. */
+            sgpr_per_wf = llvm_resource.sgpr_used;
+            vgpr_per_wf = llvm_resource.vgpr_used;
          }
       } else {
          /* No launch follows this path, but retain staging-only diagnostics
@@ -1316,11 +1324,16 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL64_LC_SIZE_X, &local_size_x,
              sizeof(local_size_x));
+      /* crt0 seeds LLVM's per-lane private-memory base from this field. */
+      memcpy(metadata.data() + VENTUS_KNL64_PDS_SIZE_PER_THREAD,
+             &pds_per_lane, sizeof(pds_per_lane));
    } else {
       uint32_t entry32 = 0;
       uint32_t args32 = 0;
+      uint32_t pds32 = 0;
       if (!vtvk_bridge_checked_u32("kernel entry", kernel_entry, &entry32) ||
-          !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32))
+          !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32) ||
+          !vtvk_bridge_checked_u32("per-lane PDS", pds_per_lane, &pds32))
          goto out;
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
@@ -1333,6 +1346,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       memcpy(metadata.data() + VENTUS_KNL32_GL_SIZE_Z, &one, sizeof(one));
       memcpy(metadata.data() + VENTUS_KNL32_LC_SIZE_X, &local_size_x,
              sizeof(local_size_x));
+      /* Keep the crt0 ABI in sync with kernel.pdsSize passed to the driver. */
+      memcpy(metadata.data() + VENTUS_KNL32_PDS_SIZE_PER_THREAD, &pds32,
+             sizeof(pds32));
    }
 
    if (!vtvk_driver_alloc_copy(&driver, metadata.data(), metadata.size(),
@@ -1534,6 +1550,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.metaDataBaseAddr = metadata_dev_addr;
    kernel.ldsSize = 0;
    kernel.pdsSize = wavefront_global ? 0 : pds_per_lane;
+   kernel.sgprUsage = sgpr_per_wf;
+   kernel.vgprUsage = vgpr_per_wf;
    kernel.pdsBaseAddr = pds_dev_addr;
    kernel.num_thread_global[0] = raygen_global_x;
    kernel.num_thread_global[1] = 1;
