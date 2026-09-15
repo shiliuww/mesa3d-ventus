@@ -10,8 +10,33 @@ vtvk_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
+ventus_embree_prefix = get_option('ventus_embree_prefix')
+if ventus_embree_prefix != '' and not get_option('ventus_embree').disabled()
+  # Intel's binary SDK includes the TBB runtime but not TBB's CMake package.
+  # Linking its shared library directly avoids requiring unrelated TBB headers.
+  dep_ventus_embree = declare_dependency(
+    dependencies : cpp.find_library('embree3', dirs : [ventus_embree_prefix / 'lib']),
+    include_directories : include_directories(ventus_embree_prefix / 'include'))
+else
+  dep_ventus_embree = dependency('embree', method : 'cmake',
+    version : ['>=3.13', '<4'], modules : ['embree'],
+    required : get_option('ventus_embree'))
+endif
+ventus_bvh_cpp_args = []
+if dep_ventus_embree.found()
+  ventus_bvh_cpp_args += '-DHAVE_VENTUS_EMBREE'
+endif
+
+vtvk_bvh_test = executable('vtvk_bvh_builder_test',
+  ['vtvk_bvh_builder.cpp', '../tests/vtvk_bvh_builder_test.cpp'],
+  dependencies : [dep_ventus_embree],
+  cpp_args : ventus_bvh_cpp_args,
+  build_by_default : false)
+test('vtvk_bvh_builder', vtvk_bvh_test, suite : ['ventus'])
+
 libvtvk_files = files(
   'vtvk_acceleration_structure.cpp',
+  'vtvk_bvh_builder.cpp',
   'vtvk_cmd_buffer.c',
   'vtvk_descriptors.c',
   'vtvk_device.c',
@@ -39,6 +64,7 @@ libvulkan_ventus = shared_library(
     inc_vulkan_util,
   ],
   dependencies : [
+    dep_ventus_embree,
     dep_m,
     dep_thread,
     dep_llvm,
@@ -53,7 +79,7 @@ libvulkan_ventus = shared_library(
     soong_compat_c_args,
     '-DVENTUS_RT_RESIDENT_WARPS=' + get_option('ventus_rt_resident_warps').to_string(),
   ],
-  cpp_args : [
+  cpp_args : ventus_bvh_cpp_args + [
     '-DVENTUS_RT_RESIDENT_WARPS=' + get_option('ventus_rt_resident_warps').to_string(),
   ],
   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],

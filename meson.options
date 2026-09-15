@@ -9,6 +9,18 @@ option(
 )
 
 option(
+  'ventus_embree',
+  type : 'feature',
+  value : 'auto',
+  description : 'Embree 3 host BVH builder for the Ventus Vulkan driver',
+)
+option(
+  'ventus_embree_prefix',
+  type : 'string',
+  value : '',
+  description : 'Optional Embree 3 binary SDK prefix (include/ and lib/)',
+)
+option(
   'ventus_rt_resident_warps',
   type : 'integer',
   value : 8,

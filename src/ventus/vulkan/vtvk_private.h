@@ -113,6 +113,8 @@ struct vtvk_acceleration_structure {
    void *data;
    uint8_t *snapshot;
    VkDeviceSize snapshot_size;
+   /* Host metadata only; not part of the serialized VTAS ABI. */
+   uint32_t bvh_stack_required;
 };
 
 struct vtvk_descriptor_binding_info {

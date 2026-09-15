@@ -6,22 +6,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 #include "util/log.h"
 #include "vk_command_buffer.h"
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 #include "ventus/common/ventus_rt_bvh.h"
+#include "vtvk_bvh_builder.h"
 
-struct vtvk_aabb {
-   float min[3];
-   float max[3];
-};
-
-struct vtvk_build_node {
-   uint32_t ref;
-   struct vtvk_aabb bounds;
-};
 static std::vector<struct vtvk_acceleration_structure *> vtvk_as_registry;
 
 static void *
@@ -202,15 +195,16 @@ vtvk_next_node_offset(uint32_t *cursor, uint32_t size)
 static uint64_t
 vtvk_internal_box_count(uint64_t leaf_count)
 {
-   uint64_t total = 0;
-   uint64_t level_count = leaf_count;
+   /* Any tree with at least two children per internal node. Also bounds
+    * the legacy bottom-up four-way tree (including its unary tail nodes). */
+   return leaf_count ? leaf_count - 1 : 0;
+}
 
-   while (level_count > 1) {
-      level_count = (level_count + 3) / 4;
-      total += level_count;
-   }
-
-   return total;
+static uint64_t
+vtvk_bvh_max_size(uint64_t count, uint64_t leaf_size)
+{
+   return VENTUS_AS_HEADER_SIZE + count * leaf_size +
+          vtvk_internal_box_count(count) * VENTUS_AS_BOX4_NODE_SIZE + 256;
 }
 
 static uint32_t
@@ -274,10 +268,12 @@ vtvk_build_box_tree(uint8_t *dst, uint32_t *cursor,
          std::vector<struct vtvk_build_node> children;
          struct vtvk_aabb bounds;
          vtvk_aabb_empty(&bounds);
+         uint32_t stack_required = 1;
 
          for (size_t j = i; j < leaves.size() && j < i + 4; j++) {
             children.push_back(leaves[j]);
             vtvk_aabb_include_aabb(&bounds, &leaves[j].bounds);
+            stack_required = std::max(stack_required, leaves[j].stack_required);
          }
 
          uint32_t offset = vtvk_next_node_offset(cursor, VENTUS_AS_BOX4_NODE_SIZE);
@@ -287,12 +283,85 @@ vtvk_build_box_tree(uint8_t *dst, uint32_t *cursor,
          next.push_back({
             ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_BOX4),
             bounds,
+            uint32_t(children.size() - 1) + stack_required,
          });
       }
       leaves = next;
    }
 
    return leaves[0];
+}
+
+static bool
+vtvk_build_tree(struct vtvk_acceleration_structure *as, uint32_t *cursor,
+                std::vector<vtvk_build_node> &leaves, uint32_t *node_count,
+                vtvk_build_node *root)
+{
+   const auto start = std::chrono::steady_clock::now();
+   const char *builder = getenv("VENTUS_VK_BVH_BUILDER");
+   if (!builder || !builder[0])
+      builder = vtvk_embree_available() ? "embree4" : "morton4";
+   uint8_t *dst = static_cast<uint8_t *>(as->data);
+   unsigned depth = 0, branching = 4;
+   unsigned fanout[5] = {};
+   bool repacked = false;
+   if (strcmp(builder, "morton4") == 0) {
+      vtvk_sort_leaves_morton(&leaves);
+      *root = vtvk_build_box_tree(dst, cursor, leaves, node_count);
+      for (size_t n = leaves.size(); n > 1; n = (n + 3) / 4)
+         depth++;
+   } else if (strcmp(builder, "embree4") == 0) {
+      vtvk_bvh_topology tree;
+      std::string error;
+      /* BLAS is built before its users are known. Reserve eight entries for
+       * TLAS siblings; the completed TLAS still checks the actual combination.
+       * This is a conservative build policy, not a promise that any TLAS fits. */
+      const uint32_t budget = as->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ? 24 : 32;
+      if (!vtvk_build_embree(leaves, &tree, &error, budget)) {
+         mesa_loge("ventus-vk: BVH build failed: %s", error.c_str());
+         return false;
+      }
+      std::vector<vtvk_build_node> serialized;
+      for (const auto &node : tree.nodes) {
+         if (!node.child_count) {
+            serialized.push_back(leaves[node.leaf]);
+            continue;
+         }
+         std::vector<vtvk_build_node> children;
+         for (unsigned i = 0; i < node.child_count; ++i)
+            children.push_back(serialized[node.children[i]]);
+         uint32_t offset = vtvk_next_node_offset(cursor, VENTUS_AS_BOX4_NODE_SIZE);
+         if (*cursor > as->size)
+            return false;
+         vtvk_write_box4(dst, offset, children);
+         (*node_count)++;
+         serialized.push_back({ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_BOX4),
+                               node.bounds, node.stack_required});
+      }
+      *root = serialized.back();
+      depth = tree.nodes.back().depth;
+      branching = tree.branching;
+      repacked = tree.stack_repacked;
+      std::copy(tree.fanout, tree.fanout + 5, fanout);
+   } else {
+      mesa_loge("ventus-vk: unknown VENTUS_VK_BVH_BUILDER=%s", builder);
+      return false;
+   }
+   if (root->stack_required > 32) {
+      mesa_loge("ventus-vk: %s combined traversal stack bound %u exceeds 32",
+                builder, root->stack_required);
+      return false;
+   }
+   as->bvh_stack_required = root->stack_required;
+   const auto elapsed = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+   mesa_logi("ventus-vk: BVH builder=%s embree=%s leaves=%zu nodes=%u "
+             "branching=%u repacked=%u fanout2=%u fanout3=%u fanout4=%u "
+             "depth=%u stack_bound=%u bytes=%u topology_ms=%.3f",
+             builder, vtvk_embree_version(), leaves.size(), *node_count,
+             branching, repacked, fanout[2], fanout[3], fanout[4],
+             depth, root->stack_required, *cursor, elapsed);
+   return true;
 }
 
 struct vtvk_acceleration_structure *
@@ -500,6 +569,12 @@ vtvk_build_blas(struct vtvk_device *device,
    if (!primitive_count)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
+   const uint64_t max_size = vtvk_bvh_max_size(primitive_count,
+      geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR ?
+      VENTUS_AS_AABB_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE);
+   if (max_size > as->size || max_size > UINT32_MAX)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
    uint8_t *dst = (uint8_t *)as->data;
    if (!dst)
       return vk_error(device, VK_ERROR_UNKNOWN);
@@ -547,9 +622,9 @@ vtvk_build_blas(struct vtvk_device *device,
          });
       }
 
-      vtvk_sort_leaves_morton(&leaves);
-      struct vtvk_build_node root =
-         vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+      struct vtvk_build_node root;
+      if (!vtvk_build_tree(as, &cursor, leaves, &node_count, &root))
+         return vk_error(device, VK_ERROR_UNKNOWN);
       vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
                         cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
                         &root.bounds);
@@ -632,9 +707,9 @@ vtvk_build_blas(struct vtvk_device *device,
       });
    }
 
-   vtvk_sort_leaves_morton(&leaves);
-   struct vtvk_build_node root =
-      vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+   struct vtvk_build_node root;
+   if (!vtvk_build_tree(as, &cursor, leaves, &node_count, &root))
+      return vk_error(device, VK_ERROR_UNKNOWN);
    vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
                      &root.bounds);
@@ -664,6 +739,11 @@ vtvk_build_tlas(struct vtvk_device *device,
    if (!instance_count)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
+   const uint64_t max_size = vtvk_bvh_max_size(instance_count,
+                                              VENTUS_AS_INSTANCE_NODE_SIZE);
+   if (max_size > as->size || max_size > UINT32_MAX)
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
    const VkAccelerationStructureGeometryInstancesDataKHR *instances =
       &geom->geometry.instances;
    if (instances->arrayOfPointers)
@@ -689,6 +769,9 @@ vtvk_build_tlas(struct vtvk_device *device,
       const VkAccelerationStructureInstanceKHR *inst = &instance_base[i];
       const uint8_t *blas = (const uint8_t *)(uintptr_t)inst->accelerationStructureReference;
       if (!blas || vtvk_load_u32(blas, VENTUS_AS_HEADER_MAGIC) != VENTUS_AS_MAGIC)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      const auto *blas_as = vtvk_find_as_by_address(inst->accelerationStructureReference);
+      if (!blas_as || !blas_as->bvh_stack_required)
          return vk_error(device, VK_ERROR_UNKNOWN);
 
       struct vtvk_aabb blas_bounds = vtvk_header_aabb(blas);
@@ -716,12 +799,13 @@ vtvk_build_tlas(struct vtvk_device *device,
       leaves.push_back({
          ventus_bvh_make_node_ref(offset, VENTUS_BVH_NODE_INSTANCE),
          bounds,
+         blas_as->bvh_stack_required,
       });
    }
 
-   vtvk_sort_leaves_morton(&leaves);
-   struct vtvk_build_node root =
-      vtvk_build_box_tree(dst, &cursor, leaves, &node_count);
+   struct vtvk_build_node root;
+   if (!vtvk_build_tree(as, &cursor, leaves, &node_count, &root))
+      return vk_error(device, VK_ERROR_UNKNOWN);
    vtvk_write_header(dst, VENTUS_AS_TYPE_TLAS, root.ref, node_count,
                      cursor - VENTUS_AS_HEADER_SIZE, 0, instance_count,
                      &root.bounds);
@@ -894,12 +978,10 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
                  VK_GEOMETRY_TYPE_AABBS_KHR) {
       leaf_size = VENTUS_AS_AABB_NODE_SIZE;
    }
-   uint64_t internal_count = vtvk_internal_box_count(primitive_count);
-   uint64_t internal_bytes = internal_count * VENTUS_AS_BOX4_NODE_SIZE;
    uint64_t primitive_bytes = primitive_count * leaf_size;
 
    pSizeInfo->accelerationStructureSize =
-      VENTUS_AS_HEADER_SIZE + primitive_bytes + internal_bytes + 256;
+      vtvk_bvh_max_size(primitive_count, leaf_size);
    pSizeInfo->updateScratchSize = 2048 + primitive_bytes;
    pSizeInfo->buildScratchSize = 4096 + primitive_bytes;
 }
