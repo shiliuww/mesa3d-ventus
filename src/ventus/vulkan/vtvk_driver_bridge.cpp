@@ -34,7 +34,14 @@ static_assert(VTVK_MAX_BOUND_DESCRIPTOR_SETS ==
 static constexpr uint64_t vtvk_rt_resident_warps =
    VENTUS_RT_RESIDENT_WARPS;
 static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
+/* Keep these ABI numbers local: the bridge deliberately does not link the
+ * driver headers, and resolves the C driver interface with dlsym(). */
+static constexpr uint64_t vtvk_driver_cap_max_cores = 0x1;
+static constexpr uint64_t vtvk_driver_cap_max_wg_slots = 0x8;
 static constexpr uint64_t vtvk_ventus_resource_alignment = 128;
+/* Register-file allocation is in complete rows of four banks, as in POCL.
+ * ELF usage remains an exact count; only launch allocations are padded. */
+static constexpr uint64_t vtvk_ventus_register_alignment = 4;
 static constexpr uint32_t vtvk_ventus_kernel_resource_version = 3;
 
 /* This is the wire format emitted by the Ventus LLVM backend in
@@ -154,6 +161,7 @@ struct vtvk_driver_api {
 
    int (*vt_dev_open)(void **device);
    int (*vt_dev_close)(void *device);
+   int (*vt_dev_caps)(void *device, uint64_t caps_id, uint64_t *value);
    int (*vt_buf_alloc)(void *device, uint64_t size, uint64_t *vaddr,
                        int buf_type, uint64_t task_id, uint64_t kernel_id);
    int (*vt_buf_free)(void *device, uint64_t size, uint64_t *vaddr,
@@ -239,11 +247,18 @@ vtvk_bridge_store_u64(uint8_t *base, uint32_t offset, uint64_t value)
    memcpy(base + offset, &value, sizeof(value));
 }
 
-static uint64_t
+static constexpr uint64_t
 vtvk_bridge_align_u64(uint64_t value, uint64_t alignment)
 {
    return (value + alignment - 1) & ~(alignment - 1);
 }
+
+static_assert(vtvk_bridge_align_u64(20, vtvk_ventus_register_alignment) == 20);
+static_assert(vtvk_bridge_align_u64(31, vtvk_ventus_register_alignment) == 32);
+static_assert(vtvk_bridge_align_u64(32, vtvk_ventus_register_alignment) == 32);
+static_assert(vtvk_bridge_align_u64(33, vtvk_ventus_register_alignment) == 36);
+static_assert(vtvk_bridge_align_u64(36, vtvk_ventus_register_alignment) == 36);
+static_assert(vtvk_bridge_align_u64(37, vtvk_ventus_register_alignment) == 40);
 
 static bool
 vtvk_bridge_require_rv32_range(const char *label, uint64_t addr, uint64_t size)
@@ -529,6 +544,10 @@ vtvk_driver_open(struct vtvk_driver_api *api)
       return false
    VTVK_RESOLVE(vt_dev_open);
    VTVK_RESOLVE(vt_dev_close);
+   /* Older bridge backends may not expose capabilities.  Direct-profile PDS
+    * allocation retains its configured fallback in that case. */
+   api->vt_dev_caps = (int (*)(void *, uint64_t, uint64_t *))
+      dlsym(api->lib, "vt_dev_caps");
    VTVK_RESOLVE(vt_buf_alloc);
    VTVK_RESOLVE(vt_buf_free);
    VTVK_RESOLVE(vt_copy_to_dev);
@@ -1035,8 +1054,6 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    uint64_t raygen_wg_x = DIV_ROUND_UP(raygen_invocation_count, 32);
    const uint64_t raygen_wg_y = 1;
    const uint64_t raygen_wg_z = 1;
-   uint64_t pds_resident_lanes =
-      vtvk_rt_resident_warps * vtvk_rt_lanes_per_warp;
    const bool staged_dispatch_profile =
       info->execution_profile == VK_VENTUS_RT_EXECUTION_PROFILE_STAGED_DISPATCH;
    /* The pipeline profile is the lower-path selector.  The ray-ref queue and
@@ -1046,6 +1063,31 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const bool legacy_wavefront = staged_dispatch_profile;
    const bool legacy_cps_mirror = false;
    uint64_t pds_size = 0;
+   uint64_t pds_resident_warps = vtvk_rt_resident_warps;
+   if (!wavefront_global && driver.vt_dev_caps) {
+      uint64_t num_cores = 0;
+      uint64_t wg_slots_per_core = 0;
+      if (driver.vt_dev_caps(driver.device, vtvk_driver_cap_max_cores,
+                             &num_cores) == 0 &&
+          driver.vt_dev_caps(driver.device, vtvk_driver_cap_max_wg_slots,
+                             &wg_slots_per_core) == 0 &&
+          num_cores && wg_slots_per_core &&
+          num_cores <= UINT64_MAX / wg_slots_per_core) {
+         pds_resident_warps = num_cores * wg_slots_per_core;
+      } else {
+         mesa_logw("ventus-vk: could not query total resident PDS slots; "
+                   "using configured fallback=%" PRIu64,
+                   pds_resident_warps);
+      }
+   }
+   if (pds_resident_warps > UINT64_MAX / vtvk_rt_lanes_per_warp) {
+      mesa_loge("ventus-vk: resident PDS lane count overflows");
+      vtvk_driver_close(&driver);
+      bridge_failed = true;
+      return false;
+   }
+   const uint64_t pds_resident_lanes =
+      pds_resident_warps * vtvk_rt_lanes_per_warp;
    uint64_t pds_per_lane = 0;
    uint64_t sgpr_per_wf = 0;
    uint64_t vgpr_per_wf = 0;
@@ -1091,8 +1133,18 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             /* RT Local SRAM owns the fixed header.  The resource metadata
              * describes the complete PDS payload/private frame after register
             * allocation, so there is no fixed-header PDS prefix. */
-            sgpr_per_wf = llvm_resource.sgpr_used;
-            vgpr_per_wf = llvm_resource.vgpr_used;
+            const uint64_t reg_alignment = vtvk_ventus_register_alignment;
+            if (llvm_resource.sgpr_used > UINT64_MAX - (reg_alignment - 1) ||
+                llvm_resource.vgpr_used > UINT64_MAX - (reg_alignment - 1)) {
+               mesa_loge("ventus-vk: register allocation alignment overflows");
+               vtvk_driver_close(&driver);
+               bridge_failed = true;
+               return false;
+            }
+            sgpr_per_wf = vtvk_bridge_align_u64(llvm_resource.sgpr_used,
+                                               reg_alignment);
+            vgpr_per_wf = vtvk_bridge_align_u64(llvm_resource.vgpr_used,
+                                               reg_alignment);
          }
       } else {
          /* No launch follows this path, but retain staging-only diagnostics
@@ -1560,7 +1612,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.num_thread_local[1] = 1;
    kernel.num_thread_local[2] = 1;
    kernel.kernel_name = "ventus_vk_raygen";
-   kernel.pdsResidentWgCount = vtvk_rt_resident_warps;
+   kernel.pdsResidentWgCount = pds_resident_warps;
 
    if (driver.vt_start(driver.device, &kernel, 0) != 0 ||
        driver.vt_ready_wait(driver.device, 60 * 60 * 1000) != 0) {
