@@ -1141,10 +1141,14 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                bridge_failed = true;
                return false;
             }
-            sgpr_per_wf = vtvk_bridge_align_u64(llvm_resource.sgpr_used,
-                                               reg_alignment);
-            vgpr_per_wf = vtvk_bridge_align_u64(llvm_resource.vgpr_used,
-                                               reg_alignment);
+            /* Resource metadata covers the compiled entry, while crt0 runs
+             * before it and uses x0..x31 plus v32 for the private-frame base.
+             * Include those registers before bank alignment, otherwise a
+             * small entry lets adjacent warps overwrite crt0 temporaries. */
+            sgpr_per_wf = vtvk_bridge_align_u64(
+               std::max<uint64_t>(llvm_resource.sgpr_used, 32), reg_alignment);
+            vgpr_per_wf = vtvk_bridge_align_u64(
+               std::max<uint64_t>(llvm_resource.vgpr_used, 33), reg_alignment);
          }
       } else {
          /* No launch follows this path, but retain staging-only diagnostics
