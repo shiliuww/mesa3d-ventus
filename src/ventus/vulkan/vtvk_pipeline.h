@@ -31,6 +31,7 @@
 
 struct vtvk_pipeline {
    struct vk_pipeline vk;
+   struct vtvk_pipeline_layout_data resource_layout;
 
    void *nir_mem_ctx;
    nir_shader **shaders;

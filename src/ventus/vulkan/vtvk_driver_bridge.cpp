@@ -4,6 +4,7 @@
  */
 
 #include "vtvk_driver_bridge.h"
+#include "vtvk_memory.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -884,13 +885,42 @@ vtvk_driver_sampled_format_supported(VkFormat format)
           format == VK_FORMAT_B8G8R8A8_UNORM;
 }
 
+struct vtvk_memory_upload {
+   uint64_t address;
+   bool writable;
+};
+
+using vtvk_memory_uploads = std::unordered_map<vtvk_memory *, vtvk_memory_upload>;
+
+static bool
+vtvk_driver_upload_memory(struct vtvk_driver_api *api, VkDeviceMemory handle,
+                          uint64_t offset, uint64_t size, bool writable,
+                          vtvk_memory_uploads *uploads, uint64_t *address)
+{
+   auto *memory = (struct vtvk_memory *)(uintptr_t)(uint64_t)handle;
+   if (!memory || !memory->map || offset > memory->size ||
+       size > memory->size - offset)
+      return false;
+   auto it = uploads->find(memory);
+   if (it == uploads->end()) {
+      vtvk_memory_upload upload = {};
+      if (!vtvk_driver_alloc_copy(api, memory->map, memory->size, &upload.address))
+         return false;
+      it = uploads->emplace(memory, upload).first;
+   }
+   it->second.writable |= writable;
+   *address = it->second.address + offset;
+   return true;
+}
+
 static bool
 vtvk_driver_upload_descriptor(
    struct vtvk_driver_api *api,
    const struct vtvk_rt_descriptor_source *src,
    struct vtvk_rt_descriptor_record *record,
    std::unordered_map<struct vtvk_acceleration_structure *,
-                      struct vtvk_driver_upload> *as_uploads)
+                      struct vtvk_driver_upload> *as_uploads,
+   vtvk_memory_uploads *memory_uploads)
 {
    memset(record, 0, sizeof(*record));
    record->type = src->type;
@@ -921,7 +951,10 @@ vtvk_driver_upload_descriptor(
       uint32_t stride = extent.width * bpp;
       uint64_t size = (uint64_t)stride * extent.height *
                       (extent.depth ? extent.depth : 1);
-      if (!host || !vtvk_driver_alloc_copy(api, host, size, &record->device_addr)) {
+      auto *image = (struct vtvk_image *)(uintptr_t)(uint64_t)src->image;
+      if (!host || !vtvk_driver_upload_memory(api, image->memory,
+           image->memory_offset, size, src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+           memory_uploads, &record->device_addr)) {
          mesa_loge("ventus-vk: failed to upload image descriptor binding=%u",
                    src->binding);
          return false;
@@ -957,15 +990,22 @@ vtvk_driver_upload_descriptor(
 
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
-      void *host = vtvk_buffer_host_ptr(src->buffer, src->offset, src->range);
-      if (!host || !vtvk_driver_alloc_copy(api, host, src->range,
-                                           &record->device_addr)) {
+      auto *buffer = (struct vtvk_buffer *)(uintptr_t)(uint64_t)src->buffer;
+      if (!buffer || src->offset > buffer->size)
+         return false;
+      uint64_t range = src->range == VK_WHOLE_SIZE ?
+         buffer->size - src->offset : src->range;
+      if (range > buffer->size - src->offset ||
+          !vtvk_driver_upload_memory(api, buffer->memory,
+             buffer->memory_offset + src->offset, range,
+             src->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             memory_uploads, &record->device_addr)) {
          mesa_loge("ventus-vk: failed to upload buffer descriptor binding=%u "
                    "range=%" PRIu64,
                    src->binding, (uint64_t)src->range);
          return false;
       }
-      record->byte_size = src->range;
+      record->byte_size = range;
       break;
    }
 
@@ -1011,6 +1051,9 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    std::unordered_map<struct vtvk_acceleration_structure *,
                       struct vtvk_driver_upload>
       uploads;
+   vtvk_memory_uploads memory_uploads;
+   void *dump_host = info->storage_image_data;
+   VkFormat dump_format = info->image_format;
    uint64_t tlas_dev_addr = 0;
    uint64_t image_dev_addr = 0;
    uint64_t camera_dev_addr = 0;
@@ -1225,7 +1268,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
             staged_state_buffer_found = true;
          if (!vtvk_driver_upload_descriptor(&driver, src,
                                             &descriptor_table[slot],
-                                            &uploads))
+                                            &uploads, &memory_uploads))
             goto out;
       }
 
@@ -1237,9 +1280,21 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          goto out;
       }
 
-      tlas_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 0)].device_addr;
-      image_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 1)].device_addr;
-      camera_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(0, 2)].device_addr;
+      /* The legacy dump is diagnostic only; application readback uses memory.
+       * Shader accesses always use their descriptor, never these ABI fields. */
+      for (uint32_t i = 0; i < info->descriptor_count; i++) {
+         const auto &src = info->descriptors[i];
+         if (src.type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            continue;
+         VkExtent3D extent;
+         dump_host = vtvk_image_host_ptr(src.image, &extent, &dump_format);
+         image_width = extent.width;
+         image_height = extent.height;
+         image_bpp = vtvk_bridge_format_bytes_per_pixel(dump_format);
+         image_bytes = (uint64_t)image_width * image_height * image_bpp;
+         image_dev_addr = descriptor_table[VT_NIR_RT_DESCRIPTOR_SLOT(src.set, src.binding)].device_addr;
+         break;
+      }
 
       if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
                                   descriptor_table.size() *
@@ -1248,7 +1303,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          mesa_loge("ventus-vk: driver bridge failed to upload descriptor table");
          goto out;
       }
-   } else {
+   } else if (info->tlas) {
       if (staged_dispatch_profile) {
          mesa_loge("ventus-vk: staged-dispatch requires a bound path-state storage buffer");
          goto out;
@@ -2140,23 +2195,30 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       }
    }
 
-   if (driver.vt_copy_from_dev(driver.device, image_dev_addr,
-                               info->storage_image_data, image_bytes, 0, 0) != 0) {
-      mesa_loge("ventus-vk: driver bridge failed to copy storage image back");
-      goto out;
+   for (const auto &entry : memory_uploads) {
+      if (entry.second.writable &&
+          driver.vt_copy_from_dev(driver.device, entry.second.address,
+                                  entry.first->map, entry.first->size, 0, 0) != 0) {
+         mesa_loge("ventus-vk: failed to read back writable memory");
+         goto out;
+      }
    }
+   if (info->storage_image_data && !info->descriptor_count &&
+       driver.vt_copy_from_dev(driver.device, image_dev_addr,
+                               info->storage_image_data, image_bytes, 0, 0) != 0)
+      goto out;
 
-   if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG") && image_bytes >= 16) {
+   if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG") && dump_host && image_bytes >= 16) {
       uint32_t pixels[4];
-      memcpy(pixels, info->storage_image_data, sizeof(pixels));
+      memcpy(pixels, dump_host, sizeof(pixels));
       mesa_logi("ventus-vk: driver bridge image probe pixels "
                 "%08x %08x %08x %08x",
                 pixels[0], pixels[1], pixels[2], pixels[3]);
    }
 
-   if (!vtvk_driver_dump_image_ppm(dump_image, info->storage_image_data,
-                                   image_width, image_height,
-                                   info->image_format))
+   if (dump_image && dump_host &&
+       !vtvk_driver_dump_image_ppm(dump_image, dump_host,
+                                   image_width, image_height, dump_format))
       goto out;
 
    mesa_logi("ventus-vk: driver bridge executed raygen kernel %s",

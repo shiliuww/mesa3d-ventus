@@ -98,69 +98,6 @@ bool export_node(const temporary_node *src,
    return true;
 }
 
-/* Recover wide nodes from the safe binary fallback. Expand the largest-area
- * internal child first, but reserve enough stack for every frontier subtree.
- * Recursion receives the residual budget, so local widening cannot overflow
- * an ancestor. This changes grouping only, never primitive membership. */
-void widen_node(const vtvk_bvh_topology &binary, unsigned index,
-                unsigned budget, vtvk_bvh_topology *wide)
-{
-   const auto &src = binary.nodes[index];
-   if (!src.child_count) {
-      wide->nodes.push_back(src);
-      return;
-   }
-   std::vector<unsigned> frontier(src.children, src.children + src.child_count);
-   while (frontier.size() < 4) {
-      int best = -1;
-      double best_area = -1;
-      for (size_t i = 0; i < frontier.size(); ++i) {
-         const auto &candidate = binary.nodes[frontier[i]];
-         if (!candidate.child_count)
-            continue;
-         unsigned max_stack = 0;
-         for (size_t j = 0; j < frontier.size(); ++j) {
-            if (i == j) {
-               for (unsigned c = 0; c < candidate.child_count; ++c)
-                  max_stack = std::max(max_stack,
-                     binary.nodes[candidate.children[c]].stack_required);
-            } else {
-               max_stack = std::max(max_stack, binary.nodes[frontier[j]].stack_required);
-            }
-         }
-         const unsigned new_count = frontier.size() - 1 + candidate.child_count;
-         if (new_count > 4 || new_count - 1 + max_stack > budget)
-            continue;
-         const auto &b = candidate.bounds;
-         double x = double(b.max[0]) - b.min[0];
-         double y = double(b.max[1]) - b.min[1];
-         double z = double(b.max[2]) - b.min[2];
-         double area = x*y + y*z + z*x;
-         if (area > best_area) {
-            best = i;
-            best_area = area;
-         }
-      }
-      if (best < 0)
-         break;
-      const auto &candidate = binary.nodes[frontier[best]];
-      frontier.erase(frontier.begin() + best);
-      frontier.insert(frontier.begin() + best, candidate.children,
-                      candidate.children + candidate.child_count);
-   }
-   vtvk_bvh_node node;
-   node.bounds = src.bounds;
-   node.child_count = frontier.size();
-   for (unsigned i = 0; i < node.child_count; ++i) {
-      widen_node(binary, frontier[i], budget - node.child_count + 1, wide);
-      node.children[i] = wide->nodes.size() - 1;
-      node.depth = std::max(node.depth, wide->nodes.back().depth + 1);
-      node.stack_required = std::max(node.stack_required,
-         node.child_count - 1 + wide->nodes.back().stack_required);
-   }
-   wide->fanout[node.child_count]++;
-   wide->nodes.push_back(node);
-}
 } // namespace
 #endif
 
@@ -193,7 +130,7 @@ bool vtvk_build_embree(const std::vector<vtvk_build_node> &leaves,
    return false;
 #else
    if (leaves.empty() || leaves.size() > UINT32_MAX / 2 ||
-       !stack_budget || stack_budget > 32) {
+       !stack_budget || stack_budget > VENTUS_BVH_TRAVERSAL_STACK_BUDGET) {
       *error = "unsupported primitive count";
       return false;
    }
@@ -221,8 +158,9 @@ bool vtvk_build_embree(const std::vector<vtvk_build_node> &leaves,
       return false;
    }
    bool success = false;
-   /* Try a narrower SAH tree if deferred siblings exceed the hardware stack. */
-   for (unsigned branching : {4u, 2u}) {
+   /* Keep the Box4 build policy; overflow is an explicit build failure. */
+   do {
+      const unsigned branching = 4;
       *tree = {};
       tree->branching = branching;
       RTCBVH bvh = rtcNewBVH(device);
@@ -256,18 +194,13 @@ bool vtvk_build_embree(const std::vector<vtvk_build_node> &leaves,
          break;
       }
       if (tree->nodes.back().stack_required <= stack_budget) {
-         if (branching == 2) {
-            vtvk_bvh_topology wide;
-            wide.branching = 2;
-            wide.stack_repacked = true;
-            widen_node(*tree, tree->nodes.size() - 1, stack_budget, &wide);
-            *tree = std::move(wide);
-         }
          success = true;
          break;
       }
-      *error = "traversal stack bound exceeds budget, including binary fallback";
-   }
+      *error = "four-way BVH requires " +
+         std::to_string(tree->nodes.back().stack_required) +
+         " stack entries, budget is " + std::to_string(stack_budget);
+   } while (false);
    rtcReleaseDevice(device);
    if (!success)
       *tree = {};

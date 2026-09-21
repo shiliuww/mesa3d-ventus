@@ -37,7 +37,10 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    p->maxMemoryAllocationCount = 4096;
    p->maxSamplerAllocationCount = 4096;
    p->bufferImageGranularity = 64;
-   p->maxBoundDescriptorSets = 8;
+   p->maxBoundDescriptorSets = VTVK_MAX_BOUND_DESCRIPTOR_SETS;
+   p->maxDescriptorSetUniformBuffersDynamic = VTVK_MAX_DESCRIPTOR_BINDINGS;
+   p->maxDescriptorSetStorageBuffersDynamic = VTVK_MAX_DESCRIPTOR_BINDINGS;
+   p->maxPerSetDescriptors = VTVK_MAX_DESCRIPTOR_BINDINGS;
    p->maxPerStageDescriptorSamplers = 1024;
    p->maxPerStageDescriptorUniformBuffers = 64;
    p->maxPerStageDescriptorStorageBuffers = 1024;
@@ -170,6 +173,10 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->maintenance5 = true;
    f->bufferDeviceAddress = true;
    f->vulkanMemoryModel = true;
+   f->shaderUniformBufferArrayDynamicIndexing = true;
+   f->shaderStorageBufferArrayDynamicIndexing = true;
+   f->shaderStorageImageArrayDynamicIndexing = true;
+   f->shaderSampledImageArrayDynamicIndexing = true;
    f->descriptorIndexing = true;
    f->shaderUniformBufferArrayNonUniformIndexing = true;
    f->shaderSampledImageArrayNonUniformIndexing = true;

@@ -14,6 +14,8 @@ static void check_tree(const std::vector<vtvk_build_node> &leaves,
                        const vtvk_bvh_topology &tree)
 {
    CHECK(!tree.nodes.empty());
+   CHECK(tree.branching == 4);
+   CHECK(!tree.stack_repacked);
    CHECK(tree.nodes.size() <= 2 * leaves.size() - 1);
    std::vector<unsigned> seen(leaves.size());
    for (size_t i = 0; i < tree.nodes.size(); ++i) {
@@ -37,7 +39,7 @@ static void check_tree(const std::vector<vtvk_build_node> &leaves,
    }
    for (unsigned count : seen)
       CHECK(count == 1);
-   CHECK(tree.nodes.back().stack_required <= 32);
+   CHECK(tree.nodes.back().stack_required <= VENTUS_BVH_TRAVERSAL_STACK_BUDGET);
 }
 
 static bool intersects(const vtvk_aabb &b, const float origin[3], const float dir[3])
@@ -115,28 +117,33 @@ int main()
          for (unsigned c = 0; c < 4; ++c)
             CHECK(second.nodes[i].children[c] == tree.nodes[i].children[c]);
       }
-      CHECK(vtvk_build_embree(leaves, &tree, &error, 24));
-      CHECK(tree.nodes.back().stack_required <= 24);
-      check_tree(leaves, tree);
-      if (count == 1024)
-         replay_bounds(leaves, tree);
+      /* A smaller caller budget may reject the same four-way topology;
+       * it must not trigger a hidden binary rebuild. */
+      const auto required = tree.nodes.back().stack_required;
+      CHECK(vtvk_build_embree(leaves, &tree, &error, required));
+      if (required > 1)
+         CHECK(!vtvk_build_embree(leaves, &tree, &error, required - 1));
    }
-   /* Coincident, zero-area bounds and conservative TLAS+BLAS stack budget. */
+   /* Coincident, zero-area bounds and combined TLAS+BLAS stack budget. */
    leaves.assign(1024, {0, {{0, 0, 0}, {0, 0, 0}}});
    CHECK(vtvk_build_embree(leaves, &tree, &error));
    check_tree(leaves, tree);
    leaves.resize(4);
    for (auto &leaf : leaves)
-      leaf.stack_required = 30;
-   CHECK(vtvk_build_embree(leaves, &tree, &error));
-   CHECK(tree.branching == 2);
-   CHECK(tree.nodes.back().stack_required == 32);
+      leaf.stack_required = 62;
+   CHECK(!vtvk_build_embree(leaves, &tree, &error));
+   CHECK(error.find("65 stack entries") != std::string::npos);
    for (auto &leaf : leaves)
-      leaf.stack_required = 32;
+      leaf.stack_required = 61;
+   CHECK(vtvk_build_embree(leaves, &tree, &error));
+   CHECK(tree.nodes.back().stack_required == 64);
+   check_tree(leaves, tree);
+   for (auto &leaf : leaves)
+      leaf.stack_required = 64;
    CHECK(!vtvk_build_embree(leaves, &tree, &error));
    leaves.resize(1);
    CHECK(vtvk_build_embree(leaves, &tree, &error));
-   CHECK(tree.nodes.back().stack_required == 32);
+   CHECK(tree.nodes.back().stack_required == 64);
    leaves[0].bounds.min[0] = std::numeric_limits<float>::quiet_NaN();
    CHECK(!vtvk_build_embree(leaves, &tree, &error));
    leaves[0].bounds.min[0] = 1;

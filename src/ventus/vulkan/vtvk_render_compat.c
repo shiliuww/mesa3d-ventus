@@ -543,8 +543,9 @@ vtvk_CmdCopyImage(VkCommandBuffer commandBuffer,
             VkDeviceSize bytes = (VkDeviceSize)width * 4;
             if (src_offset + bytes <= src->size &&
                 dst_offset + bytes <= dst->size)
-               memcpy((uint8_t *)dst->map + dst_offset,
-                      (uint8_t *)src->map + src_offset, bytes);
+               vtvk_cmd_buffer_record_copy(commandBuffer,
+                  (uint8_t *)dst->map + dst_offset,
+                  (uint8_t *)src->map + src_offset, bytes);
          }
       }
    }
@@ -564,7 +565,7 @@ vtvk_CmdCopyBuffer(VkCommandBuffer commandBuffer,
       void *dst = vtvk_buffer_host_ptr(dstBuffer, pRegions[i].dstOffset,
                                        pRegions[i].size);
       if (src && dst)
-         memcpy(dst, src, pRegions[i].size);
+         vtvk_cmd_buffer_record_copy(commandBuffer, dst, src, pRegions[i].size);
    }
 }
 
@@ -618,7 +619,36 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
             const VkDeviceSize bytes = (VkDeviceSize)width * bpp;
             void *src = vtvk_buffer_host_ptr(srcBuffer, src_offset, bytes);
             if (src && dst_offset + bytes <= dst->size)
-               memcpy((uint8_t *)dst->map + dst_offset, src, bytes);
+               vtvk_cmd_buffer_record_copy(commandBuffer, (uint8_t *)dst->map + dst_offset, src, bytes);
+         }
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer,
+                          VkImage srcImage, VkImageLayout srcImageLayout,
+                          VkBuffer dstBuffer, uint32_t regionCount,
+                          const VkBufferImageCopy *pRegions)
+{
+   (void)srcImageLayout;
+   struct vtvk_image *src = vtvk_handle_to_ptr((uint64_t)srcImage);
+   if (!src || !src->map)
+      return;
+   const uint32_t bpp = vtvk_image_bytes_per_pixel(src->format);
+   for (uint32_t r = 0; r < regionCount; r++) {
+      const VkBufferImageCopy *region = &pRegions[r];
+      const uint32_t row = region->bufferRowLength ? region->bufferRowLength : region->imageExtent.width;
+      const uint32_t height = region->bufferImageHeight ? region->bufferImageHeight : region->imageExtent.height;
+      for (uint32_t z = 0; z < region->imageExtent.depth; z++) {
+         for (uint32_t y = 0; y < region->imageExtent.height; y++) {
+            VkDeviceSize offset = (((VkDeviceSize)(region->imageOffset.z + z) * src->extent.height +
+               region->imageOffset.y + y) * src->extent.width + region->imageOffset.x) * bpp;
+            VkDeviceSize bytes = (VkDeviceSize)region->imageExtent.width * bpp;
+            void *dst = vtvk_buffer_host_ptr(dstBuffer,
+               region->bufferOffset + ((VkDeviceSize)z * height + y) * row * bpp, bytes);
+            if (dst && offset <= src->size && bytes <= src->size - offset)
+               vtvk_cmd_buffer_record_copy(commandBuffer, dst, (uint8_t *)src->map + offset, bytes);
          }
       }
    }

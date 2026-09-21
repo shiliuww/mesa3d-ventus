@@ -1192,6 +1192,18 @@ vtvk_inline_rt_callback_shader_with_index(nir_builder *b,
       return;
    }
 
+   /* Diagnostic for multi-miss pipelines such as raytracingshadows.  Keep
+    * traversal's hit/miss decision intact, but bypass only the dynamic SBT
+    * record group-index load for a named group. */
+   if (vtvk_env_enabled("VENTUS_VK_RT_DEBUG_DIRECT_CALLBACK_GROUP_2")) {
+      for (const auto &entry : entries) {
+         if (entry.group_index == 2) {
+            vtvk_inline_rt_callback_shader(b, entry.shader);
+            return;
+         }
+      }
+   }
+
    for (size_t i = 0; i < entries.size(); i++) {
       nir_push_if(b, nir_ieq_imm(b, index, entries[i].group_index));
       vtvk_inline_rt_callback_shader(b, entries[i].shader);
@@ -1474,6 +1486,53 @@ vtvk_rt_stage_supported(mesa_shader_stage stage)
           stage == MESA_SHADER_INTERSECTION;
 }
 
+static bool
+vtvk_map_shader_resources(nir_shader *shader,
+                           const struct vtvk_pipeline_layout_data *layout)
+{
+   nir_foreach_variable_in_shader(var, shader) {
+      /* SPIR-V carries AS bindings on vulkan_resource_index, not on its
+       * bookkeeping variable (whose set/binding remain zero). */
+      if (var->data.resource_type == nir_resource_type_acceleration_structure)
+         continue;
+      if (!(var->data.mode & (nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo)))
+         continue;
+      if (var->data.descriptor_set >= layout->count)
+         return false;
+      int slot = vtvk_descriptor_slot(&layout->sets[var->data.descriptor_set],
+                                      var->data.binding);
+      if (slot < 0) {
+         mesa_loge("ventus-vk: resource %s mode=0x%x set=%u binding=%u missing from layout",
+                   var->name ? var->name : "<unnamed>", (unsigned)var->data.mode,
+                   var->data.descriptor_set, var->data.binding);
+         return false;
+      }
+      var->data.binding = slot;
+   }
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+               continue;
+            uint32_t set = nir_intrinsic_desc_set(intr);
+            if (set >= layout->count)
+               return false;
+            int slot = vtvk_descriptor_slot(&layout->sets[set], nir_intrinsic_binding(intr));
+            if (slot < 0) {
+               mesa_loge("ventus-vk: resource index set=%u binding=%u missing from layout",
+                         set, nir_intrinsic_binding(intr));
+               return false;
+            }
+            nir_intrinsic_set_binding(intr, slot);
+         }
+      }
+   }
+   return true;
+}
+
 static VkResult
 vtvk_compile_rt_stage(struct vtvk_device *device,
                       struct vtvk_pipeline *pipeline,
@@ -1493,6 +1552,10 @@ vtvk_compile_rt_stage(struct vtvk_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+   if (!vtvk_map_shader_resources(*nir_out, &pipeline->resource_layout)) {
+      mesa_loge("ventus-vk: shader resource is absent from the pipeline layout");
+      return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+   }
    vtvk_rt_log_nir_stats(*nir_out, "after spirv_to_nir");
    NIR_PASS(_, *nir_out, nir_lower_system_values);
    vtvk_rt_log_nir_stats(*nir_out, "after nir_lower_system_values");
@@ -1708,6 +1771,10 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    if (!pipeline)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   if (!vtvk_get_pipeline_layout(info->layout, &pipeline->resource_layout)) {
+      vtvk_pipeline_destroy(&device->vk, &pipeline->vk, pAllocator);
+      return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+   }
    pipeline->nir_mem_ctx = ralloc_context(nullptr);
    pipeline->shader_count = info->stageCount;
    pipeline->max_ray_recursion_depth = info->maxPipelineRayRecursionDepth;

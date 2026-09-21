@@ -313,10 +313,10 @@ vtvk_build_tree(struct vtvk_acceleration_structure *as, uint32_t *cursor,
    } else if (strcmp(builder, "embree4") == 0) {
       vtvk_bvh_topology tree;
       std::string error;
-      /* BLAS is built before its users are known. Reserve eight entries for
-       * TLAS siblings; the completed TLAS still checks the actual combination.
-       * This is a conservative build policy, not a promise that any TLAS fits. */
-      const uint32_t budget = as->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ? 24 : 32;
+      /* TLAS instance leaves carry their referenced BLAS requirement. Check
+       * the composed tree against the shared hardware stack, without reserving
+       * a fixed TLAS quota in every independently built BLAS. */
+      const uint32_t budget = VENTUS_BVH_TRAVERSAL_STACK_BUDGET;
       if (!vtvk_build_embree(leaves, &tree, &error, budget)) {
          mesa_loge("ventus-vk: BVH build failed: %s", error.c_str());
          return false;
@@ -347,9 +347,9 @@ vtvk_build_tree(struct vtvk_acceleration_structure *as, uint32_t *cursor,
       mesa_loge("ventus-vk: unknown VENTUS_VK_BVH_BUILDER=%s", builder);
       return false;
    }
-   if (root->stack_required > 32) {
-      mesa_loge("ventus-vk: %s combined traversal stack bound %u exceeds 32",
-                builder, root->stack_required);
+   if (root->stack_required > VENTUS_BVH_TRAVERSAL_STACK_BUDGET) {
+      mesa_loge("ventus-vk: %s combined traversal stack bound %u exceeds %u",
+                builder, root->stack_required, VENTUS_BVH_TRAVERSAL_STACK_BUDGET);
       return false;
    }
    as->bvh_stack_required = root->stack_required;
@@ -557,28 +557,38 @@ vtvk_build_blas(struct vtvk_device *device,
                 const VkAccelerationStructureBuildGeometryInfoKHR *info,
                 const VkAccelerationStructureBuildRangeInfoKHR *range)
 {
-   if (info->geometryCount != 1)
+   uint32_t total_primitives = 0;
+   uint64_t leaf_size = 0;
+   for (uint32_t g = 0; g < info->geometryCount; g++) {
+      const auto *geom = vtvk_build_geometry(info, g);
+      if (geom->geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+          geom->geometryType != VK_GEOMETRY_TYPE_AABBS_KHR)
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      if (!range || range[g].primitiveCount > UINT32_MAX - total_primitives)
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      total_primitives += range[g].primitiveCount;
+      leaf_size = std::max<uint64_t>(leaf_size,
+         geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR ?
+            VENTUS_AS_AABB_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE);
+   }
+   if (!total_primitives)
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-
-   const VkAccelerationStructureGeometryKHR *geom = vtvk_build_geometry(info, 0);
-   if (geom->geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
-       geom->geometryType != VK_GEOMETRY_TYPE_AABBS_KHR)
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-
-   uint32_t primitive_count = range ? range->primitiveCount : 0;
-   if (!primitive_count)
-      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
-
-   const uint64_t max_size = vtvk_bvh_max_size(primitive_count,
-      geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR ?
-      VENTUS_AS_AABB_NODE_SIZE : VENTUS_AS_TRIANGLE_NODE_SIZE);
+   const uint64_t max_size = vtvk_bvh_max_size(total_primitives, leaf_size);
    if (max_size > as->size || max_size > UINT32_MAX)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-
    uint8_t *dst = (uint8_t *)as->data;
    if (!dst)
       return vk_error(device, VK_ERROR_UNKNOWN);
-
+   memset(dst, 0, as->size);
+   uint32_t cursor = VENTUS_AS_HEADER_SIZE;
+   uint32_t node_count = 0;
+   std::vector<struct vtvk_build_node> leaves;
+   for (uint32_t geometry = 0; geometry < info->geometryCount; geometry++) {
+      const auto *geom = vtvk_build_geometry(info, geometry);
+      const auto *geometry_range = &range[geometry];
+      uint32_t primitive_count = geometry_range->primitiveCount;
+      if (!primitive_count)
+         continue;
    if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
       const VkAccelerationStructureGeometryAabbsDataKHR *aabbs =
          &geom->geometry.aabbs;
@@ -586,7 +596,7 @@ vtvk_build_blas(struct vtvk_device *device,
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
       VkDeviceAddress aabb_addr = aabbs->data.deviceAddress;
-      const VkDeviceSize primitive_offset = range ? range->primitiveOffset : 0;
+      const VkDeviceSize primitive_offset = geometry_range ? geometry_range->primitiveOffset : 0;
       if (UINT64_MAX - aabb_addr < primitive_offset ||
           UINT64_MAX - (aabb_addr + primitive_offset) <
              (VkDeviceSize)(primitive_count - 1) * aabbs->stride)
@@ -598,10 +608,6 @@ vtvk_build_blas(struct vtvk_device *device,
       if (!aabb_base)
          return vk_error(device, VK_ERROR_UNKNOWN);
 
-      memset(dst, 0, as->size);
-      uint32_t cursor = VENTUS_AS_HEADER_SIZE;
-      uint32_t node_count = 0;
-      std::vector<struct vtvk_build_node> leaves;
       for (uint32_t p = 0; p < primitive_count; p++) {
          const uint8_t *src = aabb_base + (VkDeviceSize)p * aabbs->stride;
          float min[3] = { vtvk_load_f32(src, 0), vtvk_load_f32(src, 4),
@@ -613,7 +619,7 @@ vtvk_build_blas(struct vtvk_device *device,
          memcpy(bounds.max, max, sizeof(max));
          uint32_t offset =
             vtvk_next_node_offset(&cursor, VENTUS_AS_AABB_NODE_SIZE);
-         vtvk_write_aabb_leaf(dst, offset, min, max, p, 0, 0,
+         vtvk_write_aabb_leaf(dst, offset, min, max, p, geometry, 0,
                               geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
                               aabb_addr + (VkDeviceAddress)p * aabbs->stride);
          node_count++;
@@ -622,19 +628,7 @@ vtvk_build_blas(struct vtvk_device *device,
          });
       }
 
-      struct vtvk_build_node root;
-      if (!vtvk_build_tree(as, &cursor, leaves, &node_count, &root))
-         return vk_error(device, VK_ERROR_UNKNOWN);
-      vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
-                        cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
-                        &root.bounds);
-      if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
-         mesa_logi("ventus-vk: AABB BLAS primitive_count=%u node_count=%u root=0x%x",
-                   primitive_count, node_count, root.ref);
-         vtvk_log_aabb("AABB BLAS root", &root.bounds);
-      }
-      as->address = (VkDeviceAddress)(uintptr_t)as->data;
-      return VK_SUCCESS;
+      continue;
    }
 
    const VkAccelerationStructureGeometryTrianglesDataKHR *triangles =
@@ -644,17 +638,17 @@ vtvk_build_blas(struct vtvk_device *device,
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    VkDeviceAddress index_addr = triangles->indexData.deviceAddress;
-   if (range) {
-      if (UINT64_MAX - index_addr < range->primitiveOffset)
+   if (geometry_range) {
+      if (UINT64_MAX - index_addr < geometry_range->primitiveOffset)
          return vk_error(device, VK_ERROR_UNKNOWN);
-      index_addr += range->primitiveOffset;
+      index_addr += geometry_range->primitiveOffset;
    }
    uint32_t *index_base = (uint32_t *)vtvk_buffer_host_ptr_from_addr(
       index_addr, sizeof(uint32_t) * primitive_count * 3);
    if (!index_base)
       return vk_error(device, VK_ERROR_UNKNOWN);
 
-   uint32_t first_vertex = range ? range->firstVertex : 0;
+   uint32_t first_vertex = geometry_range ? geometry_range->firstVertex : 0;
    uint32_t max_index = 0;
    for (uint32_t p = 0; p < primitive_count; p++) {
       max_index = std::max(max_index, index_base[p * 3 + 0]);
@@ -673,10 +667,6 @@ vtvk_build_blas(struct vtvk_device *device,
    if (!vertex_base)
       return vk_error(device, VK_ERROR_UNKNOWN);
 
-   memset(dst, 0, as->size);
-   uint32_t cursor = VENTUS_AS_HEADER_SIZE;
-   uint32_t node_count = 0;
-   std::vector<struct vtvk_build_node> leaves;
 
    for (uint32_t p = 0; p < primitive_count; p++) {
       uint32_t i0 = index_base[p * 3 + 0] + first_vertex;
@@ -696,7 +686,7 @@ vtvk_build_blas(struct vtvk_device *device,
       uint32_t offset =
          vtvk_next_node_offset(&cursor, VENTUS_AS_TRIANGLE_NODE_SIZE);
       vtvk_write_triangle_leaf(dst, offset, v0, v1, v2,
-                               p, 0, 0,
+                               p, geometry, 0,
                                geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR ? 1 : 0,
                                index_addr + (VkDeviceAddress)p * 3 *
                                   sizeof(uint32_t));
@@ -707,15 +697,17 @@ vtvk_build_blas(struct vtvk_device *device,
       });
    }
 
+   }
+
    struct vtvk_build_node root;
    if (!vtvk_build_tree(as, &cursor, leaves, &node_count, &root))
       return vk_error(device, VK_ERROR_UNKNOWN);
    vtvk_write_header(dst, VENTUS_AS_TYPE_BLAS, root.ref, node_count,
-                     cursor - VENTUS_AS_HEADER_SIZE, primitive_count, 0,
+                     cursor - VENTUS_AS_HEADER_SIZE, total_primitives, 0,
                      &root.bounds);
    if (vtvk_env_enabled("VENTUS_VK_DEBUG_AS")) {
       mesa_logi("ventus-vk: BLAS primitive_count=%u node_count=%u root=0x%x",
-                primitive_count, node_count, root.ref);
+                total_primitives, node_count, root.ref);
       vtvk_log_aabb("BLAS root", &root.bounds);
    }
    as->address = (VkDeviceAddress)(uintptr_t)as->data;
@@ -966,8 +958,12 @@ vtvk_GetAccelerationStructureBuildSizesKHR(
    (void)device;
    (void)buildType;
    uint64_t primitive_count = 1;
-   if (pMaxPrimitiveCounts && pBuildInfo && pBuildInfo->geometryCount)
-      primitive_count = pMaxPrimitiveCounts[0] ? pMaxPrimitiveCounts[0] : 1;
+   if (pMaxPrimitiveCounts && pBuildInfo && pBuildInfo->geometryCount) {
+      primitive_count = 0;
+      for (uint32_t i = 0; i < pBuildInfo->geometryCount; i++)
+         primitive_count += pMaxPrimitiveCounts[i];
+      primitive_count = std::max<uint64_t>(primitive_count, 1);
+   }
 
    uint64_t leaf_size = VENTUS_AS_TRIANGLE_NODE_SIZE;
    if (pBuildInfo &&

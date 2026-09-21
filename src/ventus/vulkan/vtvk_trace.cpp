@@ -8,16 +8,17 @@
 #include "vtvk_entrypoints.h"
 
 static bool
-vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
+vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t set, uint32_t binding,
+                           uint32_t dynamic_offset,
                            std::vector<vtvk_rt_descriptor_source> *out)
 {
    struct vtvk_descriptor_binding_info info = {};
-   if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info))
+   if (!vtvk_descriptor_set_get_slot(descriptor_set, binding, &info))
       return false;
 
    struct vtvk_rt_descriptor_source desc = {};
    desc.type = info.type;
-   desc.set = 0;
+   desc.set = set;
    desc.binding = binding;
 
    switch (info.type) {
@@ -29,10 +30,16 @@ vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
       desc.image = info.image;
       desc.sampler = info.image_info.sampler;
       break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
       desc.buffer = info.buffer.buffer;
-      desc.offset = info.buffer.offset;
+      desc.offset = info.buffer.offset + dynamic_offset;
+      if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+         desc.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         desc.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       desc.range = info.buffer.range;
       break;
    default:
@@ -45,80 +52,27 @@ vtvk_collect_rt_descriptor(VkDescriptorSet descriptor_set, uint32_t binding,
    return true;
 }
 
-void
+VkResult
 vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record)
 {
-   static bool logged;
-
-   VkPipeline pipeline_handle = record->pipeline;
-   struct vtvk_pipeline *pipeline =
-      vtvk_pipeline_from_handle(pipeline_handle);
-   VkDescriptorSet descriptor_set = record->descriptor_set;
-   VkAccelerationStructureKHR tlas_handle =
-      vtvk_descriptor_set_acceleration_structure(descriptor_set, 0);
-   struct vtvk_acceleration_structure *tlas =
-      (struct vtvk_acceleration_structure *)
-         (uintptr_t)tlas_handle;
-
-   VkExtent3D image_extent = {};
-   VkFormat image_format = VK_FORMAT_UNDEFINED;
-   VkImage storage_image = vtvk_descriptor_set_image(descriptor_set, 1);
-   void *storage_image_data =
-      vtvk_image_host_ptr(storage_image, &image_extent, &image_format);
-
-   VkDeviceSize camera_range = 0;
-   void *camera_data =
-      vtvk_descriptor_set_buffer_ptr(descriptor_set, 2, &camera_range);
-   uint32_t push_constants_size = record->push_constants_size;
-   const void *push_constants = record->push_constants;
-
-   const VkStridedDeviceAddressRegionKHR *raygen_sbt =
-      record->has_raygen_sbt ? &record->raygen_sbt : nullptr;
-   const VkStridedDeviceAddressRegionKHR *miss_sbt =
-      record->has_miss_sbt ? &record->miss_sbt : nullptr;
-   const VkStridedDeviceAddressRegionKHR *hit_sbt =
-      record->has_hit_sbt ? &record->hit_sbt : nullptr;
-   const VkStridedDeviceAddressRegionKHR *callable_sbt =
-      record->has_callable_sbt ? &record->callable_sbt : nullptr;
-
+   struct vtvk_pipeline *pipeline = vtvk_pipeline_from_handle(record->pipeline);
+   if (!pipeline)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   if (!record->width || !record->height || !record->depth)
+      return VK_SUCCESS;
    std::vector<vtvk_rt_descriptor_source> descriptors;
-   descriptors.reserve(5);
-   for (uint32_t binding = 0; binding <= 4; binding++)
-      vtvk_collect_rt_descriptor(descriptor_set, binding, &descriptors);
-
-   if (!pipeline || !tlas || !tlas->address || !storage_image_data ||
-       !camera_data) {
-      mesa_loge("ventus-vk: vkCmdTraceRaysKHR missing Spike dispatch state "
-                "pipeline=%p tlas=0x%" PRIx64 " image=%p camera=%p",
-                (void *)pipeline, tlas ? (uint64_t)tlas->address : 0,
-                storage_image_data, camera_data);
-      return;
+   for (uint32_t set = 0; set < pipeline->resource_layout.count; set++) {
+      for (uint32_t slot = 0; slot < VTVK_MAX_DESCRIPTOR_BINDINGS; slot++)
+         vtvk_collect_rt_descriptor(record->descriptor_sets[set], set, slot,
+                                    record->dynamic_offsets[set][slot], &descriptors);
    }
-
-   if (!logged) {
-      logged = true;
-      mesa_logi("ventus-vk: executing recorded vkCmdTraceRaysKHR on Spike "
-                "%ux%ux%u tlas=0x%" PRIx64 " image=%ux%u format=%u "
-                "descriptors=%zu scratch=%u sbt={raygen:0x%" PRIx64 ",miss:0x%" PRIx64
-                ",hit:0x%" PRIx64 "}",
-                record->width, record->height, record->depth,
-                (uint64_t)tlas->address,
-                image_extent.width, image_extent.height, image_format,
-                descriptors.size(), pipeline->per_lane_scratch_size,
-                raygen_sbt ? (uint64_t)raygen_sbt->deviceAddress : 0,
-                miss_sbt ? (uint64_t)miss_sbt->deviceAddress : 0,
-                hit_sbt ? (uint64_t)hit_sbt->deviceAddress : 0);
-   }
-
+   const VkStridedDeviceAddressRegionKHR *raygen_sbt = record->has_raygen_sbt ? &record->raygen_sbt : nullptr;
+   const VkStridedDeviceAddressRegionKHR *miss_sbt = record->has_miss_sbt ? &record->miss_sbt : nullptr;
+   const VkStridedDeviceAddressRegionKHR *hit_sbt = record->has_hit_sbt ? &record->hit_sbt : nullptr;
+   const VkStridedDeviceAddressRegionKHR *callable_sbt = record->has_callable_sbt ? &record->callable_sbt : nullptr;
    struct vtvk_driver_trace_rays_info trace = {};
-   trace.tlas = tlas;
-   trace.storage_image_data = storage_image_data;
-   trace.image_extent = image_extent;
-   trace.image_format = image_format;
-   trace.camera_data = camera_data;
-   trace.camera_range = camera_range;
-   trace.push_constants = push_constants;
-   trace.push_constants_size = push_constants_size;
+   trace.push_constants = record->push_constants;
+   trace.push_constants_size = record->push_constants_size;
    trace.raygen_sbt = raygen_sbt;
    trace.miss_sbt = miss_sbt;
    trace.hit_sbt = hit_sbt;
@@ -148,7 +102,7 @@ vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record)
    trace.descriptors = descriptors.data();
    trace.descriptor_count = descriptors.size();
 
-   vtvk_driver_trace_rays(&trace);
+   return vtvk_driver_trace_rays(&trace) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
 }
 
 VKAPI_ATTR void VKAPI_CALL

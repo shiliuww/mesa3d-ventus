@@ -28,12 +28,6 @@ validate_descriptor_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          *unsupported = true;
       }
       break;
-   case nir_intrinsic_vulkan_resource_reindex:
-      fprintf(stderr,
-              "ventus-nir: descriptor arrays/dynamic indexing are not supported "
-              "by the RT descriptor ABI\n");
-      *unsupported = true;
-      break;
    case nir_intrinsic_load_vulkan_descriptor:
       switch (nir_intrinsic_desc_type(intrin)) {
       case nir_descriptor_type_uniform_buffer:

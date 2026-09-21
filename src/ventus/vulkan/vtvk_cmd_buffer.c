@@ -54,6 +54,20 @@ vtvk_cmd_buffer_append_command(struct vtvk_cmd_buffer *cmd,
    cmd->recorded_commands[cmd->recorded_command_count++] = *record;
    return VK_SUCCESS;
 }
+void
+vtvk_cmd_buffer_record_copy(VkCommandBuffer commandBuffer, void *dst,
+                            const void *src, size_t size)
+{
+   struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
+   struct vtvk_recorded_command record = {
+      .type = VTVK_RECORDED_COMMAND_COPY,
+      .u.copy = { .dst = dst, .src = src, .size = size },
+   };
+   VkResult result = vtvk_cmd_buffer_append_command(cmd, &record);
+   if (result != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmd->vk, result);
+}
+
 static VkPipelineBindPoint
 vtvk_bind_point_from_shader_stages(VkShaderStageFlags stage_flags)
 {
@@ -113,25 +127,31 @@ vtvk_cmd_buffer_record_as_build(
    };
    struct vtvk_recorded_as_build *build = &record.u.build_as;
    build->info_count = infoCount;
+   uint32_t geometry_count = 0;
+   for (uint32_t i = 0; i < infoCount; i++)
+      geometry_count += pInfos[i].geometryCount;
    build->infos = calloc(infoCount, sizeof(*build->infos));
-   build->geometries = calloc(infoCount, sizeof(*build->geometries));
-   build->ranges = calloc(infoCount, sizeof(*build->ranges));
+   build->geometries = calloc(geometry_count, sizeof(*build->geometries));
+   build->ranges = calloc(geometry_count, sizeof(*build->ranges));
    if (!build->infos || !build->geometries || !build->ranges)
       goto oom;
 
+   uint32_t offset = 0;
    for (uint32_t i = 0; i < infoCount; i++) {
-      if (pInfos[i].geometryCount != 1 || !ppBuildRangeInfos[i])
-         goto unsupported;
-      const VkAccelerationStructureGeometryKHR *geometry =
-         pInfos[i].pGeometries ? &pInfos[i].pGeometries[0] :
-         (pInfos[i].ppGeometries ? pInfos[i].ppGeometries[0] : NULL);
-      if (!geometry)
+      if (!pInfos[i].geometryCount || !ppBuildRangeInfos[i])
          goto unsupported;
       build->infos[i] = pInfos[i];
-      build->geometries[i] = *geometry;
-      build->infos[i].pGeometries = &build->geometries[i];
+      build->infos[i].pGeometries = &build->geometries[offset];
       build->infos[i].ppGeometries = NULL;
-      build->ranges[i] = *ppBuildRangeInfos[i];
+      for (uint32_t g = 0; g < pInfos[i].geometryCount; g++, offset++) {
+         const VkAccelerationStructureGeometryKHR *geometry =
+            pInfos[i].pGeometries ? &pInfos[i].pGeometries[g] :
+            (pInfos[i].ppGeometries ? pInfos[i].ppGeometries[g] : NULL);
+         if (!geometry)
+            goto unsupported;
+         build->geometries[offset] = *geometry;
+         build->ranges[offset] = ppBuildRangeInfos[i][g];
+      }
    }
 
    VkResult result = vtvk_cmd_buffer_append_command(cmd, &record);
@@ -174,6 +194,8 @@ vtvk_cmd_buffer_record_trace_rays(
       },
    };
    struct vtvk_recorded_trace_rays *trace = &record.u.trace_rays;
+   memcpy(trace->descriptor_sets, cmd->bound_descriptor_sets, sizeof(trace->descriptor_sets));
+   memcpy(trace->dynamic_offsets, cmd->dynamic_offsets, sizeof(trace->dynamic_offsets));
    memcpy(trace->push_constants, cmd->push_constants,
           sizeof(trace->push_constants));
    if (pRaygenShaderBindingTable) {
@@ -209,14 +231,21 @@ vtvk_cmd_buffer_execute(VkCommandBuffer commandBuffer)
       if (record->type == VTVK_RECORDED_COMMAND_BUILD_AS) {
          struct vtvk_recorded_as_build *build = &record->u.build_as;
          const VkAccelerationStructureBuildRangeInfoKHR *ranges[build->info_count];
-         for (uint32_t j = 0; j < build->info_count; j++)
-            ranges[j] = &build->ranges[j];
+         uint32_t offset = 0;
+         for (uint32_t j = 0; j < build->info_count; j++) {
+            ranges[j] = &build->ranges[offset];
+            offset += build->infos[j].geometryCount;
+         }
          VkResult result = vtvk_execute_build_acceleration_structures(
             device, build->info_count, build->infos, ranges);
          if (result != VK_SUCCESS)
             return result;
+      } else if (record->type == VTVK_RECORDED_COMMAND_COPY) {
+         memcpy(record->u.copy.dst, record->u.copy.src, record->u.copy.size);
       } else if (record->type == VTVK_RECORDED_COMMAND_TRACE_RAYS) {
-         vtvk_execute_trace_rays(&record->u.trace_rays);
+         VkResult result = vtvk_execute_trace_rays(&record->u.trace_rays);
+         if (result != VK_SUCCESS)
+            return result;
       }
    }
    return VK_SUCCESS;
@@ -254,6 +283,7 @@ vtvk_cmd_buffer_reset(struct vk_command_buffer *cmd_buffer,
    vtvk_cmd_buffer_discard_commands(cmd);
    cmd->bound_rt_pipeline = VK_NULL_HANDLE;
    memset(cmd->bound_descriptor_sets, 0, sizeof(cmd->bound_descriptor_sets));
+   memset(cmd->dynamic_offsets, 0, sizeof(cmd->dynamic_offsets));
    memset(cmd->push_constants, 0, sizeof(cmd->push_constants));
    cmd->push_constants_size = 0;
 }
@@ -347,15 +377,28 @@ vtvk_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
 {
    struct vtvk_cmd_buffer *cmd = vtvk_handle_to_ptr((uint64_t)commandBuffer);
    (void)layout;
-   (void)dynamicOffsetCount;
-   (void)pDynamicOffsets;
+   uint32_t offset_index = 0;
    if (!cmd || pipelineBindPoint != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
       return;
 
    for (uint32_t i = 0; i < descriptorSetCount; i++) {
       uint32_t set = firstSet + i;
-      if (set < VTVK_MAX_BOUND_DESCRIPTOR_SETS)
+      if (set < VTVK_MAX_BOUND_DESCRIPTOR_SETS) {
          cmd->bound_descriptor_sets[set] = pDescriptorSets[i];
+         memset(cmd->dynamic_offsets[set], 0, sizeof(cmd->dynamic_offsets[set]));
+         struct vtvk_descriptor_layout set_layout;
+         if (!vtvk_descriptor_set_layout(pDescriptorSets[i], &set_layout))
+            continue;
+         for (uint32_t b = 0; b < set_layout.count; b++) {
+            VkDescriptorType type = set_layout.bindings[b].descriptorType;
+            if (type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+                type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+               continue;
+            for (uint32_t e = 0; e < set_layout.bindings[b].descriptorCount; e++)
+               if (offset_index < dynamicOffsetCount)
+                  cmd->dynamic_offsets[set][set_layout.slots[b] + e] = pDynamicOffsets[offset_index++];
+         }
+      }
    }
 }
 

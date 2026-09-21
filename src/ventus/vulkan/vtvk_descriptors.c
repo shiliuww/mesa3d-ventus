@@ -2,16 +2,17 @@
 #include "vtvk_memory.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "vk_util.h"
 #include "vtvk_entrypoints.h"
 
 struct vtvk_descriptor_set_layout {
-   uint32_t binding_count;
+   struct vtvk_descriptor_layout data;
 };
 
 struct vtvk_pipeline_layout {
-   uint32_t set_layout_count;
+   struct vtvk_pipeline_layout_data data;
 };
 
 struct vtvk_descriptor_pool {
@@ -19,7 +20,7 @@ struct vtvk_descriptor_pool {
 };
 
 struct vtvk_descriptor_set {
-   VkDescriptorSetLayout layout;
+   struct vtvk_descriptor_layout layout;
    struct {
       VkDescriptorType type;
       VkAccelerationStructureKHR acceleration_structure;
@@ -38,16 +39,46 @@ vtvk_ptr_to_handle(void *ptr)
 {
    return (uint64_t)(uintptr_t)ptr;
 }
+int
+vtvk_descriptor_slot(const struct vtvk_descriptor_layout *layout, uint32_t binding)
+{
+   for (uint32_t i = 0; i < layout->count; i++)
+      if (layout->bindings[i].binding == binding)
+         return layout->slots[i];
+   return -1;
+}
+
+bool
+vtvk_get_pipeline_layout(VkPipelineLayout handle, struct vtvk_pipeline_layout_data *out)
+{
+   struct vtvk_pipeline_layout *layout = vtvk_handle_to_ptr((uint64_t)handle);
+   if (!layout || !out)
+      return false;
+   *out = layout->data;
+   return true;
+}
+
+bool
+vtvk_descriptor_set_layout(VkDescriptorSet handle, struct vtvk_descriptor_layout *out)
+{
+   struct vtvk_descriptor_set *set = vtvk_handle_to_ptr((uint64_t)handle);
+   if (!set || !out)
+      return false;
+   *out = set->layout;
+   return true;
+}
+
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding)
 {
    struct vtvk_descriptor_set *set =
       vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+   int slot = set ? vtvk_descriptor_slot(&set->layout, binding) : -1;
+   if (slot < 0)
       return VK_NULL_HANDLE;
 
-   return set->bindings[binding].acceleration_structure;
+   return set->bindings[slot].acceleration_structure;
 }
 
 VkImage
@@ -55,11 +86,12 @@ vtvk_descriptor_set_image(VkDescriptorSet descriptorSet, uint32_t binding)
 {
    struct vtvk_descriptor_set *set =
       vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+   int slot = set ? vtvk_descriptor_slot(&set->layout, binding) : -1;
+   if (slot < 0)
       return VK_NULL_HANDLE;
 
    struct vtvk_image_view *view =
-      vtvk_handle_to_ptr((uint64_t)set->bindings[binding].image.imageView);
+      vtvk_handle_to_ptr((uint64_t)set->bindings[slot].image.imageView);
    return view ? view->image : VK_NULL_HANDLE;
 }
 
@@ -69,10 +101,11 @@ vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
 {
    struct vtvk_descriptor_set *set =
       vtvk_handle_to_ptr((uint64_t)descriptorSet);
-   if (!set || binding >= VTVK_MAX_DESCRIPTOR_BINDINGS)
+   int slot = set ? vtvk_descriptor_slot(&set->layout, binding) : -1;
+   if (slot < 0)
       return NULL;
 
-   VkDescriptorBufferInfo *info = &set->bindings[binding].buffer;
+   VkDescriptorBufferInfo *info = &set->bindings[slot].buffer;
    VkDeviceSize range = info->range;
    if (range == VK_WHOLE_SIZE) {
       struct vtvk_buffer *buffer = vtvk_handle_to_ptr((uint64_t)info->buffer);
@@ -85,7 +118,7 @@ vtvk_descriptor_set_buffer_ptr(VkDescriptorSet descriptorSet, uint32_t binding,
 }
 
 bool
-vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
+vtvk_descriptor_set_get_slot(VkDescriptorSet descriptorSet,
                                 uint32_t binding,
                                 struct vtvk_descriptor_binding_info *out)
 {
@@ -123,6 +156,8 @@ vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
       out->valid = out->image != VK_NULL_HANDLE;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
       out->valid = out->buffer.buffer != VK_NULL_HANDLE &&
                    out->buffer.range != 0;
@@ -133,6 +168,68 @@ vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
    }
 
    return out->valid;
+}
+
+bool
+vtvk_descriptor_set_get_binding(VkDescriptorSet handle, uint32_t binding,
+                                struct vtvk_descriptor_binding_info *out)
+{
+   struct vtvk_descriptor_set *set = vtvk_handle_to_ptr((uint64_t)handle);
+   int slot = set ? vtvk_descriptor_slot(&set->layout, binding) : -1;
+   return slot >= 0 && vtvk_descriptor_set_get_slot(handle, slot, out);
+}
+
+static int
+compare_bindings(const void *a, const void *b)
+{
+   uint32_t x = ((const VkDescriptorSetLayoutBinding *)a)->binding;
+   uint32_t y = ((const VkDescriptorSetLayoutBinding *)b)->binding;
+   return (x > y) - (x < y);
+}
+
+static bool
+vtvk_descriptor_layout_supported(const VkDescriptorSetLayoutCreateInfo *info)
+{
+   if (info->flags || info->bindingCount > VTVK_MAX_DESCRIPTOR_BINDINGS)
+      return false;
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags =
+      vk_find_struct_const(info->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+   if (flags)
+      for (uint32_t i = 0; i < flags->bindingCount; i++)
+         if (flags->pBindingFlags[i])
+            return false;
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < info->bindingCount; i++) {
+      const VkDescriptorSetLayoutBinding *binding = &info->pBindings[i];
+      if (binding->descriptorCount > VTVK_MAX_DESCRIPTOR_BINDINGS - count ||
+          binding->pImmutableSamplers)
+         return false;
+      if (!binding->descriptorCount)
+         continue;
+      switch (binding->descriptorType) {
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+         break;
+      default:
+         return false;
+      }
+      count += binding->descriptorCount;
+   }
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_GetDescriptorSetLayoutSupport(VkDevice device,
+                                    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                    VkDescriptorSetLayoutSupport *pSupport)
+{
+   (void)device;
+   pSupport->supported = vtvk_descriptor_layout_supported(pCreateInfo);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -148,7 +245,21 @@ vtvk_CreateDescriptorSetLayout(VkDevice _device,
    if (!layout)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   layout->binding_count = pCreateInfo->bindingCount;
+   if (!vtvk_descriptor_layout_supported(pCreateInfo)) {
+      vk_free(alloc, layout);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   layout->data.count = pCreateInfo->bindingCount;
+   memcpy(layout->data.bindings, pCreateInfo->pBindings,
+          pCreateInfo->bindingCount * sizeof(*pCreateInfo->pBindings));
+   qsort(layout->data.bindings, layout->data.count,
+         sizeof(layout->data.bindings[0]), compare_bindings);
+   uint32_t slot = 0;
+   for (uint32_t i = 0; i < layout->data.count; i++) {
+      const VkDescriptorSetLayoutBinding *binding = &layout->data.bindings[i];
+      layout->data.slots[i] = slot;
+      slot += binding->descriptorCount;
+   }
    *pSetLayout = (VkDescriptorSetLayout)vtvk_ptr_to_handle(layout);
    return VK_SUCCESS;
 }
@@ -176,7 +287,17 @@ vtvk_CreatePipelineLayout(VkDevice _device,
    if (!layout)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   layout->set_layout_count = pCreateInfo->setLayoutCount;
+   if (pCreateInfo->setLayoutCount > VTVK_MAX_BOUND_DESCRIPTOR_SETS) {
+      vk_free(alloc, layout);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   layout->data.count = pCreateInfo->setLayoutCount;
+   for (uint32_t i = 0; i < layout->data.count; i++) {
+      struct vtvk_descriptor_set_layout *set =
+         vtvk_handle_to_ptr((uint64_t)pCreateInfo->pSetLayouts[i]);
+      if (set)
+         layout->data.sets[i] = set->data;
+   }
    *pPipelineLayout = (VkPipelineLayout)vtvk_ptr_to_handle(layout);
    return VK_SUCCESS;
 }
@@ -232,7 +353,9 @@ vtvk_AllocateDescriptorSets(VkDevice _device,
       if (!set)
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-      set->layout = pAllocateInfo->pSetLayouts[i];
+      struct vtvk_descriptor_set_layout *layout =
+         vtvk_handle_to_ptr((uint64_t)pAllocateInfo->pSetLayouts[i]);
+      set->layout = layout->data;
       pDescriptorSets[i] = (VkDescriptorSet)vtvk_ptr_to_handle(set);
    }
    return VK_SUCCESS;
@@ -263,33 +386,38 @@ vtvk_UpdateDescriptorSets(VkDevice device,
       const VkWriteDescriptorSet *write = &pDescriptorWrites[i];
       struct vtvk_descriptor_set *set =
          vtvk_handle_to_ptr((uint64_t)write->dstSet);
-      if (!set || write->dstBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
-          write->descriptorCount == 0)
+      int base = set ? vtvk_descriptor_slot(&set->layout, write->dstBinding) : -1;
+      if (base < 0 || base + write->dstArrayElement + write->descriptorCount > VTVK_MAX_DESCRIPTOR_BINDINGS)
          continue;
+      for (uint32_t element = 0; element < write->descriptorCount; element++) {
+         uint32_t slot = base + write->dstArrayElement + element;
 
-      set->bindings[write->dstBinding].type = write->descriptorType;
-      switch (write->descriptorType) {
-      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
-         const VkWriteDescriptorSetAccelerationStructureKHR *as_info =
-            vk_find_struct_const(write->pNext,
-                                 WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
-         if (as_info && as_info->accelerationStructureCount)
-            set->bindings[write->dstBinding].acceleration_structure =
-               as_info->pAccelerationStructures[0];
-         break;
-      }
-      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         if (write->pImageInfo)
-            set->bindings[write->dstBinding].image = write->pImageInfo[0];
-         break;
-      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-         if (write->pBufferInfo)
-            set->bindings[write->dstBinding].buffer = write->pBufferInfo[0];
-         break;
-      default:
-         break;
+         set->bindings[slot].type = write->descriptorType;
+         switch (write->descriptorType) {
+         case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+            const VkWriteDescriptorSetAccelerationStructureKHR *as_info =
+               vk_find_struct_const(write->pNext,
+                                    WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+            if (as_info && as_info->accelerationStructureCount)
+               set->bindings[slot].acceleration_structure =
+                  as_info->pAccelerationStructures[element];
+            break;
+         }
+         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            if (write->pImageInfo)
+               set->bindings[slot].image = write->pImageInfo[element];
+            break;
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (write->pBufferInfo)
+               set->bindings[slot].buffer = write->pBufferInfo[element];
+            break;
+         default:
+            break;
+         }
       }
    }
 
@@ -299,11 +427,14 @@ vtvk_UpdateDescriptorSets(VkDevice device,
          vtvk_handle_to_ptr((uint64_t)copy->srcSet);
       struct vtvk_descriptor_set *dst =
          vtvk_handle_to_ptr((uint64_t)copy->dstSet);
-      if (!src || !dst ||
-          copy->srcBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
-          copy->dstBinding >= VTVK_MAX_DESCRIPTOR_BINDINGS ||
-          copy->descriptorCount == 0)
+      int src_slot = src ? vtvk_descriptor_slot(&src->layout, copy->srcBinding) : -1;
+      int dst_slot = dst ? vtvk_descriptor_slot(&dst->layout, copy->dstBinding) : -1;
+      if (src_slot < 0 || dst_slot < 0 ||
+          src_slot + copy->srcArrayElement + copy->descriptorCount > VTVK_MAX_DESCRIPTOR_BINDINGS ||
+          dst_slot + copy->dstArrayElement + copy->descriptorCount > VTVK_MAX_DESCRIPTOR_BINDINGS)
          continue;
-      dst->bindings[copy->dstBinding] = src->bindings[copy->srcBinding];
+      memmove(&dst->bindings[dst_slot + copy->dstArrayElement],
+              &src->bindings[src_slot + copy->srcArrayElement],
+              copy->descriptorCount * sizeof(dst->bindings[0]));
    }
 }

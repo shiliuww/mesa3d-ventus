@@ -5,6 +5,7 @@
 #include <vector>
 
 /* Host-only topology. Leaves retain their caller-owned serialized reference. */
+constexpr uint32_t VENTUS_BVH_TRAVERSAL_STACK_BUDGET = 64;
 struct vtvk_aabb {
    float min[3];
    float max[3];
@@ -38,4 +39,4 @@ bool vtvk_embree_available();
 const char *vtvk_embree_version();
 bool vtvk_build_embree(const std::vector<vtvk_build_node> &leaves,
                       vtvk_bvh_topology *tree, std::string *error,
-                      uint32_t stack_budget = 32);
+                      uint32_t stack_budget = VENTUS_BVH_TRAVERSAL_STACK_BUDGET);

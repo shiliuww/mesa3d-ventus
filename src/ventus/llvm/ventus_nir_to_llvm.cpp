@@ -1212,9 +1212,33 @@ private:
                           builder.CreateShl(a, ConstantInt::get(i32, 24))));
    }
 
-   void storeStorageImage(Value *coord, Value *rgba)
+   Value *descriptorDeref(nir_deref_instr *deref)
    {
-      Value *imageBinding = ConstantInt::get(i32, 1);
+      const nir_variable *var = nir_deref_instr_get_variable(deref);
+      Value *slot = ConstantInt::get(i32,
+         VT_NIR_RT_DESCRIPTOR_SLOT(var->data.descriptor_set, var->data.binding));
+      for (; deref->deref_type != nir_deref_type_var;
+           deref = nir_deref_instr_parent(deref)) {
+         if (deref->deref_type == nir_deref_type_array) {
+            unsigned stride = glsl_type_is_array(deref->type) ?
+               glsl_get_aoa_size(deref->type) : 1;
+            slot = builder.CreateAdd(slot, builder.CreateMul(
+               asInt32(value(deref->arr.index)), ConstantInt::get(i32, stride)));
+         }
+      }
+      return slot;
+   }
+
+   Value *imageDescriptor(nir_intrinsic_instr *intrin)
+   {
+      if (intrin->intrinsic == nir_intrinsic_image_deref_store ||
+          intrin->intrinsic == nir_intrinsic_image_deref_size)
+         return descriptorDeref(nir_src_as_deref(intrin->src[0]));
+      return asInt32(value(intrin->src[0]));
+   }
+
+   void storeStorageImage(Value *imageBinding, Value *coord, Value *rgba)
+   {
       Value *imageBase =
          descriptorRecordI32(imageBinding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
       Value *stride =
@@ -1372,9 +1396,7 @@ private:
        * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
        * sampler derefs resolve through one software descriptor record, just
        * as RADV first resolves them to its hardware descriptor pair. */
-      Value *binding = ConstantInt::get(
-         i32, VT_NIR_RT_DESCRIPTOR_SLOT(texture_var->data.descriptor_set,
-                                         texture_var->data.binding));
+      Value *binding = descriptorDeref(texture_deref);
       Value *base = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
       Value *format = descriptorRecordI32(
@@ -1868,9 +1890,10 @@ private:
          return rayLaunchSize();
       }
       case nir_intrinsic_vulkan_resource_index: {
-         return ConstantInt::get(
+         return builder.CreateAdd(ConstantInt::get(
             i32, VT_NIR_RT_DESCRIPTOR_SLOT(nir_intrinsic_desc_set(intrin),
-                                            nir_intrinsic_binding(intrin)));
+                                            nir_intrinsic_binding(intrin))),
+            asInt32(value(intrin->src[0])));
       }
       case nir_intrinsic_vulkan_resource_reindex: {
          return builder.CreateAdd(asInt32(value(intrin->src[0])),
@@ -1936,20 +1959,20 @@ private:
       }
       case nir_intrinsic_image_deref_store:
       case nir_intrinsic_image_store: {
-         storeStorageImage(value(intrin->src[1]), value(intrin->src[3]));
+         storeStorageImage(imageDescriptor(intrin), value(intrin->src[1]), value(intrin->src[3]));
          return nullptr;
       }
       case nir_intrinsic_image_deref_size:
       case nir_intrinsic_image_size: {
-         return buildVector(3, i32, [&](unsigned i) {
-            switch (i) {
-            case 0:
-               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_WIDTH);
-            case 1:
-               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_HEIGHT);
-            default:
-               return dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DEPTH);
-            }
+         Value *binding = imageDescriptor(intrin);
+         return buildVector(intrin->def.num_components, i32, [&](unsigned i) -> Value * {
+            if (i == 0)
+               return descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_AUX);
+            if (i == 1)
+               return builder.CreateUDiv(
+                  descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE),
+                  descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE));
+            return ConstantInt::get(i32, 1);
          });
       }
       case nir_intrinsic_load_deref: {
@@ -1976,8 +1999,22 @@ private:
       }
       case nir_intrinsic_store_deref: {
          Value *ptr = value(intrin->src[0]);
-         if (ptr->getType()->isPointerTy())
+         if (ptr->getType()->isPointerTy()) {
             storeLocalValue(ptr, value(intrin->src[1]));
+         } else {
+            Value *stored = value(intrin->src[1]);
+            const unsigned bits = nir_src_bit_size(intrin->src[1]);
+            for (unsigned c = 0; c < nir_src_num_components(intrin->src[1]); c++) {
+               if (!(nir_intrinsic_write_mask(intrin) & (1u << c)))
+                  continue;
+               Value *address = builder.CreateAdd(asAddress(ptr),
+                  ConstantInt::get(asAddress(ptr)->getType(), c * (bits / 8)));
+               Value *scalar = bits == 64 ? asInt64(component(stored, c)) :
+                                           asInt32(component(stored, c));
+               StoreInst *store = builder.CreateStore(scalar, globalPtr(address));
+               store->setAlignment(Align(4));
+            }
+         }
          return nullptr;
       }
       case nir_intrinsic_load_shared: {

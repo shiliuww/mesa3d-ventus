@@ -46,6 +46,27 @@ struct vtvk_device {
    struct vk_device vk;
 };
 
+/* Dense device slots are derived from the API layout, never from the binding
+ * number. Copies in sets/pipelines survive destruction of the layout handle. */
+struct vtvk_descriptor_layout {
+   uint32_t count;
+   VkDescriptorSetLayoutBinding bindings[VTVK_MAX_DESCRIPTOR_BINDINGS];
+   uint32_t slots[VTVK_MAX_DESCRIPTOR_BINDINGS];
+};
+struct vtvk_descriptor_binding_info;
+struct vtvk_pipeline_layout_data {
+   uint32_t count;
+   struct vtvk_descriptor_layout sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+};
+bool vtvk_get_pipeline_layout(VkPipelineLayout layout,
+                              struct vtvk_pipeline_layout_data *out);
+int vtvk_descriptor_slot(const struct vtvk_descriptor_layout *layout,
+                         uint32_t binding);
+bool vtvk_descriptor_set_get_slot(VkDescriptorSet set, uint32_t slot,
+                                  struct vtvk_descriptor_binding_info *out);
+bool vtvk_descriptor_set_layout(VkDescriptorSet set,
+                                struct vtvk_descriptor_layout *out);
+
 struct vtvk_sampler {
    VkFilter mag_filter;
    VkFilter min_filter;
@@ -53,9 +74,13 @@ struct vtvk_sampler {
    VkSamplerAddressMode address_mode_v;
 };
 
+void vtvk_cmd_buffer_record_copy(VkCommandBuffer commandBuffer, void *dst,
+                                  const void *src, size_t size);
+
 enum vtvk_recorded_command_type {
    VTVK_RECORDED_COMMAND_BUILD_AS,
    VTVK_RECORDED_COMMAND_TRACE_RAYS,
+   VTVK_RECORDED_COMMAND_COPY,
 };
 
 struct vtvk_recorded_as_build {
@@ -68,6 +93,8 @@ struct vtvk_recorded_as_build {
 struct vtvk_recorded_trace_rays {
    VkPipeline pipeline;
    VkDescriptorSet descriptor_set;
+   VkDescriptorSet descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+   uint32_t dynamic_offsets[VTVK_MAX_BOUND_DESCRIPTOR_SETS][VTVK_MAX_DESCRIPTOR_BINDINGS];
    uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
    uint32_t push_constants_size;
    VkStridedDeviceAddressRegionKHR raygen_sbt;
@@ -88,6 +115,7 @@ struct vtvk_recorded_command {
    union {
       struct vtvk_recorded_as_build build_as;
       struct vtvk_recorded_trace_rays trace_rays;
+      struct { void *dst; const void *src; size_t size; } copy;
    } u;
 };
 
@@ -96,6 +124,7 @@ struct vtvk_cmd_buffer {
 
    VkPipeline bound_rt_pipeline;
    VkDescriptorSet bound_descriptor_sets[VTVK_MAX_BOUND_DESCRIPTOR_SETS];
+   uint32_t dynamic_offsets[VTVK_MAX_BOUND_DESCRIPTOR_SETS][VTVK_MAX_DESCRIPTOR_BINDINGS];
    uint8_t push_constants[VTVK_MAX_PUSH_CONSTANT_SIZE];
    uint32_t push_constants_size;
 
@@ -169,7 +198,7 @@ VkResult vtvk_execute_build_acceleration_structures(
    uint32_t infoCount,
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos);
-void vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record);
+VkResult vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record);
 VkAccelerationStructureKHR
 vtvk_descriptor_set_acceleration_structure(VkDescriptorSet descriptorSet,
                                            uint32_t binding);
