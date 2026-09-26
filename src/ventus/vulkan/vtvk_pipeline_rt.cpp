@@ -627,6 +627,7 @@ vtvk_read_elf_symbol(const std::string &elf_path, const char *symbol,
 static bool
 vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
                                  bool retain_artifacts, bool force_elf,
+                                 bool check_v5_frontier,
                                  char **out_path, uint64_t *out_entry)
 {
    *out_path = NULL;
@@ -684,6 +685,30 @@ vtvk_maybe_emit_rt_kernel_module(llvm::Module *module, bool rv64,
    if (!vtvk_run_tool(link_cmd, "link"))
       return false;
 
+   /* Check the final linked image before handing its path to the runtime.
+    * V5 uses ordinary VGPR scoreboarding: an unchecked ELF cannot silently
+    * fall back to a whole-warp RT busy mechanism. The deployment environment
+    * supplies the checker from the matching Ventus toolchain. */
+   if (check_v5_frontier) {
+      const char *checker = getenv("VENTUS_VK_RT_COMPLETION_CHECKER");
+      const char *objdump = getenv("VENTUS_VK_LLVM_OBJDUMP");
+      if (!checker || !checker[0]) {
+         mesa_loge("ventus-vk: V5 final ELF requires "
+                   "VENTUS_VK_RT_COMPLETION_CHECKER");
+         return false;
+      }
+      if (!objdump || !objdump[0])
+         objdump = "llvm-objdump";
+      const std::string check_cmd = tool_env + "python3 " +
+         vtvk_shell_quote(checker) + " --mode strict --objdump " +
+         vtvk_shell_quote(objdump) + " " +
+         vtvk_shell_quote(artifacts.elf_path.c_str());
+      if (!vtvk_run_tool(check_cmd, "V5 final ELF completion frontier"))
+         return false;
+      mesa_logi("ventus-vk: V5 final ELF completion frontier passed: %s",
+                artifacts.elf_path.c_str());
+   }
+
    uint64_t kernel_entry = 0;
    if (!vtvk_read_elf_symbol(artifacts.elf_path, "main", &kernel_entry))
       return false;
@@ -707,6 +732,7 @@ vtvk_maybe_emit_rt_kernel(struct vtvk_pipeline *pipeline)
                                          pipeline->rt_uses_rv64,
                                          pipeline->retain_generated_artifacts,
                                          pipeline->rt_single_elf_multi_entry,
+                                         pipeline->rt_v5_enabled,
                                          &path, &entry))
       return false;
    if (pipeline->generated_kernel_path &&
@@ -753,7 +779,7 @@ vtvk_emit_rt_resume_kernels(struct vtvk_pipeline *pipeline,
       uint64_t entry = 0;
       const bool emitted = vtvk_maybe_emit_rt_kernel_module(
          module, pipeline->rt_uses_rv64,
-         pipeline->retain_generated_artifacts, false, &path, &entry);
+         pipeline->retain_generated_artifacts, false, false, &path, &entry);
       delete module;
       if (!emitted)
          return false;
@@ -3010,7 +3036,7 @@ vtvk_emit_rt_global_candidate_kernels(
       uint64_t entry = 0;
       const bool emitted = vtvk_maybe_emit_rt_kernel_module(
          module, pipeline->rt_uses_rv64,
-         pipeline->retain_generated_artifacts, false, &path, &entry);
+         pipeline->retain_generated_artifacts, false, false, &path, &entry);
       delete module;
       if (!emitted)
          return false;

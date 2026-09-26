@@ -250,6 +250,10 @@ vt_nir_build_traversal_v5_submit(nir_builder *b,
                              nir_var_mem_shared | nir_var_mem_global);
    nir_def *traversed =
       nir_ventus_rt_traverse_v5(b, pds_address, private_state_address);
+   /* Wait in the issuing SIMT path, before the admission/bypass merge. A
+    * frontier on the merged value can leave JOINs (and the other branch's
+    * effects) between the hardware request and its first destination read. */
+   traversed = nir_ventus_rt_completion_frontier(b, traversed);
    nir_push_else(b, NULL);
    nir_def *bypassed = bypass;
    nir_pop_if(b, NULL);
@@ -267,5 +271,7 @@ vt_nir_build_traversal_v5_resume(nir_builder *b, nir_def *pds_address,
 {
    nir_scoped_memory_barrier(b, SCOPE_DEVICE, NIR_MEMORY_RELEASE,
                              nir_var_mem_shared | nir_var_mem_global);
-   return nir_ventus_rt_traverse_v5(b, pds_address, private_state_address);
+   nir_def *traversed =
+      nir_ventus_rt_traverse_v5(b, pds_address, private_state_address);
+   return nir_ventus_rt_completion_frontier(b, traversed);
 }

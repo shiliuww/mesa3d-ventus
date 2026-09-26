@@ -111,11 +111,24 @@ Relevant runtime controls include:
 | `VENTUS_VK_DRIVER_BACKEND=spike` | Select the Spike driver backend |
 | `VENTUS_VK_DRIVER_BRIDGE=1` | Enable resource upload and backend launch |
 | `VENTUS_VK_EMIT_ELF=1` | Compile/link a generated RT ELF |
+| `VENTUS_VK_RT_COMPLETION_CHECKER` | Required for V5 ELF emission: path to matching `ventus-env/tools/rtcore.py`; strict final-ELF failure rejects pipeline creation before execution |
+| `VENTUS_VK_LLVM_OBJDUMP` | Matching Ventus disassembler for the completion checker; falls back to `llvm-objdump` on PATH |
 | `VENTUS_VK_SHADER_ARTIFACT_DIR` | Directory for generated LLVM/ELF artifacts |
 | `VENTUS_VK_RETAIN_SHADER_ARTIFACTS=1` | Keep pipeline ELF and compiler intermediates after pipeline destruction for debugging |
 | `VENTUS_VK_RT_LEGACY_V4=1` | Select the retained MegaKernel V4 compatibility path; V5 is the default |
 | `VENTUS_VK_DUMP_IMAGE` | PPM path for storage-image readback |
 | `VENTUS_VK_DRIVER_LIB` | Optional explicit driver shared library |
+
+`ventus-env/env.sh` and the full-app Spike runner supply the checker paths.
+The gate currently supports uncompressed RV32 default V5 MegaKernel images
+containing at least one traversal, and decodes physical
+VGPRs through REGEXT/REGEXTI. Each traversal must read its result with the
+unmasked zero-immediate `vor.vi` frontier before memory operations, another RT
+operation, or SIMT control (including JOIN). It does not certify release-to-PDS
+reuse timing or request-owned PDS allocation. Artifact retention is optional;
+the runtime checks the final ELF while the owning pipeline still holds it.
+RV64 and traversal-free images fail this gate. Legacy V4/global profiles and
+ELFs supplied outside this pipeline compilation path are not certified by it.
 
 ## Build and Focused Tests
 

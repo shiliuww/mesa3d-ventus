@@ -395,6 +395,30 @@ count_intrinsic(nir_shader *shader, nir_intrinsic_op op)
 }
 
 static unsigned
+count_traversals_with_local_frontier(nir_shader *shader)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *frontier = nir_instr_as_intrinsic(instr);
+            if (frontier->intrinsic != nir_intrinsic_ventus_rt_completion_frontier)
+               continue;
+            nir_instr *source = nir_def_instr(frontier->src[0].ssa);
+            if (source->type == nir_instr_type_intrinsic &&
+                source->block == block &&
+                nir_instr_as_intrinsic(source)->intrinsic ==
+                   nir_intrinsic_ventus_rt_traverse_v5)
+               count++;
+         }
+      }
+   }
+   return count;
+}
+
+static unsigned
 count_zero_pds_field_store(nir_shader *shader,
                            enum vt_nir_rt_pds_field field,
                            uint32_t range_base)
@@ -927,7 +951,10 @@ main(int argc, char **argv)
                                nir_intrinsic_ventus_rt_traverse_v5) == 2);
    VT_RT_CHECK(count_intrinsic(
                   resident_raygen,
-                  nir_intrinsic_ventus_rt_completion_frontier) == 1);
+                  nir_intrinsic_ventus_rt_completion_frontier) == 2);
+   /* Both initial admission and callback resume must wait before leaving
+    * their issuing block; a single frontier after a phi/JOIN is too late. */
+   VT_RT_CHECK(count_traversals_with_local_frontier(resident_raygen) == 2);
    VT_RT_CHECK(count_intrinsic(resident_raygen,
                                nir_intrinsic_ventus_rt_release) == 1);
 
