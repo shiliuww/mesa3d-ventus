@@ -7,6 +7,106 @@
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_v5.h"
 
+/* Execute the lowered scalar expression against concrete PDS images by
+ * replacing memory loads, then using NIR's constant folder. This checks value
+ * selection, not merely whether some load exists in the generated shader. */
+static uint32_t
+evaluate_ray_tmax(mesa_shader_stage stage,
+                  const nir_shader_compiler_options *options,
+                  const struct vt_nir_rt_config *config,
+                  uint32_t candidate, uint32_t committed, bool valid)
+{
+   nir_builder b = nir_builder_init_simple_shader(stage, options,
+                                                 "vt_rt_tmax_phase_probe");
+   nir_store_global(&b, nir_load_ray_t_max(&b), nir_imm_int64(&b, 0x1000),
+                    .write_mask = 1, .align_mul = 4);
+   VT_RT_CHECK(vt_nir_lower_rt_abi(b.shader, config));
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_ventus_rt_hot_pds_address)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def_rewrite_uses(&intr->def, nir_imm_int(&b, 0));
+            nir_instr_remove(instr);
+         }
+      }
+   }
+   while (nir_opt_constant_folding(b.shader)) {}
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_global)
+               continue;
+            VT_RT_CHECK(nir_src_is_const(intr->src[0]));
+            const uint64_t address = nir_src_as_uint(intr->src[0]);
+            uint32_t value;
+            switch (address) {
+            case VENTUS_RT_V5_PDS_CALLBACK_BASE + VENTUS_RT_V5_HIT_T:
+               value = candidate; break;
+            case VENTUS_RT_V5_PDS_COMMITTED_BASE + VENTUS_RT_V5_HIT_T:
+               value = committed; break;
+            case VENTUS_RT_V5_PDS_COMMITTED_BASE + VENTUS_RT_V5_HIT_METADATA:
+               value = valid ? VENTUS_RT_V5_HIT_METADATA_COMMITTED_VALID : 0;
+               break;
+            case VT_RT_SLOT_TMAX * sizeof(uint32_t):
+               value = 0x41200000; break; /* original upper bound 10 */
+            default:
+               fprintf(stderr, "unexpected tmax probe read: %llu\n",
+                       (unsigned long long)address);
+               abort();
+            }
+            b.cursor = nir_before_instr(instr);
+            nir_def_rewrite_uses(&intr->def, nir_imm_int(&b, value));
+            nir_instr_remove(instr);
+         }
+      }
+   }
+   while (nir_opt_constant_folding(b.shader)) {}
+   uint32_t result = 0;
+   unsigned stores = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_global) {
+               VT_RT_CHECK(nir_src_is_const(intr->src[0]));
+               result = nir_src_as_uint(intr->src[0]);
+               ++stores;
+            }
+         }
+      }
+   }
+   VT_RT_CHECK(stores == 1);
+   ralloc_free(b.shader);
+   return result;
+}
+
+static void
+check_ray_tmax_phase_semantics(const nir_shader_compiler_options *options,
+                               const struct vt_nir_rt_config *config)
+{
+   const uint32_t candidates[] = {0, 0x426fabed, 0x42c80000};
+   for (unsigned i = 0; i < ARRAY_SIZE(candidates); ++i) {
+      VT_RT_CHECK(evaluate_ray_tmax(MESA_SHADER_INTERSECTION, options, config,
+                    candidates[i], 0x40e00000, false) == 0x41200000);
+      VT_RT_CHECK(evaluate_ray_tmax(MESA_SHADER_INTERSECTION, options, config,
+                    candidates[i], 0x40e00000, true) == 0x40e00000);
+      VT_RT_CHECK(evaluate_ray_tmax(MESA_SHADER_ANY_HIT, options, config,
+                    candidates[i], 0x40e00000, true) == candidates[i]);
+      VT_RT_CHECK(evaluate_ray_tmax(MESA_SHADER_CLOSEST_HIT, options, config,
+                    candidates[i], 0x40e00000, true) == 0x40e00000);
+   }
+}
+
 static nir_shader *
 build_resident_callable_probe(const nir_shader_compiler_options *options)
 {
@@ -835,6 +935,7 @@ main(int argc, char **argv)
    struct vt_nir_rt_config v5_config = vt_nir_rt_default_config();
    vt_nir_rt_config_apply_abi_layout(&v5_config, &abi);
    v5_config.use_v5_pds = true;
+   check_ray_tmax_phase_semantics(&options, &v5_config);
    VT_RT_CHECK(vt_nir_lower_rt_abi(v5_raygen, &v5_config));
    VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(v5_raygen, &v5_config));
    nir_validate_shader(v5_raygen, "after Ventus production V5 lowering");

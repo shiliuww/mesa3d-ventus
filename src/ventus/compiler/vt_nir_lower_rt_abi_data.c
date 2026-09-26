@@ -907,8 +907,14 @@ lower_hit_record_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                          nir_intrinsic_column(intrin) * 3 * sizeof(float)));
       break;
    case nir_intrinsic_load_ray_t_max:
-      replacement = load_active_hit_record_word(b, config, layout,
-                                                VT_RT_HIT_RECORD_HIT_T, 32);
+      /* An intersection callback has an AABB identity, not a reported hit.
+       * Its candidate t is not valid; the interval ends at the accepted hit
+       * (or the original ray upper bound before any hit is accepted).
+       * Any-hit still observes the current reported candidate distance. */
+      replacement = b->shader->info.stage == MESA_SHADER_INTERSECTION
+                       ? load_committed_tmax(b, config, layout)
+                       : load_active_hit_record_word(
+                            b, config, layout, VT_RT_HIT_RECORD_HIT_T, 32);
       break;
    case nir_intrinsic_load_ray_t_min:
       replacement = vt_nir_load_ray_state_word(b, config, layout, VT_RT_SLOT_TMIN);
