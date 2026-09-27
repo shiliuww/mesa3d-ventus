@@ -20,6 +20,12 @@ extern "C" {
 
 #define VK_VENTUS_RT_EXECUTION_PROFILE_VERSION_1 1u
 
+/* Shader-private flag consumed by Mesa before RT Local TraceMeta0 is written.
+ * A raygen helper may OR it into one traceRayEXT invocation to request the
+ * collective group-traverse lowering.  It is not a Vulkan RayFlagsKHR bit and
+ * must never be visible to an RT shader-table implementation. */
+#define VENTUS_RT_TRACE_FLAG_GROUP_COLLECTIVE_BIT 0x80000000u
+
 typedef enum VkVentusRtExecutionProfile {
    VK_VENTUS_RT_EXECUTION_PROFILE_MEGAKERNEL = 0,
    /* Application-defined primary/shadow/reflection dispatch stages.  This is

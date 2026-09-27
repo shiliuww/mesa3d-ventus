@@ -455,9 +455,17 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *base = NULL;
 
    store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
+   /* A private helper may mark this particular trace as a collective.  Keep
+    * that control bit out of the standard trace-flags ABI consumed by RTcore.
+    */
+   nir_def *software_group_collective = nir_ine_imm(
+      b, nir_iand_imm(b, params->flags,
+                       VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE), 0);
+   nir_def *trace_flags = nir_iand_imm(b, params->flags,
+                                       ~VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE);
    vt_nir_store_trace_meta_field(
       b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_SLOT_TRACE_META0,
-      VT_RT_TRACE_META0_FLAGS_SHIFT, VT_RT_TRACE_META0_FLAGS_BITS, params->flags);
+      VT_RT_TRACE_META0_FLAGS_SHIFT, VT_RT_TRACE_META0_FLAGS_BITS, trace_flags);
    vt_nir_store_trace_meta_field(
       b, config, VT_RT_LAYOUT_RAYGEN, VT_RT_SLOT_TRACE_META0,
       VT_RT_TRACE_META0_CULL_MASK_SHIFT, VT_RT_TRACE_META0_CULL_MASK_BITS,
@@ -502,12 +510,14 @@ vt_nir_build_traversal(nir_builder *b,
    if (config->enable_group_reorder && config->rt_group_warps > 1) {
       /* A global pipeline setting cannot make every recursive trace a
        * collective: closest-hit/raygen-loop children may be issued by only a
-       * subset of the workgroup.  Level zero is the uniform primary round;
-       * children retain their logical RT Local mapping but use ordinary
-       * traverse until software supplies an explicit later-round rendezvous. */
+       * subset of the workgroup.  Level zero is uniform.  A later round is
+       * collective only when VentusGroupTraceRay marked this trace and software
+       * has arranged a full-group rendezvous. */
       nir_def *is_primary_round = nir_ieq_imm(
          b, vt_nir_load_active_level(b, config, VT_RT_LAYOUT_RAYGEN), 0);
-      nir_if *primary_if = nir_push_if(b, is_primary_round);
+      nir_def *is_group_collective = nir_ior(b, is_primary_round,
+                                             software_group_collective);
+      nir_if *primary_if = nir_push_if(b, is_group_collective);
       nir_def *group_status = nir_ventus_rt_group_traverse(b, group_locator);
       nir_if *child_else = nir_push_else(b, primary_if);
       nir_def *child_status = nir_ventus_rt_traverse(b, warp_first_tid);

@@ -103,6 +103,12 @@ struct vt_nir_rt_abi_layout {
    uint32_t total_size_bytes;
 };
 
+/* Private per-trace marker used by the VentusGroupTraceRay shader helper.
+ * It is consumed by lowering and never reaches the RT Local trace flags or
+ * RTcore.  Its use promises that every member of the configured group reaches
+ * this trace round (an inactive member still issues the empty collective). */
+#define VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE (1u << 31)
+
 struct vt_nir_rt_config;
 
 struct vt_nir_rt_trace_params {
