@@ -92,6 +92,22 @@ current_layout(nir_builder *b)
    return vt_nir_layout_for_stage(b->shader->info.stage);
 }
 
+static uint32_t
+v5_hit_attribute_base(mesa_shader_stage stage, uint32_t fallback)
+{
+   switch (stage) {
+   case MESA_SHADER_ANY_HIT:
+   case MESA_SHADER_INTERSECTION:
+      return VENTUS_RT_V5_PDS_CALLBACK_BASE +
+             VENTUS_RT_V5_HIT_ATTRIBUTES;
+   case MESA_SHADER_CLOSEST_HIT:
+      return VENTUS_RT_V5_PDS_COMMITTED_BASE +
+             VENTUS_RT_V5_HIT_ATTRIBUTES;
+   default:
+      return fallback;
+   }
+}
+
 static nir_def *
 load_dispatch_arg(nir_builder *b, uint32_t offset, unsigned bit_size)
 {
@@ -1009,7 +1025,9 @@ lower_rt_control_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
          }
       } else if (config->use_v5_pds) {
          replacement = load_v5_pds_u32(
-            b, config->scratchpad[layout].hit_attrib_base_bytes +
+            b, v5_hit_attribute_base(
+                  b->shader->info.stage,
+                  config->scratchpad[layout].hit_attrib_base_bytes) +
                   byte_offset);
       } else {
          replacement = load_rt_slot_word(
@@ -1091,6 +1109,9 @@ vt_nir_lower_rt_control(nir_shader *shader,
    enum vt_rt_shader_layout layout = vt_nir_layout_for_stage(shader->info.stage);
    uint32_t hit_attrib_base =
       config->scratchpad[layout].hit_attrib_base_bytes;
+   if (config->use_v5_pds)
+      hit_attrib_base = v5_hit_attribute_base(shader->info.stage,
+                                              hit_attrib_base);
 
    progress |= lower_rt_vars(shader, nir_var_ray_hit_attrib, config,
                              hit_attrib_base, false, NULL);

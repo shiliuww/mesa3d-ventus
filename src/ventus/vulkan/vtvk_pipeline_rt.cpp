@@ -2513,6 +2513,8 @@ vtvk_emit_rt_callback_shader_with_index(
 struct vtvk_rt_v5_intersection_report_lower_data {
    const struct vt_nir_rt_config *config;
    const std::vector<vtvk_rt_callback_shader_entry> *any_hit;
+   uint32_t intersection_group_index;
+   bool statically_bound_any_hit;
 };
 
 /* An independent intersection entry must preserve the Vulkan-visible order
@@ -2572,15 +2574,18 @@ vtvk_lower_rt_v5_intersection_report_entry(nir_builder *b,
    nir_def *procedural_any_hit = vt_nir_load_candidate_hit_record_word(
       b, config, layout,
       VT_RT_HIT_RECORD_NEED_SOFTWARE_OPACITY_TEST, 1);
-   nir_push_if(b, nir_iand(b, eligible, procedural_any_hit));
-   nir_def *frame = vt_nir_rt_v5_current_continuation_frame(b);
-   nir_def *record_ptr = nir_load_global(
-      b, 1, 64,
-      nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
-      .align_mul = 8);
-   nir_def *group_index =
-      vtvk_load_rt_shader_record_group_index(b, record_ptr);
+   nir_def *invoke_any_hit = state->statically_bound_any_hit ?
+      eligible : nir_iand(b, eligible, procedural_any_hit);
+   nir_push_if(b, invoke_any_hit);
    if (state->any_hit && !state->any_hit->empty()) {
+      nir_def *frame = vt_nir_rt_v5_current_continuation_frame(b);
+      nir_def *record_ptr = nir_load_global(
+         b, 1, 64,
+         nir_iadd_imm(b, frame, VTVK_RT_ENTRY_RECORD_PTR_OFFSET),
+         .align_mul = 8);
+      nir_def *group_index = state->statically_bound_any_hit ?
+         nir_imm_int(b, state->intersection_group_index) :
+         vtvk_load_rt_shader_record_group_index(b, record_ptr);
       vtvk_emit_rt_callback_shader_with_index(
          b, *state->any_hit, group_index, record_ptr, true);
    }
@@ -2642,9 +2647,27 @@ vtvk_lower_rt_v5_intersection_entry_reports(
       if (already_lowered)
          continue;
 
+      size_t shader_group_count = 0;
+      for (const vtvk_rt_callback_shader_entry &entry : intersection) {
+         if (entry.shader == shader)
+            shader_group_count++;
+      }
+
+      bool statically_bound_any_hit = false;
+      if (shader_group_count == 1) {
+         for (const vtvk_rt_callback_shader_entry &entry : any_hit) {
+            if (entry.group_index == intersection[i].group_index) {
+               statically_bound_any_hit = true;
+               break;
+            }
+         }
+      }
+
       const vtvk_rt_v5_intersection_report_lower_data data = {
          .config = config,
          .any_hit = &any_hit,
+         .intersection_group_index = intersection[i].group_index,
+         .statically_bound_any_hit = statically_bound_any_hit,
       };
       nir_shader_intrinsics_pass(
          shader, vtvk_lower_rt_v5_intersection_report_entry,
