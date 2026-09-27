@@ -2054,10 +2054,21 @@ private:
       }
       case nir_intrinsic_ventus_rt_warp_first_tid:
          return callI32Intrinsic("llvm.riscv.ventus.rt.warp.first.tid");
+      case nir_intrinsic_ventus_rt_warp_first_tid_scalar:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.warp.first.tid.scalar");
+      case nir_intrinsic_ventus_rt_lane_id:
+         return callI32Intrinsic("llvm.riscv.ventus.rt.lane.id");
       case nir_intrinsic_ventus_rt_traverse: {
          if (noopRtIntrinsics)
             return ConstantInt::get(i32, 0);
          Function *fn = declare("llvm.riscv.ventus.rt.traverse.i32", i32, {i32});
+         return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
+      }
+      case nir_intrinsic_ventus_rt_group_traverse: {
+         if (noopRtIntrinsics)
+            return ConstantInt::get(i32, 0);
+         Function *fn = declare("llvm.riscv.ventus.rt.group.traverse.i32", i32,
+                                {i32});
          return builder.CreateCall(fn, {asInt32(value(intrin->src[0]))});
       }
       case nir_intrinsic_ventus_rt_release: {

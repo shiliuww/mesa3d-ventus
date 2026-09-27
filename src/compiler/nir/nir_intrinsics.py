@@ -778,10 +778,16 @@ intrinsic("ventus_rt_worker_id", dest_comp=1, bit_sizes=[32])
 # not the Vulkan local-invocation index.  RTcore uses it to select the warp's
 # RT Local SRAM row and validates it against CSR_WID.
 intrinsic("ventus_rt_warp_first_tid", dest_comp=1, bit_sizes=[32])
+intrinsic("ventus_rt_warp_first_tid_scalar", dest_comp=1, bit_sizes=[32])
+# Lane-varying hardware-warp index (0..VL-1).  Group traverse combines this
+# with the workgroup-local CSR_TID base so its vector source names a logical
+# cross-warp TID, never a physical RT Local SRAM row.
+intrinsic("ventus_rt_lane_id", dest_comp=1, bit_sizes=[32])
 # Compact global callback/resume dispatch index.  Unlike a Vulkan launch ID it
 # names an entry in the RTcore-owned ray_ref list for this kernel dispatch.
 intrinsic("ventus_rt_dispatch_index", dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
+intrinsic("ventus_rt_group_traverse", src_comp=[1], dest_comp=1, bit_sizes=[32])
 intrinsic("ventus_rt_release", src_comp=[1])
 # Global-wavefront producer doorbell.  The source is the lane's global submit
 # mailbox address; it is valid only after the producer has published VALID.

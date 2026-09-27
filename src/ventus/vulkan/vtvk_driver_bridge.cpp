@@ -1094,7 +1094,28 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       bridge_failed = true;
       return false;
    }
-   uint64_t raygen_wg_x = DIV_ROUND_UP(raygen_invocation_count, 32);
+   const char *rt_group_env = getenv("VENTUS_VK_RT_GROUP_WARPS");
+   const unsigned long rt_group_warps = rt_group_env ? strtoul(rt_group_env, NULL, 10) : 1;
+   if (rt_group_warps != 1 && rt_group_warps != 2 &&
+       rt_group_warps != 4 && rt_group_warps != 8) {
+      mesa_loge("ventus-vk: VENTUS_VK_RT_GROUP_WARPS must be 1, 2, 4 or 8");
+      vtvk_driver_close(&driver);
+      bridge_failed = true;
+      return false;
+   }
+   /* A tail dispatch cannot form a static 2/4/8-warp collective: rays in
+    * absent warps exit before traceRay and therefore never arrive at its
+    * fence.  Clamp the launch cohort to the largest supported power of two
+    * covered by this dispatch.  The shader remains group-capable; CSR group
+    * size tells pipe the effective participant count. */
+   const uint64_t raygen_warp_count = DIV_ROUND_UP(raygen_invocation_count,
+                                                   vtvk_rt_lanes_per_warp);
+   unsigned long effective_rt_group_warps = 1;
+   while (effective_rt_group_warps < rt_group_warps &&
+          effective_rt_group_warps * 2 <= raygen_warp_count)
+      effective_rt_group_warps *= 2;
+   const uint64_t raygen_wg_x = DIV_ROUND_UP(raygen_invocation_count,
+                                               32 * effective_rt_group_warps);
    const uint64_t raygen_wg_y = 1;
    const uint64_t raygen_wg_z = 1;
    const bool staged_dispatch_profile =
@@ -1657,7 +1678,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.kernel_size[1] = raygen_wg_y;
    kernel.kernel_size[2] = raygen_wg_z;
    kernel.wf_size = vtvk_rt_lanes_per_warp;
-   kernel.wg_size = 1;
+   kernel.wg_size = effective_rt_group_warps;
    kernel.metaDataBaseAddr = metadata_dev_addr;
    kernel.ldsSize = 0;
    kernel.pdsSize = wavefront_global ? 0 : pds_per_lane;
@@ -1667,7 +1688,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.num_thread_global[0] = raygen_global_x;
    kernel.num_thread_global[1] = 1;
    kernel.num_thread_global[2] = 1;
-   kernel.num_thread_local[0] = vtvk_rt_lanes_per_warp;
+   kernel.num_thread_local[0] = vtvk_rt_lanes_per_warp * effective_rt_group_warps;
    kernel.num_thread_local[1] = 1;
    kernel.num_thread_local[2] = 1;
    kernel.kernel_name = "ventus_vk_raygen";

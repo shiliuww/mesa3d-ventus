@@ -73,6 +73,26 @@ vtvk_env_enabled(const char *name)
           strcmp(value, "OFF") != 0;
 }
 
+/* This is a pipeline specialization, not a dynamic shader knob: generated
+ * code, launch geometry and RTL must agree.  Invalid values intentionally
+ * retain the compatibility configuration. */
+static uint8_t
+vtvk_rt_group_warps(void)
+{
+   const char *value = getenv("VENTUS_VK_RT_GROUP_WARPS");
+   if (!value || !value[0])
+      return 1;
+   unsigned long n = strtoul(value, NULL, 10);
+   return n == 1 || n == 2 || n == 4 || n == 8 ? n : 1;
+}
+
+static void
+vtvk_configure_rt_group(struct vt_nir_rt_config *config)
+{
+   config->rt_group_warps = vtvk_rt_group_warps();
+   config->enable_group_reorder = config->rt_group_warps > 1;
+}
+
 struct vtvk_rt_execution_profile_config {
    VkVentusRtExecutionProfile profile;
    VkVentusRtStageRole stage_role;
@@ -1864,6 +1884,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    {
       struct vt_nir_rt_config config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&config, &rt_abi);
+      vtvk_configure_rt_group(&config);
 
       config.defer_intersection_reports = true;
       if (global_wavefront) {
@@ -1882,6 +1903,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    {
       struct vt_nir_rt_config rt_io_config = vt_nir_rt_default_config();
       vt_nir_rt_config_apply_abi_layout(&rt_io_config, &rt_abi);
+      vtvk_configure_rt_group(&rt_io_config);
       rt_io_config.defer_intersection_reports = true;
       if (global_wavefront) {
          vt_nir_rt_config_apply_global_cps_layout(&rt_io_config, &rt_abi);

@@ -29,6 +29,8 @@ vt_nir_rt_default_config(void)
       .hit_sbt_record_stride = 64,
       .shader_group_handle_size = 32,
       .miss_depth_value = 0x7fffffff,
+      .rt_group_warps = 1,
+      .enable_group_reorder = false,
       .defer_intersection_reports = false,
       .enable_monolithic_shader_callbacks = false,
       .emit_closest_hit = NULL,
@@ -489,7 +491,31 @@ vt_nir_build_traversal(nir_builder *b,
     * warp's first thread ID and derives its SRAM bank; lane selects the
     * corresponding word within that bank. */
    nir_def *warp_first_tid = nir_ventus_rt_warp_first_tid(b);
-   nir_def *status = nir_ventus_rt_traverse(b, warp_first_tid);
+   /* A group locator is deliberately lane varying.  CSR_TID supplies the
+    * workgroup-local warp-member base (member * 32); lane_id completes the
+    * logical cross-warp TID.  Scheduler maps this logical TID plus the
+    * command workgroup tag to RT Local SRAM, so no physical row/PDS address
+    * becomes part of the shader ABI. */
+   nir_def *group_locator = nir_iadd(b, warp_first_tid,
+                                     nir_ventus_rt_lane_id(b));
+   nir_def *status;
+   if (config->enable_group_reorder && config->rt_group_warps > 1) {
+      /* A global pipeline setting cannot make every recursive trace a
+       * collective: closest-hit/raygen-loop children may be issued by only a
+       * subset of the workgroup.  Level zero is the uniform primary round;
+       * children retain their logical RT Local mapping but use ordinary
+       * traverse until software supplies an explicit later-round rendezvous. */
+      nir_def *is_primary_round = nir_ieq_imm(
+         b, vt_nir_load_active_level(b, config, VT_RT_LAYOUT_RAYGEN), 0);
+      nir_if *primary_if = nir_push_if(b, is_primary_round);
+      nir_def *group_status = nir_ventus_rt_group_traverse(b, group_locator);
+      nir_if *child_else = nir_push_else(b, primary_if);
+      nir_def *child_status = nir_ventus_rt_traverse(b, warp_first_tid);
+      nir_pop_if(b, child_else);
+      status = nir_if_phi(b, group_status, child_status);
+   } else {
+      status = nir_ventus_rt_traverse(b, warp_first_tid);
+   }
    nir_def *candidate_non_opaque_triangle =
       nir_ieq_imm(b, status, VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE);
    nir_def *candidate_procedural_aabb =

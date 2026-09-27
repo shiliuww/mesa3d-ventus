@@ -171,6 +171,11 @@ struct vt_nir_rt_config {
    uint32_t hit_sbt_record_stride;
    uint32_t shader_group_handle_size;
    uint32_t miss_depth_value;
+   /* Number of 32-lane warps participating in one RT reorder group.  This is
+    * pipeline-specialized (1, 2, 4 or 8); it is never inferred from a PDS
+    * address. */
+   uint8_t rt_group_warps;
+   bool enable_group_reorder;
    /* Keep reportIntersectionEXT in an intersection shader intact until the
     * per-hit-group callback builder can inline that group's any-hit code at
     * the report site. */
