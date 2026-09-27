@@ -90,7 +90,11 @@ static void
 vtvk_configure_rt_group(struct vt_nir_rt_config *config)
 {
    config->rt_group_warps = vtvk_rt_group_warps();
-   config->enable_group_reorder = config->rt_group_warps > 1;
+   /* Keep primary traversal on the locator-based group ISA even for a
+    * one-warp cohort.  Besides making group size a pure launch policy, this
+    * gives the compatibility configuration the same physical-completion
+    * hand-off path as larger groups. */
+   config->enable_group_reorder = true;
 }
 
 struct vtvk_rt_execution_profile_config {

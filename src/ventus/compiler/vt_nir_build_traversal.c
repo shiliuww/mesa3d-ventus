@@ -507,7 +507,7 @@ vt_nir_build_traversal(nir_builder *b,
    nir_def *group_locator = nir_iadd(b, warp_first_tid,
                                      nir_ventus_rt_lane_id(b));
    nir_def *status;
-   if (config->enable_group_reorder && config->rt_group_warps > 1) {
+   if (config->enable_group_reorder) {
       /* A global pipeline setting cannot make every recursive trace a
        * collective: closest-hit/raygen-loop children may be issued by only a
        * subset of the workgroup.  Level zero is uniform.  A later round is
