@@ -3850,7 +3850,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    /* A mip-linear sampler is immaterial when every texture instruction uses
     * LOD0 and minLod is zero. Preserve existing RT base-level workloads while
     * rejecting this sampler for explicit nonzero/dynamic LOD pipelines. */
-   pipeline->texture_lod0_only = true;
+   /* Separate global callbacks/resume ELFs are not all in this list. */
+   pipeline->texture_lod0_only = !global_wavefront;
    for (nir_shader *shader : linked_entry_shaders) {
       nir_foreach_function_impl(impl, shader) {
          nir_foreach_block(block, impl) {
