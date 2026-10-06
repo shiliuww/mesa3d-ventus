@@ -1569,10 +1569,17 @@ private:
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, max_lod), max_lod, level);
       Value *last = builder.CreateUIToFP(builder.CreateSub(level_count, ConstantInt::get(i32, 1)), f32);
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, last), last, level);
-      Value *low = floorToI32(level);
-      Value *fraction = builder.CreateFSub(level, builder.CreateSIToFP(low, f32));
-      Value *index = builder.CreateSelect(builder.CreateFCmpOGT(fraction, ConstantFP::get(f32, 0.5)),
-                                          builder.CreateAdd(low, ConstantInt::get(i32, 1)), low);
+      /* The clamped value is nonnegative, so binary32 bit ordering matches
+       * numeric ordering. Count half-level thresholds using integer compares.
+       * This preserves exact ties without uniform floating subtraction, which
+       * the current Ventus backend incorrectly places in a vector register. */
+      Value *index = ConstantInt::get(i32, 0);
+      Value *level_bits = asInt32(level);
+      for (unsigned mip = 0; mip < 14; ++mip) {
+         Value *threshold = asInt32(ConstantFP::get(f32, mip + 0.5));
+         index = builder.CreateSelect(builder.CreateICmpUGT(level_bits, threshold),
+                                       ConstantInt::get(i32, mip + 1), index);
+      }
       Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
       Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
       auto field = [&](unsigned offset) {
