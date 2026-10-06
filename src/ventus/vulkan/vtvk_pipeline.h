@@ -78,6 +78,7 @@ struct vtvk_pipeline {
    uint32_t rt_state_descriptor_set;
    uint32_t rt_state_descriptor_binding;
    bool rt_uses_rv64;
+   bool texture_lod0_only;
    bool retain_generated_artifacts;
    bool rt_v5_enabled;
    bool rt_stack_size_dynamic;

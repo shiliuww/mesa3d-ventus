@@ -93,6 +93,7 @@ static bool
 vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
                            uint32_t set,
                            uint32_t binding,
+                           bool texture_lod0_only,
                            std::vector<vtvk_rt_descriptor_source> *out)
 {
    struct vtvk_rt_descriptor_source desc = {};
@@ -108,6 +109,7 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       desc.image = info->image;
       desc.image_view = info->image_info.imageView;
+      desc.texture_lod0_only = texture_lod0_only;
       desc.sampler = info->image_info.sampler;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -214,7 +216,9 @@ vtvk_execute_trace_rays(
            binding++) {
          struct vtvk_descriptor_binding_info info = {};
          if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info) ||
-             !vtvk_collect_rt_descriptor(&info, set, binding, &descriptors))
+             !vtvk_collect_rt_descriptor(&info, set, binding,
+                                         pipeline && pipeline->texture_lod0_only,
+                                         &descriptors))
             continue;
 
          if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&

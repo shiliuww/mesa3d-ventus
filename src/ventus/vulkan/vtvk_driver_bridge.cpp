@@ -1215,7 +1215,8 @@ vtvk_driver_upload_descriptor(
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
              sampler->compare_enable || sampler->unnormalized_coordinates ||
              (view->level_count > 1 &&
-              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST)) {
+              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+              !(src->texture_lod0_only && sampler->min_lod == 0.0f))) {
             mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
             return false;
          }

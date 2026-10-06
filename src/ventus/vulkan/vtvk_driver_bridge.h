@@ -95,6 +95,7 @@ struct vtvk_rt_descriptor_source {
    VkAccelerationStructureKHR acceleration_structure;
    VkImage image;
    VkImageView image_view;
+   bool texture_lod0_only;
    VkSampler sampler;
    VkBuffer buffer;
    VkDeviceSize offset;

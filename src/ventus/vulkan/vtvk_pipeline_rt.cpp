@@ -3847,6 +3847,29 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          (unsigned)linked_entry_symbols.size() : 0,
    };
 
+   /* A mip-linear sampler is immaterial when every texture instruction uses
+    * LOD0 and minLod is zero. Preserve existing RT base-level workloads while
+    * rejecting this sampler for explicit nonzero/dynamic LOD pipelines. */
+   pipeline->texture_lod0_only = true;
+   for (nir_shader *shader : linked_entry_shaders) {
+      nir_foreach_function_impl(impl, shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_tex)
+                  continue;
+               const nir_tex_instr *tex = nir_instr_as_tex(instr);
+               bool lod0 = tex->op == nir_texop_tex;
+               if (tex->op == nir_texop_txl) {
+                  for (unsigned src = 0; src < tex->num_srcs; ++src)
+                     if (tex->src[src].src_type == nir_tex_src_lod)
+                        lod0 = nir_src_is_const(tex->src[src].src) &&
+                           nir_src_as_float(tex->src[src].src) == 0.0f;
+               }
+               pipeline->texture_lod0_only &= lod0;
+            }
+         }
+      }
+   }
    pipeline->llvm_module =
       vt_nir_to_llvm_translate(linked_entry_shaders.data(),
                                linked_entry_shaders.size(),
