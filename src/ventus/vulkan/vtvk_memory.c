@@ -333,6 +333,23 @@ vtvk_CreateImage(VkDevice _device,
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
 
+   const bool color = pCreateInfo->format == VK_FORMAT_R8G8B8A8_UNORM ||
+                      pCreateInfo->format == VK_FORMAT_B8G8R8A8_UNORM;
+   uint32_t max_levels = 1;
+   uint32_t dimension = MAX2(pCreateInfo->extent.width, pCreateInfo->extent.height);
+   while (dimension > 1) { dimension >>= 1; ++max_levels; }
+   if (pCreateInfo->pNext || pCreateInfo->flags ||
+       pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
+       pCreateInfo->arrayLayers != 1 ||
+       pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
+       !pCreateInfo->extent.width || !pCreateInfo->extent.height ||
+       pCreateInfo->extent.width > 16384 || pCreateInfo->extent.height > 16384 ||
+       pCreateInfo->extent.depth != 1 || !pCreateInfo->mipLevels ||
+       pCreateInfo->mipLevels > max_levels ||
+       pCreateInfo->mipLevels > VTVK_MAX_MIP_LEVELS ||
+       (!color && pCreateInfo->mipLevels != 1))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
    struct vtvk_image *image =
       vk_zalloc(alloc, sizeof(*image), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!image)
@@ -340,9 +357,19 @@ vtvk_CreateImage(VkDevice _device,
 
    image->extent = pCreateInfo->extent;
    image->format = pCreateInfo->format;
-   image->size =
-      (VkDeviceSize)image->extent.width * image->extent.height *
-      image->extent.depth * vtvk_format_bytes_per_pixel(image->format);
+   image->mip_levels = pCreateInfo->mipLevels;
+   uint32_t width = image->extent.width, height = image->extent.height;
+   for (uint32_t level = 0; level < image->mip_levels; ++level) {
+      struct vtvk_image_level *mip = &image->levels[level];
+      mip->width = width;
+      mip->height = height;
+      mip->row_pitch = width * vtvk_format_bytes_per_pixel(image->format);
+      mip->offset = image->size;
+      mip->size = (VkDeviceSize)mip->row_pitch * height;
+      image->size += mip->size;
+      width = MAX2(1, width >> 1);
+      height = MAX2(1, height >> 1);
+   }
    *pImage = (VkImage)vtvk_ptr_to_handle(image);
    return VK_SUCCESS;
 }
@@ -364,6 +391,26 @@ vtvk_CreateImageView(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)pCreateInfo->image);
+   const VkImageSubresourceRange *range = &pCreateInfo->subresourceRange;
+   const uint32_t count = image && range->baseMipLevel < image->mip_levels &&
+      range->levelCount == VK_REMAINING_MIP_LEVELS ?
+      image->mip_levels - range->baseMipLevel : range->levelCount;
+   const bool color = image && (image->format == VK_FORMAT_R8G8B8A8_UNORM ||
+                               image->format == VK_FORMAT_B8G8R8A8_UNORM);
+   if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
+       pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D ||
+       pCreateInfo->format != image->format ||
+       range->baseArrayLayer != 0 ||
+       (range->layerCount != 1 && range->layerCount != VK_REMAINING_ARRAY_LAYERS) ||
+       range->baseMipLevel >= image->mip_levels || !count ||
+       count > image->mip_levels - range->baseMipLevel ||
+       (color && range->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) ||
+       (pCreateInfo->components.r != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.r != VK_COMPONENT_SWIZZLE_R) ||
+       (pCreateInfo->components.g != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.g != VK_COMPONENT_SWIZZLE_G) ||
+       (pCreateInfo->components.b != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.b != VK_COMPONENT_SWIZZLE_B) ||
+       (pCreateInfo->components.a != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.a != VK_COMPONENT_SWIZZLE_A))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    struct vtvk_image_view *view =
       vk_zalloc(alloc, sizeof(*view), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!view)
@@ -371,6 +418,8 @@ vtvk_CreateImageView(VkDevice _device,
 
    view->image = pCreateInfo->image;
    view->format = pCreateInfo->format;
+   view->base_mip = range->baseMipLevel;
+   view->level_count = count;
    *pView = (VkImageView)vtvk_ptr_to_handle(view);
    return VK_SUCCESS;
 }

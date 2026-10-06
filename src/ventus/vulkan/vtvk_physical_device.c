@@ -394,6 +394,8 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
+   if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D || pImageFormatInfo->flags)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if (pImageFormatInfo->format != VK_FORMAT_R8G8B8A8_UNORM &&
        pImageFormatInfo->format != VK_FORMAT_B8G8R8A8_UNORM &&
        pImageFormatInfo->format != VK_FORMAT_D16_UNORM &&
@@ -404,7 +406,8 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
 
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
       .maxExtent = {16384, 16384, 1},
-      .maxMipLevels = 1,
+      .maxMipLevels = (pImageFormatInfo->format == VK_FORMAT_R8G8B8A8_UNORM ||
+                       pImageFormatInfo->format == VK_FORMAT_B8G8R8A8_UNORM) ? 15 : 1,
       .maxArrayLayers = 1,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxResourceSize = 1ull << 32,

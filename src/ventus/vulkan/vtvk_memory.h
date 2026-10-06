@@ -24,6 +24,12 @@ struct vtvk_buffer {
    struct vtvk_buffer *next;
 };
 
+#define VTVK_MAX_MIP_LEVELS 15
+struct vtvk_image_level {
+   uint32_t width, height, row_pitch;
+   VkDeviceSize offset, size;
+};
+
 struct vtvk_image {
    VkExtent3D extent;
    VkFormat format;
@@ -32,11 +38,14 @@ struct vtvk_image {
    VkDeviceSize memory_offset;
    void *map;
    VkDeviceAddress device_address;
+   uint32_t mip_levels;
+   struct vtvk_image_level levels[VTVK_MAX_MIP_LEVELS];
 };
 
 struct vtvk_image_view {
    VkImage image;
    VkFormat format;
+   uint32_t base_mip, level_count;
 };
 
 #endif

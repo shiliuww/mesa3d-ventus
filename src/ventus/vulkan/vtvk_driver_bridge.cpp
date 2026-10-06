@@ -45,6 +45,12 @@ static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
 static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
               VT_NIR_RT_DESCRIPTOR_RECORD_SIZE,
               "RT descriptor ABI size mismatch");
+static_assert(sizeof(vtvk_rt_mip_record) == VT_NIR_RT_MIP_RECORD_SIZE);
+static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD);
+static_assert(offsetof(vtvk_rt_descriptor_record, max_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD);
+static_assert(offsetof(vtvk_rt_mip_record, row_pitch) == VT_NIR_RT_MIP_RECORD_ROW_PITCH);
 static_assert(offsetof(struct vtvk_rt_dispatch_args, abi_tag) ==
               VT_NIR_RT_DISPATCH_ARG_ABI_TAG,
               "legacy RT ABI tag dispatch argument mismatch");
@@ -1179,53 +1185,58 @@ vtvk_driver_upload_descriptor(
 
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
-      VkExtent3D extent = {};
-      VkFormat format = VK_FORMAT_UNDEFINED;
-      void *host = vtvk_image_host_ptr(src->image, &extent, &format);
-      uint32_t bpp = vtvk_bridge_format_bytes_per_pixel(format);
-      uint32_t stride = extent.width * bpp;
-      uint64_t size = (uint64_t)stride * extent.height *
-                      (extent.depth ? extent.depth : 1);
-      record->device_addr = vtvk_image_get_device_address(src->image);
-      if (!host || !record->device_addr ||
-          api->vt_copy_to_dev(api->device, record->device_addr, host, size,
-                              0, 0) != 0) {
-         mesa_loge("ventus-vk: failed to upload image descriptor binding=%u",
-                   src->binding);
+      auto *image = (struct vtvk_image *)(uintptr_t)(uint64_t)src->image;
+      auto *view = (struct vtvk_image_view *)(uintptr_t)(uint64_t)src->image_view;
+      if (!image || !view || view->image != src->image || !image->map ||
+          !image->device_address || !view->level_count ||
+          view->base_mip >= image->mip_levels ||
+          view->level_count > image->mip_levels - view->base_mip)
+         return false;
+      if (src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+          (view->base_mip != 0 || view->level_count != 1)) {
+         mesa_loge("ventus-vk: storage image requires a single mip-0 view");
          return false;
       }
-      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-          !vtvk_driver_sampled_format_supported(format)) {
-         mesa_loge("ventus-vk: unsupported sampled RT image format=%u binding=%u",
-                   (unsigned)format, src->binding);
+      const auto &base = image->levels[view->base_mip];
+      record->device_addr = image->device_address + base.offset;
+      record->byte_size = base.size;
+      record->format = view->format;
+      record->stride = base.row_pitch;
+      record->aux = base.width;
+      if (api->vt_copy_to_dev(api->device, image->device_address, image->map,
+                              image->size, 0, 0) != 0)
          return false;
-      }
-      record->byte_size = size;
-      record->format = format;
-      record->stride = stride;
-      record->aux = extent.width;
       if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-         struct vtvk_sampler *sampler =
-            (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
-         if (extent.depth > 1 || !sampler ||
+         auto *sampler = (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
+         if (!vtvk_driver_sampled_format_supported(view->format) || !sampler ||
              !vtvk_driver_sampler_filter_supported(sampler->mag_filter) ||
              sampler->min_filter != sampler->mag_filter ||
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
              sampler->compare_enable || sampler->unnormalized_coordinates ||
-             sampler->min_lod > 0.0f || sampler->max_lod < 0.0f) {
-            mesa_loge("ventus-vk: unsupported RT 2D LOD0 sampler binding=%u",
-                      src->binding);
+             (view->level_count > 1 &&
+              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST)) {
+            mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
             return false;
          }
+         std::vector<vtvk_rt_mip_record> levels(view->level_count);
+         for (uint32_t level = 0; level < view->level_count; ++level) {
+            const auto &mip = image->levels[view->base_mip + level];
+            levels[level] = {image->device_address + mip.offset, mip.width,
+                             mip.height, mip.row_pitch, 0};
+         }
+         if (!vtvk_driver_alloc_copy(api, levels.data(),
+                                     levels.size() * sizeof(levels[0]),
+                                     &record->mip_table_addr))
+            return false;
+         record->mip_level_count = view->level_count;
+         record->min_lod = sampler->min_lod;
+         record->max_lod = sampler->max_lod;
          record->sampler_mag_filter = sampler->mag_filter;
          record->sampler_min_filter = sampler->min_filter;
          record->sampler_address_mode_u = sampler->address_mode_u;
          record->sampler_address_mode_v = sampler->address_mode_v;
       }
-      if (vtvk_bridge_env_enabled("VENTUS_VK_PROBE_LOG") &&
-          src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-         vtvk_driver_log_u32_words("sampled_image", host, size, 16);
       break;
    }
 

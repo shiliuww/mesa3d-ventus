@@ -107,6 +107,7 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       desc.image = info->image;
+      desc.image_view = info->image_info.imageView;
       desc.sampler = info->image_info.sampler;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:

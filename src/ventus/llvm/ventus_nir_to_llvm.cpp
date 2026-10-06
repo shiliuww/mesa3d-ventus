@@ -1400,6 +1400,24 @@ private:
          builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
    }
 
+   Value *reduceTextureCoord(Value *coord, Value *mode)
+   {
+      Value *mirror = builder.CreateICmpEQ(mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT));
+      Value *period = builder.CreateSelect(mirror, ConstantFP::get(f32, 2), ConstantFP::get(f32, 1));
+      /* Binary32 values beyond these thresholds have no fractional period.
+       * Reduce before width multiplication / FPToSI, including clamp modes. */
+      Value *limit = builder.CreateSelect(mirror, ConstantFP::get(f32, 16777216), ConstantFP::get(f32, 8388608));
+      Value *large = builder.CreateOr(builder.CreateFCmpOGE(coord, limit),
+         builder.CreateFCmpOLE(coord, builder.CreateFNeg(limit)));
+      Value *safe = builder.CreateSelect(large, ConstantFP::get(f32, 0), coord);
+      Value *quotient = builder.CreateFDiv(safe, period);
+      Value *reduced = builder.CreateFSub(safe, builder.CreateFMul(
+         builder.CreateSIToFP(floorToI32(quotient), f32), period));
+      Value *clamped = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 0)), ConstantFP::get(f32, 0), coord);
+      clamped = builder.CreateSelect(builder.CreateFCmpOGT(clamped, ConstantFP::get(f32, 1)), ConstantFP::get(f32, 1), clamped);
+      return builder.CreateSelect(builder.CreateICmpEQ(mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)), clamped, reduced);
+   }
+
    Value *wrapTexelCoord(Value *coord, Value *extent, Value *address_mode)
    {
       Value *safe_extent = builder.CreateSelect(
@@ -1465,7 +1483,6 @@ private:
       nir_deref_instr *sampler_deref = nullptr;
       nir_def *coord = nullptr;
       nir_def *lod = nullptr;
-      bool lod_is_zero = false;
       bool sources_supported = true;
       for (unsigned i = 0; i < tex->num_srcs; ++i) {
          switch (tex->src[i].src_type) {
@@ -1480,8 +1497,6 @@ private:
             break;
          case nir_tex_src_lod:
             lod = tex->src[i].src.ssa;
-            lod_is_zero = nir_src_is_const(tex->src[i].src) &&
-               nir_src_as_uint(tex->src[i].src) == 0;
             break;
          default:
             /* No projected coordinates, offsets, gradients, min-LOD or
@@ -1495,11 +1510,14 @@ private:
          nir_deref_instr_get_variable(texture_deref) : nullptr;
       nir_variable *sampler_var = sampler_deref ?
          nir_deref_instr_get_variable(sampler_deref) : nullptr;
-      const bool base_lod = (tex->op == nir_texop_txl && lod && lod_is_zero) ||
+      const bool base_lod = (tex->op == nir_texop_txl && lod &&
+                             lod->bit_size == 32 && lod->num_components == 1) ||
          (tex->op == nir_texop_tex && !lod);
       const bool supported = base_lod && sources_supported &&
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
          tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
+         !tex->is_sparse && !tex->texture_non_uniform && !tex->sampler_non_uniform &&
+         coord && coord->bit_size == 32 &&
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
          coord && texture_var && sampler_var &&
@@ -1525,25 +1543,36 @@ private:
 
       /* This mirrors RADV's texture/sampler-deref resolution at the level
        * appropriate to the Ventus RT software descriptor ABI.  The supported
-       * subset is a normalized, base-level RGBA8 2D lookup.  Texture and
+       * subset is a normalized RGBA8/BGRA8 2D mip lookup.  Texture and
        * sampler derefs resolve through one software descriptor record, just
        * as RADV first resolves them to its hardware descriptor pair. */
       Value *binding = ConstantInt::get(
          i32, vt_rt_descriptor_table_slot(texture_var->data.descriptor_set,
                                           texture_var->data.binding));
-      Value *base = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
-      Value *format = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
-      Value *stride = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_STRIDE);
-      Value *width = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_AUX);
-      Value *byte_size = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_BYTE_SIZE);
-      Value *height = builder.CreateSelect(
-         builder.CreateICmpUGT(stride, ConstantInt::get(i32, 0)),
-         builder.CreateUDiv(byte_size, stride), ConstantInt::get(i32, 0));
+      /* LOD is view-relative. Clamp before converting to integer, then use
+       * mip-nearest with the preferred exact-half-to-lower rule. */
+      Value *level_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+      Value *min_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
+      Value *max_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
+      Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
+      level = builder.CreateSelect(builder.CreateFCmpOLT(level, min_lod), min_lod, level);
+      level = builder.CreateSelect(builder.CreateFCmpOGT(level, max_lod), max_lod, level);
+      Value *last = builder.CreateUIToFP(builder.CreateSub(level_count, ConstantInt::get(i32, 1)), f32);
+      level = builder.CreateSelect(builder.CreateFCmpOGT(level, last), last, level);
+      Value *low = floorToI32(level);
+      Value *fraction = builder.CreateFSub(level, builder.CreateSIToFP(low, f32));
+      Value *index = builder.CreateSelect(builder.CreateFCmpOGT(fraction, ConstantFP::get(f32, 0.5)),
+                                          builder.CreateAdd(low, ConstantInt::get(i32, 1)), low);
+      Value *table = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+      Value *entry = builder.CreateAdd(table, builder.CreateMul(index, ConstantInt::get(i32, VT_NIR_RT_MIP_RECORD_SIZE)));
+      auto field = [&](unsigned offset) {
+         return loadI32At(builder.CreateAdd(entry, ConstantInt::get(i32, offset)));
+      };
+      Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
+      Value *width = field(VT_NIR_RT_MIP_RECORD_WIDTH);
+      Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
+      Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
+      Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *filter = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
       Value *address_mode_u = descriptorRecordI32(
@@ -1551,8 +1580,8 @@ private:
       Value *address_mode_v = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
       Value *coord_value = value(nir_src_for_ssa(coord));
-      Value *u = asFloat(component(coord_value, 0));
-      Value *v = asFloat(component(coord_value, 1));
+      Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u);
+      Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v);
       Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
       Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
 

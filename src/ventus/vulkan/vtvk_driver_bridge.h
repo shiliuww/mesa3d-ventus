@@ -75,6 +75,17 @@ struct vtvk_rt_descriptor_record {
    uint32_t sampler_min_filter;
    uint32_t sampler_address_mode_u;
    uint32_t sampler_address_mode_v;
+   uint64_t mip_table_addr;
+   uint32_t mip_level_count;
+   float min_lod;
+   float max_lod;
+   uint32_t reserved;
+};
+
+/* Dispatch-owned metadata indexed relative to the bound view. */
+struct vtvk_rt_mip_record {
+   uint64_t device_addr;
+   uint32_t width, height, row_pitch, reserved;
 };
 
 struct vtvk_rt_descriptor_source {
@@ -83,6 +94,7 @@ struct vtvk_rt_descriptor_source {
    uint32_t binding;
    VkAccelerationStructureKHR acceleration_structure;
    VkImage image;
+   VkImageView image_view;
    VkSampler sampler;
    VkBuffer buffer;
    VkDeviceSize offset;
