@@ -2,6 +2,7 @@
 #include "vtvk_memory.h"
 
 #include <string.h>
+#include <math.h>
 
 #include "vk_common_entrypoints.h"
 #include "vk_util.h"
@@ -42,6 +43,27 @@ vtvk_CreateSampler(VkDevice _device,
                    VkSampler *pSampler)
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
+   /* This software sampler implements normalized 2D nearest/bilinear with
+    * equal min/mag and no bias, comparison, or anisotropy. mipmapMode does
+    * not affect the single-level profile, but must still be a known value. */
+   if (pCreateInfo->pNext || pCreateInfo->flags ||
+       (pCreateInfo->magFilter != VK_FILTER_NEAREST &&
+        pCreateInfo->magFilter != VK_FILTER_LINEAR) ||
+       pCreateInfo->minFilter != pCreateInfo->magFilter ||
+       (pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+        pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_LINEAR) ||
+       pCreateInfo->anisotropyEnable || pCreateInfo->compareEnable ||
+       pCreateInfo->unnormalizedCoordinates ||
+       pCreateInfo->mipLodBias != 0.0f ||
+       !isfinite(pCreateInfo->minLod) || !isfinite(pCreateInfo->maxLod) ||
+       pCreateInfo->minLod < 0.0f || pCreateInfo->maxLod < pCreateInfo->minLod ||
+       (pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+        pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
+        pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE) ||
+       (pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+        pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
+        pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    struct vtvk_sampler *sampler =
       vk_zalloc(alloc, sizeof(*sampler), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);

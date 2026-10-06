@@ -1466,6 +1466,7 @@ private:
       nir_def *coord = nullptr;
       nir_def *lod = nullptr;
       bool lod_is_zero = false;
+      bool sources_supported = true;
       for (unsigned i = 0; i < tex->num_srcs; ++i) {
          switch (tex->src[i].src_type) {
          case nir_tex_src_texture_deref:
@@ -1483,6 +1484,9 @@ private:
                nir_src_as_uint(tex->src[i].src) == 0;
             break;
          default:
+            /* No projected coordinates, offsets, gradients, min-LOD or
+             * descriptor indices are implemented in this sampling profile. */
+            sources_supported = false;
             break;
          }
       }
@@ -1493,12 +1497,16 @@ private:
          nir_deref_instr_get_variable(sampler_deref) : nullptr;
       const bool base_lod = (tex->op == nir_texop_txl && lod && lod_is_zero) ||
          (tex->op == nir_texop_tex && !lod);
-      const bool supported = base_lod &&
+      const bool supported = base_lod && sources_supported &&
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
          tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
          coord && texture_var && sampler_var &&
+         !glsl_type_is_array(texture_var->type) &&
+         !glsl_type_is_array(sampler_var->type) &&
+         texture_deref->deref_type == nir_deref_type_var &&
+         sampler_deref->deref_type == nir_deref_type_var &&
          vt_rt_descriptor_location_valid(
             texture_var->data.descriptor_set, texture_var->data.binding) &&
          vt_rt_descriptor_location_valid(
