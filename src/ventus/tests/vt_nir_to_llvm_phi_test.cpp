@@ -158,6 +158,25 @@ build_rt_traverse_v5_shader(const nir_shader_compiler_options *options)
    return b.shader;
 }
 
+static nir_shader *
+build_external_store_shader(const nir_shader_compiler_options *options,
+                            unsigned bits)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_RAYGEN, options,
+                                                 "vt_external_store");
+   const glsl_type *type = bits == 32 ? glsl_uvec4_type() :
+                           bits == 64 ? glsl_uint64_t_type() : glsl_uint16_t_type();
+   nir_deref_instr *target = nir_build_deref_cast(
+      &b, nir_imm_int64(&b, 0x91000000), nir_var_mem_global, type, 0);
+   nir_def *data = bits == 32 ?
+      nir_vec4(&b, nir_imm_int(&b, 101), nir_imm_int(&b, 202),
+                   nir_imm_int(&b, 303), nir_imm_int(&b, 404)) :
+      nir_imm_intN_t(&b, 0x1122334455667788ull, bits);
+   nir_store_deref_with_access(&b, target, data, bits == 32 ? 0x5 : 0x1,
+                               ACCESS_VOLATILE);
+   return b.shader;
+}
+
 int
 main()
 {
@@ -482,6 +501,44 @@ main()
    module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
    VT_RT_CHECK(module == nullptr);
    ralloc_free(shader);
+
+   for (unsigned bits : {32u, 64u, 16u}) {
+      shader = build_external_store_shader(&nir_options, bits);
+      shaders[0] = shader;
+      module = vt_nir_to_llvm_translate(shaders, 1, &llvm_options);
+      if (bits == 16) {
+         VT_RT_CHECK(module == nullptr);
+      } else {
+         VT_RT_CHECK(module != nullptr);
+         VT_RT_CHECK(!llvm::verifyModule(*module));
+         unsigned stores = 0;
+         for (llvm::Function &function : *module)
+            for (llvm::BasicBlock &block : function)
+               for (llvm::Instruction &instruction : block) {
+                  auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                  if (!store || store->getPointerAddressSpace() != 1)
+                     continue;
+                  auto *ptr = llvm::dyn_cast<llvm::ConstantExpr>(store->getPointerOperand());
+                  VT_RT_CHECK(ptr && ptr->getOpcode() == llvm::Instruction::IntToPtr);
+                  auto *addr = llvm::dyn_cast<llvm::ConstantInt>(ptr->getOperand(0));
+                  auto *data = llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+                  VT_RT_CHECK(addr && data && store->isVolatile());
+                  VT_RT_CHECK(data->getBitWidth() == bits);
+                  if (bits == 32) {
+                     const auto offset = addr->getZExtValue() - 0x91000000;
+                     VT_RT_CHECK((offset == 0 && data->getZExtValue() == 101) ||
+                                 (offset == 8 && data->getZExtValue() == 303));
+                  } else {
+                     VT_RT_CHECK(addr->getZExtValue() == 0x91000000);
+                     VT_RT_CHECK(data->getZExtValue() == 0x1122334455667788ull);
+                  }
+                  ++stores;
+               }
+         VT_RT_CHECK(stores == (bits == 32 ? 2u : 1u));
+         delete module;
+      }
+      ralloc_free(shader);
+   }
 
    glsl_type_singleton_decref();
    return 0;

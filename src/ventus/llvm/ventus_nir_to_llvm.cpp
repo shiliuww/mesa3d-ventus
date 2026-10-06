@@ -1194,7 +1194,7 @@ private:
                          loadScalar);
    }
 
-   void storeLocalValue(Value *ptr, Value *value)
+   void storeLocalValue(Value *ptr, Value *value, unsigned writeMask = ~0u)
    {
       unsigned components = 1;
       if (auto *structType = dyn_cast<StructType>(value->getType()))
@@ -1203,6 +1203,8 @@ private:
          components = std::min<unsigned>(vecType->getNumElements(), 4);
 
       for (unsigned i = 0; i < components; ++i) {
+         if (!(writeMask & (1u << i)))
+            continue;
          StoreInst *store =
             builder.CreateStore(asInt32(component(value, i)), localSlotPtr(ptr, i));
          store->setAlignment(Align(4));
@@ -2176,8 +2178,34 @@ private:
       }
       case nir_intrinsic_store_deref: {
          Value *ptr = value(intrin->src[0]);
-         if (ptr->getType()->isPointerTy())
-            storeLocalValue(ptr, value(intrin->src[1]));
+         const unsigned mask = nir_intrinsic_write_mask(intrin);
+         if (ptr->getType()->isPointerTy()) {
+            storeLocalValue(ptr, value(intrin->src[1]), mask);
+         } else {
+            /* Descriptor and physical-buffer derefs carry integer device
+             * addresses. Loads already support this form; stores must also
+             * materialize a global pointer rather than silently disappearing. */
+            const unsigned bits = intrin->src[1].ssa->bit_size;
+            if (!ptr->getType()->isIntegerTy() ||
+                (bits != 32 && bits != 64)) {
+               translationFailed = true;
+               return nullptr;
+            }
+            Value *base = asAddress(ptr);
+            Value *stored = value(intrin->src[1]);
+            for (unsigned i = 0; i < nir_src_num_components(intrin->src[1]); ++i) {
+               if (!(mask & (1u << i)))
+                  continue;
+               Value *addr = builder.CreateAdd(
+                  base, ConstantInt::get(base->getType(), i * (bits / 8)));
+               StoreInst *store = builder.CreateStore(
+                  asInteger(component(stored, i), bits), globalPtr(addr));
+               /* Deref has no explicit alignment operands. Do not invent
+                * stronger alignment than the external address guarantees. */
+               store->setAlignment(Align(1));
+               store->setVolatile(nir_intrinsic_access(intrin) & ACCESS_VOLATILE);
+            }
+         }
          return nullptr;
       }
       case nir_intrinsic_barrier: {
