@@ -702,18 +702,23 @@ private:
       return loadI32Global(descriptorRecordBase(binding), offset);
    }
 
-   Value *descriptorAddressForBinding(Value *binding, const nir_def *def)
+   Value *descriptorRecordAddress(Value *binding, uint32_t offset)
    {
-      (void)def;
       Value *base = descriptorRecordBase(binding);
       if (addressBits() == 64) {
          LoadInst *load = builder.CreateLoad(i64,
             globalPtr(builder.CreateAdd(base, ConstantInt::get(i64,
-               VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR))));
+               offset))));
          load->setAlignment(Align(8));
          return load;
       }
-      return descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
+      return descriptorRecordI32(binding, offset);
+   }
+
+   Value *descriptorAddressForBinding(Value *binding, const nir_def *def)
+   {
+      (void)def;
+      return descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_DEVICE_ADDR);
    }
 
    Value *descriptorAddressForBinding(uint32_t binding, const nir_def *def)
@@ -1413,6 +1418,11 @@ private:
       Value *quotient = builder.CreateFDiv(safe, period);
       Value *reduced = builder.CreateFSub(safe, builder.CreateFMul(
          builder.CreateSIToFP(floorToI32(quotient), f32), period));
+      // Keep small coordinates intact, preserving tiny negative inputs at
+      // nearest texel boundaries where subtracting a period could round to 1.
+      Value *small = builder.CreateAnd(builder.CreateFCmpOGT(coord, ConstantFP::get(f32, -2)),
+                                      builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 2)));
+      reduced = builder.CreateSelect(small, coord, reduced);
       Value *clamped = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 0)), ConstantFP::get(f32, 0), coord);
       clamped = builder.CreateSelect(builder.CreateFCmpOGT(clamped, ConstantFP::get(f32, 1)), ConstantFP::get(f32, 1), clamped);
       return builder.CreateSelect(builder.CreateICmpEQ(mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)), clamped, reduced);
@@ -1563,12 +1573,17 @@ private:
       Value *fraction = builder.CreateFSub(level, builder.CreateSIToFP(low, f32));
       Value *index = builder.CreateSelect(builder.CreateFCmpOGT(fraction, ConstantFP::get(f32, 0.5)),
                                           builder.CreateAdd(low, ConstantInt::get(i32, 1)), low);
-      Value *table = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
-      Value *entry = builder.CreateAdd(table, builder.CreateMul(index, ConstantInt::get(i32, VT_NIR_RT_MIP_RECORD_SIZE)));
+      Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+      Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
       auto field = [&](unsigned offset) {
-         return loadI32At(builder.CreateAdd(entry, ConstantInt::get(i32, offset)));
+         return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
       };
       Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
+      if (addressBits() == 64) {
+         LoadInst *address = builder.CreateLoad(i64, globalPtr(entry));
+         address->setAlignment(Align(8));
+         base = address;
+      }
       Value *width = field(VT_NIR_RT_MIP_RECORD_WIDTH);
       Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
       Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
