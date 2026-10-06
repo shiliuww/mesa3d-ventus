@@ -661,7 +661,8 @@ vtvk_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                           uint32_t regionCount,
                           const VkBufferImageCopy *pRegions)
 {
-   VK_FROM_HANDLE(vtvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_command_buffer, vk_cmd, commandBuffer);
+   struct vtvk_cmd_buffer *cmd = container_of(vk_cmd, struct vtvk_cmd_buffer, vk);
    if (!pRegions || !regionCount ||
        (dstImageLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && dstImageLayout != VK_IMAGE_LAYOUT_GENERAL) ||
        regionCount > (SIZE_MAX - sizeof(struct vtvk_copy_buffer_image_command)) / sizeof(*pRegions)) {
