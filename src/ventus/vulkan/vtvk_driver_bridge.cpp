@@ -1211,7 +1211,7 @@ vtvk_driver_upload_descriptor(
          auto *sampler = (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
          if (!vtvk_driver_sampled_format_supported(view->format) || !sampler ||
              !vtvk_driver_sampler_filter_supported(sampler->mag_filter) ||
-             sampler->min_filter != sampler->mag_filter ||
+             !vtvk_driver_sampler_filter_supported(sampler->min_filter) ||
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
              sampler->compare_enable || sampler->unnormalized_coordinates ||

@@ -43,13 +43,13 @@ vtvk_CreateSampler(VkDevice _device,
                    VkSampler *pSampler)
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
-   /* This software sampler implements normalized 2D nearest/bilinear with
-    * equal min/mag and no bias, comparison, or anisotropy. mipmapMode does
-    * not affect the single-level profile, but must still be a known value. */
+   /* Normalized 2D nearest/bilinear with independent min/mag and mip filters;
+    * no bias, comparison, or anisotropy. */
    if (pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->magFilter != VK_FILTER_NEAREST &&
         pCreateInfo->magFilter != VK_FILTER_LINEAR) ||
-       pCreateInfo->minFilter != pCreateInfo->magFilter ||
+       (pCreateInfo->minFilter != VK_FILTER_NEAREST &&
+        pCreateInfo->minFilter != VK_FILTER_LINEAR) ||
        (pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
         pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_LINEAR) ||
        pCreateInfo->anisotropyEnable || pCreateInfo->compareEnable ||

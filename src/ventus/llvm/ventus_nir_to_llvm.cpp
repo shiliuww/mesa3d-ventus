@@ -1567,14 +1567,22 @@ private:
       Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
       level = builder.CreateSelect(builder.CreateFCmpOLT(level, min_lod), min_lod, level);
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, max_lod), max_lod, level);
+      /* Filter selection uses sampler-clamped lambda, not the view-clamped
+       * level or rounded mip. A single-level view may still be minified. */
+      Value *mag_filter = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
+      Value *min_filter = descriptorRecordI32(
+         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIN_FILTER);
+      Value *filter = builder.CreateSelect(
+         builder.CreateFCmpOGT(level, ConstantFP::get(f32, 0)), min_filter, mag_filter);
       Value *last = builder.CreateUIToFP(builder.CreateSub(level_count, ConstantInt::get(i32, 1)), f32);
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, last), last, level);
-      /* The clamped value is nonnegative, so binary32 bit ordering matches
-       * numeric ordering. Count half-level thresholds using integer compares.
+      /* The clamped value is nonnegative. Clear the sign of negative zero
+       * before using binary32 bit ordering for half-level integer compares.
        * This preserves exact ties without uniform floating subtraction, which
        * the current Ventus backend incorrectly places in a vector register. */
       Value *index = ConstantInt::get(i32, 0);
-      Value *level_bits = asInt32(level);
+      Value *level_bits = builder.CreateAnd(asInt32(level), ConstantInt::get(i32, 0x7fffffff));
       for (unsigned mip = 0; mip < 14; ++mip) {
          Value *threshold = asInt32(ConstantFP::get(f32, mip + 0.5));
          index = builder.CreateSelect(builder.CreateICmpUGT(level_bits, threshold),
@@ -1590,8 +1598,6 @@ private:
       Value *second_index = builder.CreateSelect(mip_linear, next_index, index);
       Value *fraction = builder.CreateFSub(level, builder.CreateUIToFP(floor_index, f32));
       Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
-      Value *filter = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
       Value *address_mode_u = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
       Value *address_mode_v = descriptorRecordI32(
