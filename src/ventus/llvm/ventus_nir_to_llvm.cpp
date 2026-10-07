@@ -1464,27 +1464,40 @@ private:
    }
 
    Value *sampleTexelRGBA8Channel(Value *base, Value *stride, Value *x,
-                                  Value *y, Value *format, unsigned channel)
+                                  Value *y, Value *format, Value *decode_table,
+                                  unsigned channel)
    {
       Value *offset = builder.CreateAdd(
          builder.CreateMul(asAddress(y), asAddress(stride)),
          builder.CreateMul(asAddress(x),
                            ConstantInt::get(asAddress(x)->getType(), 4)));
       Value *packed = loadI32At(builder.CreateAdd(asAddress(base), offset));
-      Value *is_bgra = builder.CreateICmpEQ(
-         format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM));
-      switch (channel) {
-      case 0:
-         return builder.CreateSelect(is_bgra, sampledUnorm8(packed, 16),
-                                     sampledUnorm8(packed, 0));
-      case 1:
-         return sampledUnorm8(packed, 8);
-      case 2:
-         return builder.CreateSelect(is_bgra, sampledUnorm8(packed, 0),
-                                     sampledUnorm8(packed, 16));
-      default:
+      if (channel == 3)
          return sampledUnorm8(packed, 24);
+      Value *is_bgra = builder.CreateOr(
+         builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM)),
+         builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_SRGB)));
+      Value *is_srgb = builder.CreateOr(
+         builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_R8G8B8A8_SRGB)),
+         builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_SRGB)));
+      unsigned shift = channel * 8;
+      Value *byte = packed;
+      Value *unorm = sampledUnorm8(packed, shift);
+      if (channel != 1) {
+         Value *swapped = builder.CreateLShr(
+            packed, ConstantInt::get(i32, (2 - channel) * 8));
+         byte = builder.CreateSelect(is_bgra, swapped,
+                                    builder.CreateLShr(packed, ConstantInt::get(i32, shift)));
+         unorm = builder.CreateSelect(
+            is_bgra, sampledUnorm8(packed, (2 - channel) * 8), unorm);
+      } else {
+         byte = builder.CreateLShr(packed, ConstantInt::get(i32, shift));
       }
+      byte = builder.CreateAnd(byte, ConstantInt::get(i32, 255));
+      Value *entry = builder.CreateAdd(decode_table,
+         builder.CreateMul(asAddress(byte), ConstantInt::get(decode_table->getType(), 4)));
+      Value *linear = asFloat(loadI32At(entry));
+      return builder.CreateSelect(is_srgb, linear, unorm);
    }
 
    Value *lowerTex(nir_tex_instr *tex)
@@ -1605,8 +1618,10 @@ private:
       Value *coord_value = value(nir_src_for_ssa(coord));
       Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u);
       Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v);
+      Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+      Value *decode_table = builder.CreateAdd(table,
+         builder.CreateMul(asAddress(level_count), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
       auto sample_level = [&](Value *mip_index) -> Value * {
-         Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
          Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(mip_index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
          auto field = [&](unsigned offset) {
             return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
@@ -1646,14 +1661,14 @@ private:
             filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
          return floatResult(&tex->def, [&](unsigned channel) {
             Value *nearest = sampleTexelRGBA8Channel(
-               base, stride, nearest_x, nearest_y, format, channel);
-            Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format,
+               base, stride, nearest_x, nearest_y, format, decode_table, channel);
+            Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format, decode_table,
                                                  channel);
-            Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format,
+            Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format, decode_table,
                                                  channel);
-            Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format,
+            Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format, decode_table,
                                                  channel);
-            Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format,
+            Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format, decode_table,
                                                  channel);
             Value *top = builder.CreateFAdd(
                c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));

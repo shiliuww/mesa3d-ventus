@@ -21,6 +21,7 @@ vtvk_format_bytes_per_pixel(VkFormat format)
    case VK_FORMAT_R8G8B8A8_UINT:
    case VK_FORMAT_B8G8R8A8_SNORM:
    case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_R8G8B8A8_SRGB:
       return 4;
    case VK_FORMAT_R16G16_UINT:
    case VK_FORMAT_R16G16_UNORM:
@@ -333,8 +334,7 @@ vtvk_CreateImage(VkDevice _device,
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
 
-   const bool color = pCreateInfo->format == VK_FORMAT_R8G8B8A8_UNORM ||
-                      pCreateInfo->format == VK_FORMAT_B8G8R8A8_UNORM;
+   const bool color = vtvk_format_is_texture_color(pCreateInfo->format);
    uint32_t max_levels = 1;
    uint32_t dimension = MAX2(pCreateInfo->extent.width, pCreateInfo->extent.height);
    while (dimension > 1) { dimension >>= 1; ++max_levels; }
@@ -347,7 +347,9 @@ vtvk_CreateImage(VkDevice _device,
        pCreateInfo->extent.depth != 1 || !pCreateInfo->mipLevels ||
        pCreateInfo->mipLevels > max_levels ||
        pCreateInfo->mipLevels > VTVK_MAX_MIP_LEVELS ||
-       (!color && pCreateInfo->mipLevels != 1))
+       (!color && pCreateInfo->mipLevels != 1) ||
+       (vtvk_format_is_srgb(pCreateInfo->format) &&
+        !vtvk_srgb_usage_supported(pCreateInfo->usage)))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
 
    struct vtvk_image *image =
@@ -396,8 +398,7 @@ vtvk_CreateImageView(VkDevice _device,
    const uint32_t count = image && range->baseMipLevel < image->mip_levels &&
       range->levelCount == VK_REMAINING_MIP_LEVELS ?
       image->mip_levels - range->baseMipLevel : range->levelCount;
-   const bool color = image && (image->format == VK_FORMAT_R8G8B8A8_UNORM ||
-                               image->format == VK_FORMAT_B8G8R8A8_UNORM);
+   const bool color = image && vtvk_format_is_texture_color(image->format);
    if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D ||
        pCreateInfo->format != image->format ||

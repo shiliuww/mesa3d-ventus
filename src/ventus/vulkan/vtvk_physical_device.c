@@ -1,4 +1,5 @@
 #include "vtvk_private.h"
+#include "vtvk_memory.h"
 
 #include <stdlib.h>
 
@@ -345,12 +346,21 @@ vtvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    if (format == VK_FORMAT_R8G8B8A8_UNORM ||
        format == VK_FORMAT_B8G8R8A8_UNORM) {
       linear_features =
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
          VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
          VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
       optimal_features = linear_features;
       buffer_features = VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT;
+   } else if (vtvk_format_is_srgb(format)) {
+      linear_features =
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+         VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+         VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+      optimal_features = linear_features;
    } else if (format == VK_FORMAT_D16_UNORM ||
               format == VK_FORMAT_D32_SFLOAT ||
               format == VK_FORMAT_D24_UNORM_S8_UINT ||
@@ -396,18 +406,21 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
 {
    if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D || pImageFormatInfo->flags)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   if (pImageFormatInfo->format != VK_FORMAT_R8G8B8A8_UNORM &&
-       pImageFormatInfo->format != VK_FORMAT_B8G8R8A8_UNORM &&
+   if (!vtvk_format_is_texture_color(pImageFormatInfo->format) &&
        pImageFormatInfo->format != VK_FORMAT_D16_UNORM &&
        pImageFormatInfo->format != VK_FORMAT_D32_SFLOAT &&
        pImageFormatInfo->format != VK_FORMAT_D24_UNORM_S8_UINT &&
        pImageFormatInfo->format != VK_FORMAT_D32_SFLOAT_S8_UINT)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (vtvk_format_is_srgb(pImageFormatInfo->format) &&
+       (!vtvk_srgb_usage_supported(pImageFormatInfo->usage) ||
+        (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR &&
+         pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
       .maxExtent = {16384, 16384, 1},
-      .maxMipLevels = (pImageFormatInfo->format == VK_FORMAT_R8G8B8A8_UNORM ||
-                       pImageFormatInfo->format == VK_FORMAT_B8G8R8A8_UNORM) ? 15 : 1,
+      .maxMipLevels = vtvk_format_is_texture_color(pImageFormatInfo->format) ? 15 : 1,
       .maxArrayLayers = 1,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxResourceSize = 1ull << 32,

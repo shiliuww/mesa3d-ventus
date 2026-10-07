@@ -26,6 +26,7 @@
 #endif
 
 #include "util/log.h"
+#include "util/format_srgb.h"
 #include "util/u_math.h"
 #include "ventus/common/ventus_kernel_resource.h"
 #include "ventus/common/ventus_rt_address.h"
@@ -595,6 +596,8 @@ vtvk_bridge_format_bytes_per_pixel(VkFormat format)
    switch (format) {
    case VK_FORMAT_B8G8R8A8_UNORM:
    case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_R8G8B8A8_SRGB:
    case VK_FORMAT_R8G8B8A8_SNORM:
    case VK_FORMAT_R8G8B8A8_UINT:
       return 4;
@@ -1153,7 +1156,9 @@ static bool
 vtvk_driver_sampled_format_supported(VkFormat format)
 {
    return format == VK_FORMAT_R8G8B8A8_UNORM ||
-          format == VK_FORMAT_B8G8R8A8_UNORM;
+          format == VK_FORMAT_B8G8R8A8_UNORM ||
+          format == VK_FORMAT_R8G8B8A8_SRGB ||
+          format == VK_FORMAT_B8G8R8A8_SRGB;
 }
 
 static bool
@@ -1194,8 +1199,10 @@ vtvk_driver_upload_descriptor(
           view->level_count > image->mip_levels - view->base_mip)
          return false;
       if (src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-          (view->base_mip != 0 || view->level_count != 1)) {
-         mesa_loge("ventus-vk: storage image requires a single mip-0 view");
+          (view->base_mip != 0 || view->level_count != 1 ||
+           view->format == VK_FORMAT_R8G8B8A8_SRGB ||
+           view->format == VK_FORMAT_B8G8R8A8_SRGB)) {
+         mesa_loge("ventus-vk: storage image requires a supported single mip-0 view");
          return false;
       }
       const auto &base = image->levels[view->base_mip];
@@ -1226,8 +1233,18 @@ vtvk_driver_upload_descriptor(
             levels[level] = {image->device_address + mip.offset, mip.width,
                              mip.height, mip.row_pitch, 0};
          }
-         if (!vtvk_driver_alloc_copy(api, levels.data(),
-                                     levels.size() * sizeof(levels[0]),
+         /* Dispatch metadata: unchanged mip records followed by the 256-entry
+          * float decoder. Even UNORM views get a valid table so speculative
+          * reads remain bounded; their results still use the original UNORM
+          * arithmetic. Texture bytes and per-level pitches stay unchanged. */
+         const size_t mip_bytes = levels.size() * sizeof(levels[0]);
+         std::vector<uint8_t> metadata(
+            mip_bytes + sizeof(util_format_srgb_8unorm_to_linear_float_table));
+         memcpy(metadata.data(), levels.data(), mip_bytes);
+         memcpy(metadata.data() + mip_bytes,
+                util_format_srgb_8unorm_to_linear_float_table,
+                sizeof(util_format_srgb_8unorm_to_linear_float_table));
+         if (!vtvk_driver_alloc_copy(api, metadata.data(), metadata.size(),
                                      &record->mip_table_addr))
             return false;
          record->mip_level_count = view->level_count;
