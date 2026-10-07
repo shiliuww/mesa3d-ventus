@@ -1384,6 +1384,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       (uint64_t)image_width * image_height * image_depth * image_bpp;
    struct vtvk_rt_dispatch_args args = {};
    std::vector<struct vtvk_rt_descriptor_record> descriptor_table;
+   std::vector<struct vtvk_rt_descriptor_directory> descriptor_directory;
+   std::vector<size_t> descriptor_starts;
    std::vector<uint8_t> pds_image;
    uint64_t raygen_wg_x = DIV_ROUND_UP(info->width, 32);
    uint64_t raygen_wg_y = MAX2(info->height, 1u);
@@ -1586,13 +1588,27 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if (info->descriptor_count) {
       uint32_t slots = vtvk_driver_descriptor_table_slots(info);
       bool staged_state_buffer_found = !staged_dispatch;
-      descriptor_table.resize(slots);
-      for (uint32_t slot = 0; slot < slots; slot++) {
-         descriptor_table[slot].set =
-            slot / VT_RT_DESCRIPTOR_BINDINGS_PER_SET;
-         descriptor_table[slot].binding =
-            slot % VT_RT_DESCRIPTOR_BINDINGS_PER_SET;
+      static_assert(sizeof(vtvk_rt_descriptor_directory) == VT_RT_DESCRIPTOR_DIRECTORY_SIZE);
+      static_assert(sizeof(vtvk_rt_descriptor_record) == VT_RT_DESCRIPTOR_ELEMENT_SIZE);
+      descriptor_directory.resize(slots);
+      descriptor_starts.resize(slots);
+      for (uint32_t i = 0; i < info->descriptor_count; i++) {
+         const auto *src = &info->descriptors[i];
+         if (!vt_rt_descriptor_location_valid(src->set, src->binding) ||
+             !src->descriptor_count || src->array_element >= src->descriptor_count)
+            goto out;
+         auto &entry = descriptor_directory[vt_rt_descriptor_table_slot(src->set, src->binding)];
+         if (entry.count && (entry.count != src->descriptor_count || entry.type != src->type))
+            goto out;
+         entry.count = src->descriptor_count;
+         entry.type = src->type;
       }
+      size_t total = 0;
+      for (uint32_t slot = 0; slot < slots; slot++) {
+         descriptor_starts[slot] = total;
+         total += descriptor_directory[slot].count;
+      }
+      descriptor_table.resize(total);
 
       for (uint32_t i = 0; i < info->descriptor_count; i++) {
          const struct vtvk_rt_descriptor_source *src = &info->descriptors[i];
@@ -1603,18 +1619,19 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          }
          uint32_t slot =
             vt_rt_descriptor_table_slot(src->set, src->binding);
+         const size_t record_index = descriptor_starts[slot] + src->array_element;
          if (staged_dispatch &&
              src->set == info->state_descriptor_set &&
              src->binding == info->state_descriptor_binding &&
              src->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             staged_state_buffer_found = true;
          if (!vtvk_driver_upload_descriptor(&driver, src,
-                                            &descriptor_table[slot],
+                                            &descriptor_table[record_index],
                                             &uploads))
             goto out;
 
          const struct vtvk_rt_descriptor_record *record =
-            &descriptor_table[slot];
+            &descriptor_table[record_index];
          if (src->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
              !tlas_dev_addr) {
             tlas_dev_addr = record->device_addr;
@@ -1635,11 +1652,21 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          goto out;
       }
 
-      if (!vtvk_driver_alloc_copy(&driver, descriptor_table.data(),
-                                  descriptor_table.size() *
-                                     sizeof(descriptor_table[0]),
+      for (uint32_t slot = 0; slot < slots; slot++) {
+         auto &entry = descriptor_directory[slot];
+         if (!entry.count)
+            continue;
+         if (!vtvk_driver_alloc_copy(&driver, &descriptor_table[descriptor_starts[slot]],
+                                     (uint64_t)entry.count * sizeof(vtvk_rt_descriptor_record),
+                                     &entry.elements_addr) ||
+             (!rv64 && !vtvk_bridge_require_rv32_range("descriptor elements", entry.elements_addr,
+                (uint64_t)entry.count * sizeof(vtvk_rt_descriptor_record))))
+            goto out;
+      }
+      if (!vtvk_driver_alloc_copy(&driver, descriptor_directory.data(),
+                                  descriptor_directory.size() * sizeof(descriptor_directory[0]),
                                   &descriptor_table_dev_addr)) {
-         mesa_loge("ventus-vk: driver bridge failed to upload descriptor table");
+         mesa_loge("ventus-vk: driver bridge failed to upload descriptor directory");
          goto out;
       }
    } else {
@@ -1726,8 +1753,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    args.submission_mailbox_stride = wavefront_global ? mailbox_stride : 0;
    args.submission_mailbox_generation = wavefront_global ? 1 : 0;
    args.descriptor_table_addr = descriptor_table_dev_addr;
-   args.descriptor_count = descriptor_table.size();
-   args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_record);
+   args.descriptor_count = descriptor_directory.size();
+   args.descriptor_record_stride = sizeof(struct vtvk_rt_descriptor_directory);
    args.push_constants_addr = push_constants_dev_addr;
    args.push_constants_size = info->push_constants_size;
    vtvk_driver_log_u32_words("dispatch_args", &args, sizeof(args), 40);
@@ -1749,8 +1776,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                                           info->push_constants_size) ||
           !vtvk_bridge_require_rv32_range("descriptor table",
                                           descriptor_table_dev_addr,
-                                          descriptor_table.size() *
-                                             sizeof(descriptor_table[0])) ||
+                                          descriptor_directory.size() *
+                                             sizeof(descriptor_directory[0])) ||
           !vtvk_bridge_require_rv32_range("dispatch args", args_dev_addr,
                                           sizeof(args)) ||
           !vtvk_bridge_require_rv32_range("raygen SBT", args.raygen_sbt.addr,

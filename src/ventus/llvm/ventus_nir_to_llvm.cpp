@@ -693,8 +693,14 @@ private:
       }
       Value *stride =
          dispatchArgI32(VT_NIR_RT_DISPATCH_ARG_DESCRIPTOR_RECORD_STRIDE);
-      return builder.CreateAdd(
-         asAddress(table), builder.CreateMul(asAddress(binding), asAddress(stride)));
+      Value *slot = builder.CreateAnd(asInt32(binding), ConstantInt::get(i32, VT_RT_DESCRIPTOR_SLOT_MASK));
+      Value *element = builder.CreateLShr(asInt32(binding), ConstantInt::get(i32, VT_RT_DESCRIPTOR_INDEX_SHIFT));
+      Value *directory = builder.CreateAdd(asAddress(table),
+         builder.CreateMul(asAddress(slot), asAddress(stride)));
+      LoadInst *elements = builder.CreateLoad(addressBits() == 64 ? i64 : i32, globalPtr(directory));
+      elements->setAlignment(Align(addressBits() == 64 ? 8 : 4));
+      return builder.CreateAdd(elements, builder.CreateMul(asAddress(element),
+         ConstantInt::get(elements->getType(), VT_RT_DESCRIPTOR_ELEMENT_SIZE)));
    }
 
    Value *descriptorRecordI32(Value *binding, uint32_t offset)
@@ -1337,21 +1343,43 @@ private:
                           builder.CreateShl(a, ConstantInt::get(i32, 24))));
    }
 
+   /* F08 accepts scalar resources and one fixed descriptor-array dimension
+    * with a compile-time legal index. Image layers are a separate concept. */
+   Value *descriptorTokenForDeref(nir_deref_instr *deref)
+   {
+      if (!deref)
+         return nullptr;
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      if (!var || !vt_rt_descriptor_location_valid(var->data.descriptor_set, var->data.binding))
+         return nullptr;
+      uint32_t element = 0;
+      if (deref->deref_type == nir_deref_type_array) {
+         nir_deref_instr *parent = nir_src_as_deref(deref->parent);
+         if (!parent || parent->deref_type != nir_deref_type_var ||
+             !glsl_type_is_array(var->type) || !nir_src_is_const(deref->arr.index))
+            return nullptr;
+         element = nir_src_as_uint(deref->arr.index);
+         const uint32_t count = glsl_get_length(var->type);
+         if (!count || element >= count ||
+             count > (UINT32_MAX >> VT_RT_DESCRIPTOR_INDEX_SHIFT) ||
+             glsl_type_is_array(glsl_get_array_element(var->type)))
+            return nullptr;
+      } else if (deref->deref_type != nir_deref_type_var || glsl_type_is_array(var->type)) {
+         return nullptr;
+      }
+      return ConstantInt::get(i32, vt_rt_descriptor_token(
+         var->data.descriptor_set, var->data.binding, element));
+   }
+
    Value *storageImageBinding(nir_intrinsic_instr *intrin)
    {
       if (intrin->intrinsic == nir_intrinsic_image_store)
          return asInt32(value(intrin->src[0]));
 
       if (nir_src_is_deref(intrin->src[0])) {
-         nir_variable *var =
-            nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[0]));
-         if (var &&
-             vt_rt_descriptor_location_valid(var->data.descriptor_set,
-                                             var->data.binding)) {
-            return ConstantInt::get(
-               i32, vt_rt_descriptor_table_slot(var->data.descriptor_set,
-                                                var->data.binding));
-         }
+         Value *token = descriptorTokenForDeref(nir_src_as_deref(intrin->src[0]));
+         if (token)
+            return token;
       }
 
       if (debugLowering)
@@ -1555,21 +1583,15 @@ private:
          }
       }
 
-      nir_variable *texture_var = texture_deref ?
-         nir_deref_instr_get_variable(texture_deref) : nullptr;
-      nir_variable *sampler_var = sampler_deref ?
-         nir_deref_instr_get_variable(sampler_deref) : nullptr;
+      Value *texture_token = descriptorTokenForDeref(texture_deref);
+      Value *sampler_token = descriptorTokenForDeref(sampler_deref);
       const bool fetch = tex->op == nir_texop_txf;
       const bool size_query = tex->op == nir_texop_txs;
       const bool levels_query = tex->op == nir_texop_query_levels;
       if (fetch || size_query || levels_query) {
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
-         const bool supported = sources_supported && texture_var &&
-            texture_deref->deref_type == nir_deref_type_var &&
-            !glsl_type_is_array(texture_var->type) && !sampler_deref &&
-            vt_rt_descriptor_location_valid(texture_var->data.descriptor_set,
-                                             texture_var->data.binding) &&
+         const bool supported = sources_supported && texture_token && !sampler_deref &&
             tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
             !tex->is_shadow && !tex->is_sparse && !tex->texture_non_uniform &&
             !tex->sampler_non_uniform && tex->def.bit_size == 32 &&
@@ -1584,8 +1606,7 @@ private:
             translationFailed = true;
             return undefFor(&tex->def, true);
          }
-         Value *binding = ConstantInt::get(i32, vt_rt_descriptor_table_slot(
-            texture_var->data.descriptor_set, texture_var->data.binding));
+         Value *binding = texture_token;
          Value *count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
          if (levels_query)
             return count;
@@ -1646,15 +1667,7 @@ private:
          coord && coord->bit_size == 32 &&
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
-         coord && texture_var && sampler_var &&
-         !glsl_type_is_array(texture_var->type) &&
-         !glsl_type_is_array(sampler_var->type) &&
-         texture_deref->deref_type == nir_deref_type_var &&
-         sampler_deref->deref_type == nir_deref_type_var &&
-         vt_rt_descriptor_location_valid(
-            texture_var->data.descriptor_set, texture_var->data.binding) &&
-         vt_rt_descriptor_location_valid(
-            sampler_var->data.descriptor_set, sampler_var->data.binding);
+         coord && texture_token && sampler_token;
       if (!supported) {
          if (debugLowering)
             fprintf(stderr, "ventus-nir-to-llvm: unsupported texture op=%u\n",
@@ -1666,12 +1679,8 @@ private:
 
       /* Combined descriptors resolve both derefs to one slot; separate
        * descriptors resolve image/view and sampling state independently. */
-      Value *binding = ConstantInt::get(
-         i32, vt_rt_descriptor_table_slot(texture_var->data.descriptor_set,
-                                          texture_var->data.binding));
-      Value *sampler_binding = ConstantInt::get(
-         i32, vt_rt_descriptor_table_slot(sampler_var->data.descriptor_set,
-                                          sampler_var->data.binding));
+      Value *binding = texture_token;
+      Value *sampler_binding = sampler_token;
       /* LOD is view-relative. Clamp before selecting levels. Preserve the
        * mip-nearest preferred tie rule; mip-linear uses floor and its successor. */
       Value *level_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
@@ -2292,12 +2301,23 @@ private:
             unsupportedDefs.insert(&intrin->def);
             return undefFor(&intrin->def);
          }
-         return ConstantInt::get(
-            i32, vt_rt_descriptor_table_slot(set, binding));
+         /* Preserve (binding, element), never reindex into another binding. */
+         if (!nir_src_is_const(intrin->src[0]) ||
+             nir_src_as_uint(intrin->src[0]) > (UINT32_MAX >> VT_RT_DESCRIPTOR_INDEX_SHIFT)) {
+            translationFailed = true;
+            return undefFor(&intrin->def);
+         }
+         return ConstantInt::get(i32, vt_rt_descriptor_token(set, binding,
+            nir_src_as_uint(intrin->src[0])));
       }
       case nir_intrinsic_vulkan_resource_reindex: {
+         if (!nir_src_is_const(intrin->src[1])) {
+            translationFailed = true;
+            return undefFor(&intrin->def);
+         }
          return builder.CreateAdd(asInt32(value(intrin->src[0])),
-                                  asInt32(value(intrin->src[1])));
+            builder.CreateShl(asInt32(value(intrin->src[1])),
+                              ConstantInt::get(i32, VT_RT_DESCRIPTOR_INDEX_SHIFT)));
       }
       case nir_intrinsic_load_vulkan_descriptor: {
          Value *bindingValue = asInt32(value(intrin->src[0]));

@@ -62,6 +62,12 @@ struct vtvk_rt_dispatch_args {
    uint32_t rt_private_total_bytes;
 };
 
+struct vtvk_rt_descriptor_directory {
+   uint64_t elements_addr;
+   uint32_t count;
+   uint32_t type;
+};
+
 struct vtvk_rt_descriptor_record {
    uint32_t type;
    uint32_t set;
@@ -89,6 +95,7 @@ struct vtvk_rt_mip_record {
 };
 
 struct vtvk_rt_descriptor_source {
+   uint32_t array_element, descriptor_count;
    VkDescriptorType type;
    uint32_t set;
    uint32_t binding;

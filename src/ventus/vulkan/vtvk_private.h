@@ -121,6 +121,7 @@ struct vtvk_query_pool {
 };
 
 struct vtvk_descriptor_binding_info {
+   uint32_t array_element, descriptor_count;
    bool valid;
    VkDescriptorType type;
    VkAccelerationStructureKHR acceleration_structure;
@@ -168,8 +169,9 @@ void *vtvk_cmd_buffer_alloc_command(
    vtvk_recorded_command_destroy_func destroy);
 VkResult vtvk_cmd_buffer_execute_commands(struct vtvk_cmd_buffer *cmd);
 void vtvk_cmd_buffer_clear_commands(struct vtvk_cmd_buffer *cmd);
+uint32_t vtvk_descriptor_set_binding_count(VkDescriptorSet set, uint32_t binding);
 bool vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
-                                     uint32_t binding,
+                                     uint32_t binding, uint32_t element,
                                      struct vtvk_descriptor_binding_info *out);
 void *vtvk_image_host_ptr(VkImage image, VkExtent3D *extent_out,
                           VkFormat *format_out);

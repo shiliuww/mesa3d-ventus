@@ -100,6 +100,8 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
    desc.type = info->type;
    desc.set = set;
    desc.binding = binding;
+   desc.array_element = info->array_element;
+   desc.descriptor_count = info->descriptor_count;
 
    switch (info->type) {
    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
@@ -218,25 +220,28 @@ vtvk_execute_trace_rays(
       VkDescriptorSet descriptor_set = record->descriptor_sets[set];
       for (uint32_t binding = 0; binding < VTVK_MAX_DESCRIPTOR_BINDINGS;
            binding++) {
-         struct vtvk_descriptor_binding_info info = {};
-         if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, &info) ||
-             !vtvk_collect_rt_descriptor(&info, set, binding,
-                                         pipeline && pipeline->texture_lod0_only,
-                                         &descriptors))
-            continue;
+         const uint32_t count = vtvk_descriptor_set_binding_count(descriptor_set, binding);
+         for (uint32_t element = 0; element < count; element++) {
+            struct vtvk_descriptor_binding_info info = {};
+            if (!vtvk_descriptor_set_get_binding(descriptor_set, binding, element, &info) ||
+                !vtvk_collect_rt_descriptor(&info, set, binding,
+                                            pipeline && pipeline->texture_lod0_only,
+                                            &descriptors))
+               continue;
 
-         if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
-             tlas_handle == VK_NULL_HANDLE) {
-            tlas_handle = info.acceleration_structure;
-         } else if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-                    storage_image == VK_NULL_HANDLE) {
-            storage_image = info.image;
-         } else if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-                    !camera_data) {
-            camera_range = info.buffer.range;
-            camera_data =
-               vtvk_buffer_host_ptr(info.buffer.buffer, info.buffer.offset,
-                                    camera_range);
+            if (info.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+                tlas_handle == VK_NULL_HANDLE) {
+               tlas_handle = info.acceleration_structure;
+            } else if (info.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                       storage_image == VK_NULL_HANDLE) {
+               storage_image = info.image;
+            } else if (info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                       !camera_data) {
+               camera_range = info.buffer.range;
+               camera_data =
+                  vtvk_buffer_host_ptr(info.buffer.buffer, info.buffer.offset,
+                                       camera_range);
+            }
          }
       }
    }
