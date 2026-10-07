@@ -50,6 +50,7 @@ static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_D
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
 static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD);
 static_assert(offsetof(vtvk_rt_descriptor_record, max_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD);
+static_assert(offsetof(vtvk_rt_descriptor_record, sampler_mipmap_mode) == VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
 static_assert(offsetof(vtvk_rt_mip_record, row_pitch) == VT_NIR_RT_MIP_RECORD_ROW_PITCH);
 static_assert(offsetof(struct vtvk_rt_dispatch_args, abi_tag) ==
               VT_NIR_RT_DISPATCH_ARG_ABI_TAG,
@@ -1214,9 +1215,8 @@ vtvk_driver_upload_descriptor(
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
              !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
              sampler->compare_enable || sampler->unnormalized_coordinates ||
-             (view->level_count > 1 &&
-              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
-              !(src->texture_lod0_only && sampler->min_lod == 0.0f))) {
+             (sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_LINEAR)) {
             mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
             return false;
          }
@@ -1233,6 +1233,7 @@ vtvk_driver_upload_descriptor(
          record->mip_level_count = view->level_count;
          record->min_lod = sampler->min_lod;
          record->max_lod = sampler->max_lod;
+         record->sampler_mipmap_mode = sampler->mipmap_mode;
          record->sampler_mag_filter = sampler->mag_filter;
          record->sampler_min_filter = sampler->min_filter;
          record->sampler_address_mode_u = sampler->address_mode_u;

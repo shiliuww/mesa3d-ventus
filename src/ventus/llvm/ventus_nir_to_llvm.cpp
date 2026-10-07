@@ -1559,8 +1559,8 @@ private:
       Value *binding = ConstantInt::get(
          i32, vt_rt_descriptor_table_slot(texture_var->data.descriptor_set,
                                           texture_var->data.binding));
-      /* LOD is view-relative. Clamp before converting to integer, then use
-       * mip-nearest with the preferred exact-half-to-lower rule. */
+      /* LOD is view-relative. Clamp before selecting levels. Preserve the
+       * mip-nearest preferred tie rule; mip-linear uses floor and its successor. */
       Value *level_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
       Value *min_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
       Value *max_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
@@ -1580,20 +1580,15 @@ private:
          index = builder.CreateSelect(builder.CreateICmpUGT(level_bits, threshold),
                                        ConstantInt::get(i32, mip + 1), index);
       }
-      Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
-      Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
-      auto field = [&](unsigned offset) {
-         return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
-      };
-      Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
-      if (addressBits() == 64) {
-         LoadInst *address = builder.CreateLoad(i64, globalPtr(entry));
-         address->setAlignment(Align(8));
-         base = address;
-      }
-      Value *width = field(VT_NIR_RT_MIP_RECORD_WIDTH);
-      Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
-      Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
+      Value *mip_mode = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
+      Value *mip_linear = builder.CreateICmpEQ(mip_mode, ConstantInt::get(i32, VK_SAMPLER_MIPMAP_MODE_LINEAR));
+      Value *floor_index = builder.CreateFPToUI(level, i32);
+      Value *last_index = builder.CreateSub(level_count, ConstantInt::get(i32, 1));
+      Value *next_index = builder.CreateAdd(floor_index, ConstantInt::get(i32, 1));
+      next_index = builder.CreateSelect(builder.CreateICmpUGT(next_index, last_index), last_index, next_index);
+      Value *first_index = builder.CreateSelect(mip_linear, floor_index, index);
+      Value *second_index = builder.CreateSelect(mip_linear, next_index, index);
+      Value *fraction = builder.CreateFSub(level, builder.CreateUIToFP(floor_index, f32));
       Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *filter = descriptorRecordI32(
          binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
@@ -1604,48 +1599,72 @@ private:
       Value *coord_value = value(nir_src_for_ssa(coord));
       Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u);
       Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v);
-      Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
-      Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
+      auto sample_level = [&](Value *mip_index) -> Value * {
+         Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+         Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(mip_index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
+         auto field = [&](unsigned offset) {
+            return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
+         };
+         Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
+         if (addressBits() == 64) {
+            LoadInst *address = builder.CreateLoad(i64, globalPtr(entry));
+            address->setAlignment(Align(8));
+            base = address;
+         }
+         Value *width = field(VT_NIR_RT_MIP_RECORD_WIDTH);
+         Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
+         Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
+         Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
+         Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
 
-      Value *nearest_x = wrapTexelCoord(floorToI32(scaled_u), width,
-                                        address_mode_u);
-      Value *nearest_y = wrapTexelCoord(floorToI32(scaled_v), height,
-                                        address_mode_v);
+         Value *nearest_x = wrapTexelCoord(floorToI32(scaled_u), width,
+                                           address_mode_u);
+         Value *nearest_y = wrapTexelCoord(floorToI32(scaled_v), height,
+                                           address_mode_v);
 
-      Value *linear_u = builder.CreateFSub(scaled_u, ConstantFP::get(f32, 0.5));
-      Value *linear_v = builder.CreateFSub(scaled_v, ConstantFP::get(f32, 0.5));
-      Value *linear_x0 = floorToI32(linear_u);
-      Value *linear_y0 = floorToI32(linear_v);
-      Value *frac_u = builder.CreateFSub(linear_u,
-         builder.CreateSIToFP(linear_x0, f32));
-      Value *frac_v = builder.CreateFSub(linear_v,
-         builder.CreateSIToFP(linear_y0, f32));
-      Value *linear_x1 = builder.CreateAdd(linear_x0, ConstantInt::get(i32, 1));
-      Value *linear_y1 = builder.CreateAdd(linear_y0, ConstantInt::get(i32, 1));
-      Value *x0 = wrapTexelCoord(linear_x0, width, address_mode_u);
-      Value *x1 = wrapTexelCoord(linear_x1, width, address_mode_u);
-      Value *y0 = wrapTexelCoord(linear_y0, height, address_mode_v);
-      Value *y1 = wrapTexelCoord(linear_y1, height, address_mode_v);
-      Value *is_linear = builder.CreateICmpEQ(
-         filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
+         Value *linear_u = builder.CreateFSub(scaled_u, ConstantFP::get(f32, 0.5));
+         Value *linear_v = builder.CreateFSub(scaled_v, ConstantFP::get(f32, 0.5));
+         Value *linear_x0 = floorToI32(linear_u);
+         Value *linear_y0 = floorToI32(linear_v);
+         Value *frac_u = builder.CreateFSub(linear_u,
+            builder.CreateSIToFP(linear_x0, f32));
+         Value *frac_v = builder.CreateFSub(linear_v,
+            builder.CreateSIToFP(linear_y0, f32));
+         Value *linear_x1 = builder.CreateAdd(linear_x0, ConstantInt::get(i32, 1));
+         Value *linear_y1 = builder.CreateAdd(linear_y0, ConstantInt::get(i32, 1));
+         Value *x0 = wrapTexelCoord(linear_x0, width, address_mode_u);
+         Value *x1 = wrapTexelCoord(linear_x1, width, address_mode_u);
+         Value *y0 = wrapTexelCoord(linear_y0, height, address_mode_v);
+         Value *y1 = wrapTexelCoord(linear_y1, height, address_mode_v);
+         Value *is_linear = builder.CreateICmpEQ(
+            filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
+         return floatResult(&tex->def, [&](unsigned channel) {
+            Value *nearest = sampleTexelRGBA8Channel(
+               base, stride, nearest_x, nearest_y, format, channel);
+            Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format,
+                                                 channel);
+            Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format,
+                                                 channel);
+            Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format,
+                                                 channel);
+            Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format,
+                                                 channel);
+            Value *top = builder.CreateFAdd(
+               c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));
+            Value *bottom = builder.CreateFAdd(
+               c01, builder.CreateFMul(frac_u, builder.CreateFSub(c11, c01)));
+            Value *linear = builder.CreateFAdd(
+               top, builder.CreateFMul(frac_v, builder.CreateFSub(bottom, top)));
+            return builder.CreateSelect(is_linear, linear, nearest);
+         });
+      };
+      Value *first = sample_level(first_index);
+      Value *second = sample_level(second_index);
       return floatResult(&tex->def, [&](unsigned channel) {
-         Value *nearest = sampleTexelRGBA8Channel(
-            base, stride, nearest_x, nearest_y, format, channel);
-         Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format,
-                                              channel);
-         Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format,
-                                              channel);
-         Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format,
-                                              channel);
-         Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format,
-                                              channel);
-         Value *top = builder.CreateFAdd(
-            c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));
-         Value *bottom = builder.CreateFAdd(
-            c01, builder.CreateFMul(frac_u, builder.CreateFSub(c11, c01)));
-         Value *linear = builder.CreateFAdd(
-            top, builder.CreateFMul(frac_v, builder.CreateFSub(bottom, top)));
-         return builder.CreateSelect(is_linear, linear, nearest);
+         Value *a = asFloat(component(first, channel));
+         Value *b = asFloat(component(second, channel));
+         Value *mixed = builder.CreateFAdd(a, builder.CreateFMul(fraction, builder.CreateFSub(b, a)));
+         return builder.CreateSelect(mip_linear, mixed, a);
       });
    }
 
