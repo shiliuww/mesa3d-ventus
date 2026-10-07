@@ -366,6 +366,12 @@ vtvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
          VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
          VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
       optimal_features = linear_features;
+   } else if (format == VK_FORMAT_D32_SFLOAT) {
+      linear_features = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT |
+         VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+      optimal_features = linear_features | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
    } else if (format == VK_FORMAT_D16_UNORM ||
               format == VK_FORMAT_D32_SFLOAT ||
               format == VK_FORMAT_D24_UNORM_S8_UINT ||
@@ -409,8 +415,12 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
+   const bool depth_texture = vtvk_depth_texture_format(pImageFormatInfo->format) && vtvk_array_usage_supported(pImageFormatInfo->usage);
    const bool volume = pImageFormatInfo->type == VK_IMAGE_TYPE_3D;
-   if ((pImageFormatInfo->type != VK_IMAGE_TYPE_2D && !volume) ||
+   if ((vtvk_depth_texture_format(pImageFormatInfo->format) &&
+        ((pImageFormatInfo->usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ||
+         (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR && (pImageFormatInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))) ||
+       (pImageFormatInfo->type != VK_IMAGE_TYPE_2D && !volume) ||
        (volume && (pImageFormatInfo->flags ||
         !vtvk_format_is_texture_color(pImageFormatInfo->format) ||
         !vtvk_array_usage_supported(pImageFormatInfo->usage))) ||
@@ -433,7 +443,7 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
 
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
       .maxExtent = {volume ? 2048 : 16384, volume ? 2048 : 16384, volume ? 2048 : 1},
-      .maxMipLevels = volume ? 12 : vtvk_format_is_texture_color(pImageFormatInfo->format) ? 15 : 1,
+      .maxMipLevels = volume ? 12 : (vtvk_format_is_texture_color(pImageFormatInfo->format) || depth_texture) ? 15 : 1,
       .maxArrayLayers = !volume && vtvk_format_is_texture_color(pImageFormatInfo->format) &&
          vtvk_array_usage_supported(pImageFormatInfo->usage) ? 2048 : 1,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT,

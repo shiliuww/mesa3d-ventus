@@ -1520,8 +1520,9 @@ private:
          builder.CreateMul(asAddress(x),
                            ConstantInt::get(asAddress(x)->getType(), 4)));
       Value *packed = loadI32At(builder.CreateAdd(asAddress(base), offset));
+      Value *is_depth = builder.CreateICmpEQ(format,ConstantInt::get(i32,VK_FORMAT_D32_SFLOAT));
       if (channel == 3)
-         return sampledUnorm8(packed, 24);
+         return builder.CreateSelect(is_depth,ConstantFP::get(f32,1),sampledUnorm8(packed, 24));
       Value *is_bgra = builder.CreateOr(
          builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_UNORM)),
          builder.CreateICmpEQ(format, ConstantInt::get(i32, VK_FORMAT_B8G8R8A8_SRGB)));
@@ -1545,7 +1546,8 @@ private:
       Value *entry = builder.CreateAdd(decode_table,
          builder.CreateMul(asAddress(byte), ConstantInt::get(decode_table->getType(), 4)));
       Value *linear = asFloat(loadI32At(entry));
-      return builder.CreateSelect(is_srgb, linear, unorm);
+      Value *color = builder.CreateSelect(is_srgb, linear, unorm);
+      return builder.CreateSelect(is_depth,channel == 0 ? asFloat(packed) : ConstantFP::get(f32,0),color);
    }
 
    Value *swizzleTextureResult(Value *binding, Value *color)
@@ -1607,6 +1609,7 @@ private:
       nir_def *ddx = nullptr;
       nir_def *ddy = nullptr;
       nir_def *offset = nullptr;
+      nir_def *comparator = nullptr;
       bool sources_supported = true;
       for (unsigned i = 0; i < tex->num_srcs; ++i) {
          switch (tex->src[i].src_type) {
@@ -1618,6 +1621,9 @@ private:
             break;
          case nir_tex_src_coord:
             coord = tex->src[i].src.ssa;
+            break;
+         case nir_tex_src_comparator:
+            comparator = tex->src[i].src.ssa;
             break;
          case nir_tex_src_offset:
             offset = tex->src[i].src.ssa;
@@ -1672,9 +1678,9 @@ private:
       if (fetch || size_query || levels_query) {
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
-         const bool supported = sources_supported && (!volume || !offset) && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
+         const bool supported = sources_supported && !comparator && (!volume || !offset) && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
             texture_dimension && (!cube || !fetch) &&
-            !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
+            (!tex->is_shadow || !fetch) && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
              (lod && lod->bit_size == 32 && lod->num_components == 1 &&
               (size_query ? (!coord && integer_result && tex->def.num_components == query_components) :
@@ -1752,13 +1758,16 @@ private:
       const bool base_lod = gradients || (!ddx && !ddy &&
          ((tex->op == nir_texop_txl && lod && lod->bit_size == 32 && lod->num_components == 1) ||
           (tex->op == nir_texop_tex && !lod)));
+      const bool depth_compare = tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+         comparator && comparator->bit_size == 32 && comparator->num_components == 1 && !offset && !ddx && !ddy;
       const bool supported = base_lod && sources_supported && (!(cube || volume) || !offset) &&
+         (tex->is_shadow ? depth_compare : !comparator) &&
          texture_dimension &&
-         tex->coord_components == coordinate_count && !tex->is_shadow &&
+         tex->coord_components == coordinate_count &&
          !tex->is_sparse &&
          coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
          tex->dest_type == nir_type_float32 &&
-         tex->def.bit_size == 32 && tex->def.num_components == 4 &&
+         tex->def.bit_size == 32 && tex->def.num_components == (depth_compare ? 1 : 4) &&
          coord && texture_token && sampler_token;
       if (!supported) {
          if (debugLowering)
@@ -1836,6 +1845,22 @@ private:
       Value *second_index = builder.CreateSelect(mip_linear, next_index, index);
       Value *fraction = builder.CreateFSub(level, builder.CreateUIToFP(floor_index, f32));
       Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
+      Value *reference = depth_compare ? asFloat(value(nir_src_for_ssa(comparator))) : nullptr;
+      Value *compare_op = depth_compare ? descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_COMPARE_OP) : nullptr;
+      Value *compare_enabled = depth_compare ? descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_COMPARE_ENABLE) : nullptr;
+      auto compare_depth = [&](Value *depth) -> Value * {
+         if (!depth_compare) return depth;
+         Value *passes = ConstantInt::getFalse(context);
+         const std::array<Value *,8> truth{ConstantInt::getFalse(context),
+            builder.CreateFCmpOLT(reference,depth),builder.CreateFCmpOEQ(reference,depth),
+            builder.CreateFCmpOLE(reference,depth),builder.CreateFCmpOGT(reference,depth),
+            builder.CreateFCmpONE(reference,depth),builder.CreateFCmpOGE(reference,depth),ConstantInt::getTrue(context)};
+         for (unsigned op = 1; op < truth.size(); ++op)
+            passes = builder.CreateSelect(builder.CreateICmpEQ(compare_op,ConstantInt::get(i32,op)),truth[op],passes);
+         passes = builder.CreateAnd(passes,builder.CreateAnd(builder.CreateICmpNE(compare_enabled,ConstantInt::get(i32,0)),
+            builder.CreateICmpEQ(format,ConstantInt::get(i32,VK_FORMAT_D32_SFLOAT))));
+         return builder.CreateSelect(passes,ConstantFP::get(f32,1),ConstantFP::get(f32,0));
+      };
       Value *address_mode_u = descriptorRecordI32(
          sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
       Value *address_mode_v = descriptorRecordI32(
@@ -2064,6 +2089,9 @@ private:
                base, stride, x0, y1, format, decode_table, channel));
             Value *c11 = cube ? cube_tap(linear_x1, linear_y1, channel) : builder.CreateSelect(border11, replacement, sampleTexelRGBA8Channel(
                base, stride, x1, y1, format, decode_table, channel));
+            nearest = compare_depth(nearest);
+            c00 = compare_depth(c00); c10 = compare_depth(c10);
+            c01 = compare_depth(c01); c11 = compare_depth(c11);
             Value *top = builder.CreateFAdd(
                c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));
             Value *bottom = builder.CreateFAdd(
@@ -2083,7 +2111,7 @@ private:
       });
       /* Permutation/repetition and float 0/1 commute with these normalized
        * nearest/linear filters. Decode always precedes component mapping. */
-      return swizzleTextureResult(binding, filtered);
+      return depth_compare ? filtered : swizzleTextureResult(binding, filtered);
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)

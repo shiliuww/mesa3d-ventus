@@ -335,12 +335,16 @@ vtvk_CreateImage(VkDevice _device,
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
 
    const bool color = vtvk_format_is_texture_color(pCreateInfo->format);
+   const bool depth_texture = vtvk_depth_texture_format(pCreateInfo->format) && vtvk_array_usage_supported(pCreateInfo->usage);
    const bool volume = pCreateInfo->imageType == VK_IMAGE_TYPE_3D;
    const uint32_t max_dimension = volume ? 2048 : 16384;
    uint32_t max_levels = 1;
    uint32_t dimension = MAX3(pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->extent.depth);
    while (dimension > 1) { dimension >>= 1; ++max_levels; }
-   if (pCreateInfo->pNext || (pCreateInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+   if ((vtvk_depth_texture_format(pCreateInfo->format) &&
+        ((pCreateInfo->usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ||
+         (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR && (pCreateInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))) ||
+       pCreateInfo->pNext || (pCreateInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
        ((pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
         (volume || !color || pCreateInfo->extent.width != pCreateInfo->extent.height ||
          pCreateInfo->arrayLayers < 6 || !vtvk_array_usage_supported(pCreateInfo->usage))) ||
@@ -357,7 +361,7 @@ vtvk_CreateImage(VkDevice _device,
        (!volume && pCreateInfo->extent.depth != 1) || !pCreateInfo->mipLevels ||
        pCreateInfo->mipLevels > max_levels ||
        pCreateInfo->mipLevels > VTVK_MAX_MIP_LEVELS ||
-       (!color && pCreateInfo->mipLevels != 1) ||
+       (!color && !depth_texture && pCreateInfo->mipLevels != 1) ||
        (vtvk_format_is_srgb(pCreateInfo->format) &&
         !vtvk_srgb_usage_supported(pCreateInfo->usage)))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -422,6 +426,7 @@ vtvk_CreateImageView(VkDevice _device,
       range->layerCount == VK_REMAINING_ARRAY_LAYERS ?
       image->array_layers - range->baseArrayLayer : range->layerCount;
    const bool color = image && vtvk_format_is_texture_color(image->format);
+   const bool depth_texture = image && vtvk_depth_texture_format(image->format);
    if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D &&
         pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
@@ -439,6 +444,7 @@ vtvk_CreateImageView(VkDevice _device,
        range->baseMipLevel >= image->mip_levels || !count ||
        count > image->mip_levels - range->baseMipLevel ||
        (color && range->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) ||
+       (depth_texture && range->aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT) ||
        (unsigned)pCreateInfo->components.r > VK_COMPONENT_SWIZZLE_A ||
        (unsigned)pCreateInfo->components.g > VK_COMPONENT_SWIZZLE_A ||
        (unsigned)pCreateInfo->components.b > VK_COMPONENT_SWIZZLE_A ||

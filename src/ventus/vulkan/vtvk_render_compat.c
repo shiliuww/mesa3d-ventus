@@ -53,7 +53,8 @@ vtvk_CreateSampler(VkDevice _device,
         pCreateInfo->minFilter != VK_FILTER_LINEAR) ||
        (pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
         pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_LINEAR) ||
-       pCreateInfo->anisotropyEnable || pCreateInfo->compareEnable ||
+       pCreateInfo->anisotropyEnable ||
+       (pCreateInfo->compareEnable && (unsigned)pCreateInfo->compareOp > VK_COMPARE_OP_ALWAYS) ||
        pCreateInfo->unnormalizedCoordinates ||
        !isfinite(pCreateInfo->mipLodBias) ||
        fabsf(pCreateInfo->mipLodBias) > VT_NIR_RT_MAX_SAMPLER_LOD_BIAS ||
@@ -90,6 +91,7 @@ vtvk_CreateSampler(VkDevice _device,
    sampler->address_mode_v = pCreateInfo->addressModeV;
    sampler->address_mode_w = pCreateInfo->addressModeW;
    sampler->compare_enable = pCreateInfo->compareEnable;
+   sampler->compare_op = pCreateInfo->compareOp;
    sampler->unnormalized_coordinates = pCreateInfo->unnormalizedCoordinates;
    sampler->lod_bias = pCreateInfo->mipLodBias;
    sampler->min_lod = pCreateInfo->minLod;
@@ -633,7 +635,7 @@ vtvk_execute_copy_buffer_image(struct vtvk_cmd_buffer *cmd,
    for (uint32_t r = 0; r < copy->region_count; ++r) {
       const VkBufferImageCopy *region = &copy->regions[r];
       if (region->imageSubresource.mipLevel >= dst->mip_levels ||
-          region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          region->imageSubresource.aspectMask != (vtvk_depth_texture_format(dst->format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT) ||
           !region->imageSubresource.layerCount ||
           region->imageSubresource.baseArrayLayer >= dst->array_layers ||
           region->imageSubresource.layerCount > dst->array_layers - region->imageSubresource.baseArrayLayer ||

@@ -49,6 +49,8 @@ static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
 static_assert(sizeof(vtvk_rt_mip_record) == VT_NIR_RT_MIP_RECORD_SIZE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+static_assert(offsetof(vtvk_rt_descriptor_record, sampler_compare_enable) == VT_NIR_RT_DESCRIPTOR_RECORD_COMPARE_ENABLE);
+static_assert(offsetof(vtvk_rt_descriptor_record, sampler_compare_op) == VT_NIR_RT_DESCRIPTOR_RECORD_COMPARE_OP);
 static_assert(offsetof(vtvk_rt_descriptor_record, sampler_address_mode_w) == VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_W);
 static_assert(offsetof(vtvk_rt_mip_record, depth) == VT_NIR_RT_MIP_RECORD_DEPTH);
 static_assert(offsetof(vtvk_rt_mip_record, slice_pitch) == VT_NIR_RT_MIP_RECORD_SLICE_PITCH);
@@ -1165,7 +1167,7 @@ vtvk_driver_sampled_format_supported(VkFormat format)
    return format == VK_FORMAT_R8G8B8A8_UNORM ||
           format == VK_FORMAT_B8G8R8A8_UNORM ||
           format == VK_FORMAT_R8G8B8A8_SRGB ||
-          format == VK_FORMAT_B8G8R8A8_SRGB;
+          format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_D32_SFLOAT;
 }
 
 static bool
@@ -1179,7 +1181,7 @@ vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
        !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
        !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
        !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_w) ||
-       sampler->compare_enable || sampler->unnormalized_coordinates ||
+       (sampler->compare_enable && (unsigned)sampler->compare_op > VK_COMPARE_OP_ALWAYS) || sampler->unnormalized_coordinates ||
        (sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
         sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_LINEAR)) {
       mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
@@ -1195,6 +1197,8 @@ vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
    record->sampler_address_mode_u = sampler->address_mode_u;
    record->sampler_address_mode_v = sampler->address_mode_v;
    record->sampler_address_mode_w = sampler->address_mode_w;
+   record->sampler_compare_enable = sampler->compare_enable;
+   record->sampler_compare_op = sampler->compare_op;
    return true;
 }
 

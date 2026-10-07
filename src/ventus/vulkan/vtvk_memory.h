@@ -81,6 +81,12 @@ struct vtvk_image_view {
    VkComponentMapping components;
 };
 
+static inline bool
+vtvk_depth_texture_format(VkFormat format)
+{
+   return format == VK_FORMAT_D32_SFLOAT;
+}
+
 /* Array texture profile does not extend attachment or storage-image paths. */
 static inline bool
 vtvk_array_usage_supported(VkImageUsageFlags usage)
