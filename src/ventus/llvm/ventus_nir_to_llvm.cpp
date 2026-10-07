@@ -1661,7 +1661,10 @@ private:
 
       Value *texture_token = descriptorTokenForDeref(texture_deref, true);
       Value *sampler_token = descriptorTokenForDeref(sampler_deref, true);
-      const unsigned coordinate_count = tex->is_array ? 3 : 2;
+      const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array;
+      const bool texture_dimension = tex->sampler_dim == GLSL_SAMPLER_DIM_2D || cube;
+      const unsigned coordinate_count = cube || tex->is_array ? 3 : 2;
+      const unsigned query_components = cube ? 2 : coordinate_count;
       const bool fetch = tex->op == nir_texop_txf;
       const bool size_query = tex->op == nir_texop_txs;
       const bool levels_query = tex->op == nir_texop_query_levels;
@@ -1669,11 +1672,11 @@ private:
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
          const bool supported = sources_supported && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
-            tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+            texture_dimension && (!cube || !fetch) &&
             !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
              (lod && lod->bit_size == 32 && lod->num_components == 1 &&
-              (size_query ? (!coord && integer_result && tex->def.num_components == coordinate_count) :
+              (size_query ? (!coord && integer_result && tex->def.num_components == query_components) :
                (coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
                 tex->coord_components == coordinate_count && tex->dest_type == nir_type_float32 &&
                 tex->def.num_components == 4))));
@@ -1738,14 +1741,14 @@ private:
             return builder.CreateSelect(valid, asFloat(component(color, c)), ConstantFP::get(f32, 0));
          });
       }
-      const bool gradients = tex->op == nir_texop_txd && !lod && ddx && ddy &&
+      const bool gradients = !cube && tex->op == nir_texop_txd && !lod && ddx && ddy &&
          ddx->bit_size == 32 && ddy->bit_size == 32 &&
          ddx->num_components == 2 && ddy->num_components == 2;
       const bool base_lod = gradients || (!ddx && !ddy &&
          ((tex->op == nir_texop_txl && lod && lod->bit_size == 32 && lod->num_components == 1) ||
           (tex->op == nir_texop_tex && !lod)));
-      const bool supported = base_lod && sources_supported &&
-         tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+      const bool supported = base_lod && sources_supported && (!cube || !offset) &&
+         texture_dimension &&
          tex->coord_components == coordinate_count && !tex->is_shadow &&
          !tex->is_sparse &&
          coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
@@ -1849,12 +1852,42 @@ private:
          layer_index = builder.CreateAdd(low, builder.CreateZExt(up, i32));
       }
 
-      Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u, offset_values[0] != 0);
-      Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v, offset_values[1] != 0);
+      Value *u, *v;
+      if (cube) {
+         Value *rx = asFloat(component(coord_value, 0));
+         Value *ry = asFloat(component(coord_value, 1));
+         Value *rz = asFloat(component(coord_value, 2));
+         auto magnitude = [&](Value *a) {
+            return asFloat(builder.CreateAnd(asInt32(a), ConstantInt::get(i32, 0x7fffffff)));
+         };
+         auto negate = [&](Value *a) { return builder.CreateFNeg(a); };
+         Value *ax = magnitude(rx), *ay = magnitude(ry), *az = magnitude(rz);
+         Value *z_major = builder.CreateAnd(builder.CreateFCmpOGE(az, ax), builder.CreateFCmpOGE(az, ay));
+         Value *y_major = builder.CreateAnd(builder.CreateNot(z_major), builder.CreateFCmpOGE(ay, ax));
+         Value *nx = builder.CreateFCmpOLT(rx, ConstantFP::get(f32, 0));
+         Value *ny = builder.CreateFCmpOLT(ry, ConstantFP::get(f32, 0));
+         Value *nz = builder.CreateFCmpOLT(rz, ConstantFP::get(f32, 0));
+         Value *face_x = builder.CreateSelect(nx, ConstantInt::get(i32, 1), ConstantInt::get(i32, 0));
+         Value *face_y = builder.CreateSelect(ny, ConstantInt::get(i32, 3), ConstantInt::get(i32, 2));
+         Value *face_z = builder.CreateSelect(nz, ConstantInt::get(i32, 5), ConstantInt::get(i32, 4));
+         layer_index = builder.CreateSelect(z_major, face_z, builder.CreateSelect(y_major, face_y, face_x));
+         Value *major = builder.CreateSelect(z_major, az, builder.CreateSelect(y_major, ay, ax));
+         Value *sc = builder.CreateSelect(z_major, builder.CreateSelect(nz, negate(rx), rx),
+            builder.CreateSelect(y_major, rx, builder.CreateSelect(nx, rz, negate(rz))));
+         Value *tc = builder.CreateSelect(y_major, builder.CreateSelect(ny, negate(rz), rz), negate(ry));
+         u = builder.CreateFMul(builder.CreateFAdd(builder.CreateFDiv(sc, major), ConstantFP::get(f32, 1)), ConstantFP::get(f32, 0.5));
+         v = builder.CreateFMul(builder.CreateFAdd(builder.CreateFDiv(tc, major), ConstantFP::get(f32, 1)), ConstantFP::get(f32, 0.5));
+         // Cube addressing is defined by the face topology, ignoring U/V wrap.
+         address_mode_u = address_mode_v = ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+      } else {
+         u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u, offset_values[0] != 0);
+         v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v, offset_values[1] != 0);
+      }
       Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
       Value *decode_table = builder.CreateAdd(table,
          builder.CreateMul(asAddress(builder.CreateMul(level_count, layer_count)), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
       auto sample_level = [&](Value *mip_index) -> Value * {
+         Value *relative_mip = mip_index;
          mip_index = builder.CreateAdd(builder.CreateMul(layer_index, level_count), mip_index);
          Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(mip_index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
          auto field = [&](unsigned offset) {
@@ -1911,6 +1944,67 @@ private:
          Value *border10 = outside(linear_x1, linear_y0);
          Value *border01 = outside(linear_x0, linear_y1);
          Value *border11 = outside(linear_x1, linear_y1);
+         // Each edge entry is {neighbor face, x mode, y mode}; modes are
+         // 0, last, varying coordinate, or last-varying. No projected rounding.
+         static const unsigned cube_edges[6][4][3] = {
+            {{4,1,2}, {5,0,2}, {2,1,3}, {3,1,2}},
+            {{5,1,2}, {4,0,2}, {2,0,2}, {3,0,3}},
+            {{1,2,0}, {0,3,0}, {5,3,0}, {4,2,0}},
+            {{1,3,1}, {0,2,1}, {4,2,1}, {5,3,1}},
+            {{1,1,2}, {0,0,2}, {2,2,1}, {3,2,0}},
+            {{0,1,2}, {1,0,2}, {2,3,0}, {3,3,1}},
+         };
+         auto cube_tap = [&](Value *raw_x, Value *raw_y, unsigned channel) -> Value * {
+            Value *outside_x = builder.CreateICmpUGE(raw_x, width);
+            Value *outside_y = builder.CreateICmpUGE(raw_y, height);
+            Value *last = builder.CreateSub(width, ConstantInt::get(i32, 1));
+            Value *cx = wrapTexelCoord(raw_x, width, address_mode_u);
+            Value *cy = wrapTexelCoord(raw_y, height, address_mode_v);
+            auto edge = [&](unsigned side, Value *varying) {
+               auto coordinate = [&](unsigned mode) -> Value * {
+                  switch (mode) {
+                  case 0: return ConstantInt::get(i32, 0);
+                  case 1: return last;
+                  case 2: return varying;
+                  default: return builder.CreateSub(last, varying);
+                  }
+               };
+               std::array<Value *, 3> mapped{ConstantInt::get(i32, cube_edges[5][side][0]),
+                  coordinate(cube_edges[5][side][1]), coordinate(cube_edges[5][side][2])};
+               for (unsigned face = 0; face < 5; ++face) {
+                  Value *match = builder.CreateICmpEQ(layer_index, ConstantInt::get(i32, face));
+                  mapped[0] = builder.CreateSelect(match, ConstantInt::get(i32, cube_edges[face][side][0]), mapped[0]);
+                  mapped[1] = builder.CreateSelect(match, coordinate(cube_edges[face][side][1]), mapped[1]);
+                  mapped[2] = builder.CreateSelect(match, coordinate(cube_edges[face][side][2]), mapped[2]);
+               }
+               return mapped;
+            };
+            auto xl = edge(0, cy), xh = edge(1, cy), yl = edge(2, cx), yh = edge(3, cx);
+            Value *high_x = builder.CreateICmpSGE(raw_x, width);
+            Value *high_y = builder.CreateICmpSGE(raw_y, height);
+            for (unsigned c = 0; c < 3; ++c) {
+               xl[c] = builder.CreateSelect(high_x, xh[c], xl[c]);
+               yl[c] = builder.CreateSelect(high_y, yh[c], yl[c]);
+            }
+            auto load_face = [&](const std::array<Value *, 3> &tap) {
+               Value *index = builder.CreateAdd(builder.CreateMul(tap[0], level_count), relative_mip);
+               Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(index),
+                  ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
+               Value *plane = loadI32At(entry);
+               if (addressBits() == 64) {
+                  LoadInst *address = builder.CreateLoad(i64, globalPtr(entry));
+                  address->setAlignment(Align(8)); plane = address;
+               }
+               Value *pitch = loadI32At(builder.CreateAdd(entry,
+                  ConstantInt::get(entry->getType(), VT_NIR_RT_MIP_RECORD_ROW_PITCH)));
+               return sampleTexelRGBA8Channel(plane, pitch, tap[1], tap[2], format, decode_table, channel);
+            };
+            Value *current = sampleTexelRGBA8Channel(base, stride, cx, cy, format, decode_table, channel);
+            Value *across_x = load_face(xl), *across_y = load_face(yl);
+            Value *corner = builder.CreateFDiv(builder.CreateFAdd(builder.CreateFAdd(current, across_x), across_y), ConstantFP::get(f32, 3));
+            Value *ordinary = builder.CreateSelect(outside_x, across_x, builder.CreateSelect(outside_y, across_y, current));
+            return builder.CreateSelect(builder.CreateAnd(outside_x, outside_y), corner, ordinary);
+         };
          return floatResult(&tex->def, [&](unsigned channel) {
             Value *replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
                ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)), ConstantFP::get(f32, 1), ConstantFP::get(f32, 0));
@@ -1919,13 +2013,13 @@ private:
                   ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)), ConstantFP::get(f32, 1), replacement);
             Value *nearest = builder.CreateSelect(border_nearest, replacement, sampleTexelRGBA8Channel(
                base, stride, nearest_x, nearest_y, format, decode_table, channel));
-            Value *c00 = builder.CreateSelect(border00, replacement, sampleTexelRGBA8Channel(
+            Value *c00 = cube ? cube_tap(linear_x0, linear_y0, channel) : builder.CreateSelect(border00, replacement, sampleTexelRGBA8Channel(
                base, stride, x0, y0, format, decode_table, channel));
-            Value *c10 = builder.CreateSelect(border10, replacement, sampleTexelRGBA8Channel(
+            Value *c10 = cube ? cube_tap(linear_x1, linear_y0, channel) : builder.CreateSelect(border10, replacement, sampleTexelRGBA8Channel(
                base, stride, x1, y0, format, decode_table, channel));
-            Value *c01 = builder.CreateSelect(border01, replacement, sampleTexelRGBA8Channel(
+            Value *c01 = cube ? cube_tap(linear_x0, linear_y1, channel) : builder.CreateSelect(border01, replacement, sampleTexelRGBA8Channel(
                base, stride, x0, y1, format, decode_table, channel));
-            Value *c11 = builder.CreateSelect(border11, replacement, sampleTexelRGBA8Channel(
+            Value *c11 = cube ? cube_tap(linear_x1, linear_y1, channel) : builder.CreateSelect(border11, replacement, sampleTexelRGBA8Channel(
                base, stride, x1, y1, format, decode_table, channel));
             Value *top = builder.CreateFAdd(
                c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));

@@ -409,7 +409,11 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
-   if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D || pImageFormatInfo->flags)
+   if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D ||
+       (pImageFormatInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+       ((pImageFormatInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (!vtvk_format_is_texture_color(pImageFormatInfo->format) ||
+         !vtvk_array_usage_supported(pImageFormatInfo->usage))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if (!vtvk_format_is_texture_color(pImageFormatInfo->format) &&
        pImageFormatInfo->format != VK_FORMAT_D16_UNORM &&

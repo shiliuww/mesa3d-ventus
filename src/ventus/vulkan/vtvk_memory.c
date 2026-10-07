@@ -338,7 +338,10 @@ vtvk_CreateImage(VkDevice _device,
    uint32_t max_levels = 1;
    uint32_t dimension = MAX2(pCreateInfo->extent.width, pCreateInfo->extent.height);
    while (dimension > 1) { dimension >>= 1; ++max_levels; }
-   if (pCreateInfo->pNext || pCreateInfo->flags ||
+   if (pCreateInfo->pNext || (pCreateInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+       ((pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (!color || pCreateInfo->extent.width != pCreateInfo->extent.height ||
+         pCreateInfo->arrayLayers < 6 || !vtvk_array_usage_supported(pCreateInfo->usage))) ||
        pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
        !pCreateInfo->arrayLayers || pCreateInfo->arrayLayers > 2048 ||
        (pCreateInfo->arrayLayers > 1 &&
@@ -363,6 +366,7 @@ vtvk_CreateImage(VkDevice _device,
    image->format = pCreateInfo->format;
    image->mip_levels = pCreateInfo->mipLevels;
    image->array_layers = pCreateInfo->arrayLayers;
+   image->flags = pCreateInfo->flags;
    uint32_t width = image->extent.width, height = image->extent.height;
    for (uint32_t level = 0; level < image->mip_levels; ++level) {
       struct vtvk_image_level *mip = &image->levels[level];
@@ -411,11 +415,14 @@ vtvk_CreateImageView(VkDevice _device,
    const bool color = image && vtvk_format_is_texture_color(image->format);
    if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D &&
-        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_CUBE) ||
        pCreateInfo->format != image->format ||
        range->baseArrayLayer >= image->array_layers || !layers ||
        layers > image->array_layers - range->baseArrayLayer ||
        (pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_2D && layers != 1) ||
+       (pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_CUBE &&
+        (layers != 6 || !(image->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))) ||
        (!color && (range->baseArrayLayer || layers != 1 ||
                     pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D)) ||
        range->baseMipLevel >= image->mip_levels || !count ||

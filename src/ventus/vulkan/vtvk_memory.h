@@ -67,6 +67,7 @@ struct vtvk_image {
    VkDeviceSize memory_offset;
    void *map;
    VkDeviceAddress device_address;
+   VkImageCreateFlags flags;
    uint32_t mip_levels, array_layers;
    struct vtvk_image_level levels[VTVK_MAX_MIP_LEVELS];
 };
