@@ -1144,8 +1144,7 @@ vtvk_driver_sampler_address_mode_supported(VkSamplerAddressMode mode)
 {
    return mode == VK_SAMPLER_ADDRESS_MODE_REPEAT ||
           mode == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ||
-          mode == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE ||
-          mode == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+          mode == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 }
 
 static bool
@@ -1257,8 +1256,7 @@ vtvk_driver_upload_descriptor(
          record->mip_level_count = view->level_count;
          record->min_lod = sampler->min_lod;
          record->max_lod = sampler->max_lod;
-         record->sampler_mipmap_mode = (uint32_t)sampler->mipmap_mode |
-            ((uint32_t)sampler->border_color << VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT);
+         record->sampler_mipmap_mode = sampler->mipmap_mode;
          record->sampler_mag_filter = sampler->mag_filter;
          record->sampler_min_filter = sampler->min_filter;
          record->sampler_address_mode_u = sampler->address_mode_u;

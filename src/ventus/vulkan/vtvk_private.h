@@ -65,7 +65,6 @@ struct vtvk_sampler {
    float min_lod;
    float max_lod;
    VkSamplerMipmapMode mipmap_mode;
-   VkBorderColor border_color;
 };
 
 struct vtvk_cmd_buffer {

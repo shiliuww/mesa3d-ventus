@@ -699,12 +699,6 @@ enum vt_nir_rt_descriptor_record {
    VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 80,
 };
 
-/* Private software sampler word at offset76, not a frozen TMU interface. */
-enum vt_nir_rt_sampler_word {
-   VT_NIR_RT_SAMPLER_MIPMAP_MODE_MASK = 0xff,
-   VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT = 8,
-};
-
 enum vt_nir_rt_mip_record {
    VT_NIR_RT_MIP_RECORD_DEVICE_ADDR = 0,
    VT_NIR_RT_MIP_RECORD_WIDTH = 8,

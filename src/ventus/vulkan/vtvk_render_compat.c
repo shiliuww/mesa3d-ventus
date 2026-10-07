@@ -59,17 +59,10 @@ vtvk_CreateSampler(VkDevice _device,
        pCreateInfo->minLod < 0.0f || pCreateInfo->maxLod < pCreateInfo->minLod ||
        (pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
         pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
-        pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
-        pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) ||
+        pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE) ||
        (pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
         pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
-        pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
-        pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) ||
-       ((pCreateInfo->addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
-         pCreateInfo->addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) &&
-        pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK &&
-        pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK &&
-        pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE))
+        pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    struct vtvk_sampler *sampler =
@@ -86,7 +79,6 @@ vtvk_CreateSampler(VkDevice _device,
    sampler->min_lod = pCreateInfo->minLod;
    sampler->max_lod = pCreateInfo->maxLod;
    sampler->mipmap_mode = pCreateInfo->mipmapMode;
-   sampler->border_color = pCreateInfo->borderColor;
 
    *pSampler = (VkSampler)vtvk_ptr_to_handle(sampler);
    return VK_SUCCESS;
