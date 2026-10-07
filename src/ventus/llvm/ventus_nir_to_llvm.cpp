@@ -1425,7 +1425,12 @@ private:
       reduced = builder.CreateSelect(small, coord, reduced);
       Value *clamped = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 0)), ConstantFP::get(f32, 0), coord);
       clamped = builder.CreateSelect(builder.CreateFCmpOGT(clamped, ConstantFP::get(f32, 1)), ConstantFP::get(f32, 1), clamped);
-      return builder.CreateSelect(builder.CreateICmpEQ(mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)), clamped, reduced);
+      Value *bounded = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, -1)), ConstantFP::get(f32, -1), coord);
+      bounded = builder.CreateSelect(builder.CreateFCmpOGT(bounded, ConstantFP::get(f32, 2)), ConstantFP::get(f32, 2), bounded);
+      Value *ordinary = builder.CreateSelect(builder.CreateICmpEQ(mode,
+         ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)), clamped, reduced);
+      return builder.CreateSelect(builder.CreateICmpEQ(mode,
+         ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)), bounded, ordinary);
    }
 
    Value *wrapTexelCoord(Value *coord, Value *extent, Value *address_mode)
@@ -1699,7 +1704,10 @@ private:
          index = builder.CreateSelect(builder.CreateICmpUGT(level_bits, threshold),
                                        ConstantInt::get(i32, mip + 1), index);
       }
-      Value *mip_mode = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
+      Value *sampler_word = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
+      Value *mip_mode = builder.CreateAnd(sampler_word, ConstantInt::get(i32, VT_NIR_RT_SAMPLER_MIPMAP_MODE_MASK));
+      Value *border = builder.CreateAnd(builder.CreateLShr(sampler_word,
+         ConstantInt::get(i32, VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT)), ConstantInt::get(i32, 255));
       Value *mip_linear = builder.CreateICmpEQ(mip_mode, ConstantInt::get(i32, VK_SAMPLER_MIPMAP_MODE_LINEAR));
       Value *floor_index = builder.CreateFPToUI(level, i32);
       Value *last_index = builder.CreateSub(level_count, ConstantInt::get(i32, 1));
@@ -1736,9 +1744,11 @@ private:
          Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
          Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
 
-         Value *nearest_x = wrapTexelCoord(floorToI32(scaled_u), width,
+         Value *nearest_raw_x = floorToI32(scaled_u);
+         Value *nearest_raw_y = floorToI32(scaled_v);
+         Value *nearest_x = wrapTexelCoord(nearest_raw_x, width,
                                            address_mode_u);
-         Value *nearest_y = wrapTexelCoord(floorToI32(scaled_v), height,
+         Value *nearest_y = wrapTexelCoord(nearest_raw_y, height,
                                            address_mode_v);
 
          Value *linear_u = builder.CreateFSub(scaled_u, ConstantFP::get(f32, 0.5));
@@ -1757,17 +1767,34 @@ private:
          Value *y1 = wrapTexelCoord(linear_y1, height, address_mode_v);
          Value *is_linear = builder.CreateICmpEQ(
             filter, ConstantInt::get(i32, VK_FILTER_LINEAR));
+         auto outside = [&](Value *x, Value *y) {
+            return builder.CreateOr(builder.CreateAnd(
+               builder.CreateICmpEQ(address_mode_u, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)),
+               builder.CreateICmpUGE(x, width)), builder.CreateAnd(
+               builder.CreateICmpEQ(address_mode_v, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)),
+               builder.CreateICmpUGE(y, height)));
+         };
+         Value *border_nearest = outside(nearest_raw_x, nearest_raw_y);
+         Value *border00 = outside(linear_x0, linear_y0);
+         Value *border10 = outside(linear_x1, linear_y0);
+         Value *border01 = outside(linear_x0, linear_y1);
+         Value *border11 = outside(linear_x1, linear_y1);
          return floatResult(&tex->def, [&](unsigned channel) {
-            Value *nearest = sampleTexelRGBA8Channel(
-               base, stride, nearest_x, nearest_y, format, decode_table, channel);
-            Value *c00 = sampleTexelRGBA8Channel(base, stride, x0, y0, format, decode_table,
-                                                 channel);
-            Value *c10 = sampleTexelRGBA8Channel(base, stride, x1, y0, format, decode_table,
-                                                 channel);
-            Value *c01 = sampleTexelRGBA8Channel(base, stride, x0, y1, format, decode_table,
-                                                 channel);
-            Value *c11 = sampleTexelRGBA8Channel(base, stride, x1, y1, format, decode_table,
-                                                 channel);
+            Value *replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+               ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)), ConstantFP::get(f32, 1), ConstantFP::get(f32, 0));
+            if (channel == 3)
+               replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+                  ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)), ConstantFP::get(f32, 1), replacement);
+            Value *nearest = builder.CreateSelect(border_nearest, replacement, sampleTexelRGBA8Channel(
+               base, stride, nearest_x, nearest_y, format, decode_table, channel));
+            Value *c00 = builder.CreateSelect(border00, replacement, sampleTexelRGBA8Channel(
+               base, stride, x0, y0, format, decode_table, channel));
+            Value *c10 = builder.CreateSelect(border10, replacement, sampleTexelRGBA8Channel(
+               base, stride, x1, y0, format, decode_table, channel));
+            Value *c01 = builder.CreateSelect(border01, replacement, sampleTexelRGBA8Channel(
+               base, stride, x0, y1, format, decode_table, channel));
+            Value *c11 = builder.CreateSelect(border11, replacement, sampleTexelRGBA8Channel(
+               base, stride, x1, y1, format, decode_table, channel));
             Value *top = builder.CreateFAdd(
                c00, builder.CreateFMul(frac_u, builder.CreateFSub(c10, c00)));
             Value *bottom = builder.CreateFAdd(
