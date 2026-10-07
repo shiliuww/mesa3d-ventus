@@ -174,6 +174,7 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
 
    f->shaderInt16 = true;
    f->shaderInt64 = true;
+   f->shaderSampledImageArrayDynamicIndexing = true;
    f->shaderStorageImageWriteWithoutFormat = true;
    f->shaderStorageImageReadWithoutFormat = true;
    f->variablePointers = true;

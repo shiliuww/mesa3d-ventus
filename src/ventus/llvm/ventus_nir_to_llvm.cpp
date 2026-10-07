@@ -1343,32 +1343,43 @@ private:
                           builder.CreateShl(a, ConstantInt::get(i32, 24))));
    }
 
-   /* F08 accepts scalar resources and one fixed descriptor-array dimension
-    * with a compile-time legal index. Image layers are a separate concept. */
-   Value *descriptorTokenForDeref(nir_deref_instr *deref)
+   /* Fixed, one-dimensional descriptor arrays. Only sampled images and
+    * samplers allow F09 dynamically uniform indices; storage resources retain
+    * their constant-index boundary. Explicit NonUniform is rejected by lowerTex. */
+   Value *descriptorTokenForDeref(nir_deref_instr *deref, bool allow_dynamic = false)
    {
       if (!deref)
          return nullptr;
       nir_variable *var = nir_deref_instr_get_variable(deref);
       if (!var || !vt_rt_descriptor_location_valid(var->data.descriptor_set, var->data.binding))
          return nullptr;
-      uint32_t element = 0;
+      Value *element = ConstantInt::get(i32, 0);
       if (deref->deref_type == nir_deref_type_array) {
          nir_deref_instr *parent = nir_src_as_deref(deref->parent);
          if (!parent || parent->deref_type != nir_deref_type_var ||
-             !glsl_type_is_array(var->type) || !nir_src_is_const(deref->arr.index))
+             !glsl_type_is_array(var->type))
             return nullptr;
-         element = nir_src_as_uint(deref->arr.index);
          const uint32_t count = glsl_get_length(var->type);
-         if (!count || element >= count ||
-             count > (UINT32_MAX >> VT_RT_DESCRIPTOR_INDEX_SHIFT) ||
+         if (!count || count > (UINT32_MAX >> VT_RT_DESCRIPTOR_INDEX_SHIFT) ||
              glsl_type_is_array(glsl_get_array_element(var->type)))
             return nullptr;
+         if (nir_src_is_const(deref->arr.index)) {
+            const uint32_t index = nir_src_as_uint(deref->arr.index);
+            if (index >= count)
+               return nullptr;
+            element = ConstantInt::get(i32, index);
+         } else {
+            if (!allow_dynamic)
+               return nullptr;
+            // In-bounds and dynamic uniformity are Vulkan valid-usage rules.
+            element = asInt32(value(deref->arr.index));
+         }
       } else if (deref->deref_type != nir_deref_type_var || glsl_type_is_array(var->type)) {
          return nullptr;
       }
-      return ConstantInt::get(i32, vt_rt_descriptor_token(
-         var->data.descriptor_set, var->data.binding, element));
+      return builder.CreateOr(ConstantInt::get(i32, vt_rt_descriptor_token(
+         var->data.descriptor_set, var->data.binding, 0)),
+         builder.CreateShl(element, ConstantInt::get(i32, VT_RT_DESCRIPTOR_INDEX_SHIFT)));
    }
 
    Value *storageImageBinding(nir_intrinsic_instr *intrin)
@@ -1583,8 +1594,8 @@ private:
          }
       }
 
-      Value *texture_token = descriptorTokenForDeref(texture_deref);
-      Value *sampler_token = descriptorTokenForDeref(sampler_deref);
+      Value *texture_token = descriptorTokenForDeref(texture_deref, true);
+      Value *sampler_token = descriptorTokenForDeref(sampler_deref, true);
       const bool fetch = tex->op == nir_texop_txf;
       const bool size_query = tex->op == nir_texop_txs;
       const bool levels_query = tex->op == nir_texop_query_levels;
