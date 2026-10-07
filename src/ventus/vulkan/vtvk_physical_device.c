@@ -185,7 +185,7 @@ vtvk_init_features(struct vtvk_physical_device *pdev)
    f->vulkanMemoryModel = true;
    f->descriptorIndexing = true;
    f->shaderUniformBufferArrayNonUniformIndexing = false;
-   f->shaderSampledImageArrayNonUniformIndexing = false;
+   f->shaderSampledImageArrayNonUniformIndexing = true;
    f->shaderStorageBufferArrayNonUniformIndexing = false;
    f->shaderStorageImageArrayNonUniformIndexing = false;
    f->shaderUniformTexelBufferArrayNonUniformIndexing = false;

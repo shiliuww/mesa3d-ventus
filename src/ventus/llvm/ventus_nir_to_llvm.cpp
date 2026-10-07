@@ -1345,7 +1345,7 @@ private:
 
    /* Fixed, one-dimensional descriptor arrays. Only sampled images and
     * samplers allow F09 dynamically uniform indices; storage resources retain
-    * their constant-index boundary. Explicit NonUniform is rejected by lowerTex. */
+    * their constant-index boundary. F10 keeps NonUniform addressing per lane. */
    Value *descriptorTokenForDeref(nir_deref_instr *deref, bool allow_dynamic = false)
    {
       if (!deref)
@@ -1604,8 +1604,7 @@ private:
                                      tex->dest_type == nir_type_uint32;
          const bool supported = sources_supported && texture_token && !sampler_deref &&
             tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
-            !tex->is_shadow && !tex->is_sparse && !tex->texture_non_uniform &&
-            !tex->sampler_non_uniform && tex->def.bit_size == 32 &&
+            !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
              (lod && lod->bit_size == 32 && lod->num_components == 1 &&
               (size_query ? (!coord && integer_result && tex->def.num_components == 2) :
@@ -1674,7 +1673,7 @@ private:
       const bool supported = base_lod && sources_supported &&
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
          tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
-         !tex->is_sparse && !tex->texture_non_uniform && !tex->sampler_non_uniform &&
+         !tex->is_sparse &&
          coord && coord->bit_size == 32 &&
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
