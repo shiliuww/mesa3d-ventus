@@ -49,6 +49,7 @@ static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
 static_assert(sizeof(vtvk_rt_mip_record) == VT_NIR_RT_MIP_RECORD_SIZE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+static_assert(offsetof(vtvk_rt_descriptor_record, layer_count) == VT_NIR_RT_DESCRIPTOR_RECORD_LAYER_COUNT);
 static_assert(offsetof(vtvk_rt_descriptor_record, lod_bias) == VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS);
 static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD);
 static_assert(offsetof(vtvk_rt_descriptor_record, max_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD);
@@ -1232,10 +1233,13 @@ vtvk_driver_upload_descriptor(
       if (!image || !view || view->image != src->image || !image->map ||
           !image->device_address || !view->level_count ||
           view->base_mip >= image->mip_levels ||
-          view->level_count > image->mip_levels - view->base_mip)
+          view->level_count > image->mip_levels - view->base_mip ||
+          !view->layer_count || view->base_layer >= image->array_layers ||
+          view->layer_count > image->array_layers - view->base_layer)
          return false;
       if (src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
           (view->base_mip != 0 || view->level_count != 1 ||
+           view->type != VK_IMAGE_VIEW_TYPE_2D || view->base_layer != 0 || view->layer_count != 1 ||
            !vtvk_components_identity(view->components) ||
            view->format == VK_FORMAT_R8G8B8A8_SRGB ||
            view->format == VK_FORMAT_B8G8R8A8_SRGB)) {
@@ -1243,7 +1247,7 @@ vtvk_driver_upload_descriptor(
          return false;
       }
       const auto &base = image->levels[view->base_mip];
-      record->device_addr = image->device_address + base.offset;
+      record->device_addr = image->device_address + base.offset + view->base_layer * base.size;
       record->byte_size = base.size;
       record->format = view->format;
       record->stride = base.row_pitch;
@@ -1257,16 +1261,18 @@ vtvk_driver_upload_descriptor(
              (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
               !vtvk_driver_fill_sampler(src, record)))
             return false;
-         std::vector<vtvk_rt_mip_record> levels(view->level_count);
+         std::vector<vtvk_rt_mip_record> levels((size_t)view->level_count * view->layer_count);
          const uint32_t mapping = (uint32_t)view->components.r |
             ((uint32_t)view->components.g << 4) |
             ((uint32_t)view->components.b << 8) |
             ((uint32_t)view->components.a << 12);
-         for (uint32_t level = 0; level < view->level_count; ++level) {
-            const auto &mip = image->levels[view->base_mip + level];
-            levels[level] = {image->device_address + mip.offset, mip.width,
-                             mip.height, mip.row_pitch, mapping};
-         }
+         for (uint32_t layer = 0; layer < view->layer_count; ++layer)
+            for (uint32_t level = 0; level < view->level_count; ++level) {
+               const auto &mip = image->levels[view->base_mip + level];
+               levels[layer * view->level_count + level] = {
+                  image->device_address + mip.offset + (view->base_layer + layer) * mip.size,
+                  mip.width, mip.height, mip.row_pitch, mapping};
+            }
          /* Dispatch metadata: unchanged mip records followed by the 256-entry
           * float decoder. Even UNORM views get a valid table so speculative
           * reads remain bounded; their results still use the original UNORM
@@ -1282,6 +1288,7 @@ vtvk_driver_upload_descriptor(
                                      &record->mip_table_addr))
             return false;
          record->mip_level_count = view->level_count;
+         record->layer_count = view->layer_count;
       }
       break;
    }

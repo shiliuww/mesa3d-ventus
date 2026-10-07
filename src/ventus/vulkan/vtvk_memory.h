@@ -67,15 +67,25 @@ struct vtvk_image {
    VkDeviceSize memory_offset;
    void *map;
    VkDeviceAddress device_address;
-   uint32_t mip_levels;
+   uint32_t mip_levels, array_layers;
    struct vtvk_image_level levels[VTVK_MAX_MIP_LEVELS];
 };
 
 struct vtvk_image_view {
    VkImage image;
    VkFormat format;
-   uint32_t base_mip, level_count;
+   uint32_t base_mip, level_count, base_layer, layer_count;
+   VkImageViewType type;
    VkComponentMapping components;
 };
+
+/* Array texture profile does not extend attachment or storage-image paths. */
+static inline bool
+vtvk_array_usage_supported(VkImageUsageFlags usage)
+{
+   return !(usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+}
 
 #endif

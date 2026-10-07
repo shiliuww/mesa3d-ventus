@@ -426,7 +426,8 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
       .maxExtent = {16384, 16384, 1},
       .maxMipLevels = vtvk_format_is_texture_color(pImageFormatInfo->format) ? 15 : 1,
-      .maxArrayLayers = 1,
+      .maxArrayLayers = vtvk_format_is_texture_color(pImageFormatInfo->format) &&
+         vtvk_array_usage_supported(pImageFormatInfo->usage) ? 2048 : 1,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxResourceSize = 1ull << 32,
    };

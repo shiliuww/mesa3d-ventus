@@ -340,7 +340,9 @@ vtvk_CreateImage(VkDevice _device,
    while (dimension > 1) { dimension >>= 1; ++max_levels; }
    if (pCreateInfo->pNext || pCreateInfo->flags ||
        pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
-       pCreateInfo->arrayLayers != 1 ||
+       !pCreateInfo->arrayLayers || pCreateInfo->arrayLayers > 2048 ||
+       (pCreateInfo->arrayLayers > 1 &&
+        (!color || !vtvk_array_usage_supported(pCreateInfo->usage))) ||
        pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
        !pCreateInfo->extent.width || !pCreateInfo->extent.height ||
        pCreateInfo->extent.width > 16384 || pCreateInfo->extent.height > 16384 ||
@@ -360,6 +362,7 @@ vtvk_CreateImage(VkDevice _device,
    image->extent = pCreateInfo->extent;
    image->format = pCreateInfo->format;
    image->mip_levels = pCreateInfo->mipLevels;
+   image->array_layers = pCreateInfo->arrayLayers;
    uint32_t width = image->extent.width, height = image->extent.height;
    for (uint32_t level = 0; level < image->mip_levels; ++level) {
       struct vtvk_image_level *mip = &image->levels[level];
@@ -368,9 +371,13 @@ vtvk_CreateImage(VkDevice _device,
       mip->row_pitch = width * vtvk_format_bytes_per_pixel(image->format);
       mip->offset = image->size;
       mip->size = (VkDeviceSize)mip->row_pitch * height;
-      image->size += mip->size;
+      image->size += mip->size * image->array_layers;
       width = MAX2(1, width >> 1);
       height = MAX2(1, height >> 1);
+   }
+   if (image->array_layers > 1 && image->size > UINT32_MAX) {
+      vk_free(alloc, image);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
    *pImage = (VkImage)vtvk_ptr_to_handle(image);
    return VK_SUCCESS;
@@ -398,12 +405,19 @@ vtvk_CreateImageView(VkDevice _device,
    const uint32_t count = image && range->baseMipLevel < image->mip_levels &&
       range->levelCount == VK_REMAINING_MIP_LEVELS ?
       image->mip_levels - range->baseMipLevel : range->levelCount;
+   const uint32_t layers = image && range->baseArrayLayer < image->array_layers &&
+      range->layerCount == VK_REMAINING_ARRAY_LAYERS ?
+      image->array_layers - range->baseArrayLayer : range->layerCount;
    const bool color = image && vtvk_format_is_texture_color(image->format);
    if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
-       pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D ||
+       (pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D &&
+        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
        pCreateInfo->format != image->format ||
-       range->baseArrayLayer != 0 ||
-       (range->layerCount != 1 && range->layerCount != VK_REMAINING_ARRAY_LAYERS) ||
+       range->baseArrayLayer >= image->array_layers || !layers ||
+       layers > image->array_layers - range->baseArrayLayer ||
+       (pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_2D && layers != 1) ||
+       (!color && (range->baseArrayLayer || layers != 1 ||
+                    pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D)) ||
        range->baseMipLevel >= image->mip_levels || !count ||
        count > image->mip_levels - range->baseMipLevel ||
        (color && range->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) ||
@@ -422,6 +436,9 @@ vtvk_CreateImageView(VkDevice _device,
    view->format = pCreateInfo->format;
    view->base_mip = range->baseMipLevel;
    view->level_count = count;
+   view->base_layer = range->baseArrayLayer;
+   view->layer_count = layers;
+   view->type = pCreateInfo->viewType;
    view->components = pCreateInfo->components;
    *pView = (VkImageView)vtvk_ptr_to_handle(view);
    return VK_SUCCESS;
@@ -435,6 +452,26 @@ vtvk_DestroyImageView(VkDevice _device,
    VK_FROM_HANDLE(vtvk_device, device, _device);
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
    vk_free(alloc, vtvk_handle_to_ptr((uint64_t)imageView));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vtvk_GetImageSubresourceLayout(VkDevice device, VkImage _image,
+                              const VkImageSubresource *subresource,
+                              VkSubresourceLayout *layout)
+{
+   struct vtvk_image *image = vtvk_handle_to_ptr((uint64_t)_image);
+   *layout = (VkSubresourceLayout){0};
+   if (!image || subresource->mipLevel >= image->mip_levels ||
+       subresource->arrayLayer >= image->array_layers)
+      return;
+   const struct vtvk_image_level *mip = &image->levels[subresource->mipLevel];
+   *layout = (VkSubresourceLayout){
+      .offset = mip->offset + (VkDeviceSize)subresource->arrayLayer * mip->size,
+      .size = mip->size,
+      .rowPitch = mip->row_pitch,
+      .arrayPitch = mip->size,
+      .depthPitch = mip->size,
+   };
 }
 
 VKAPI_ATTR void VKAPI_CALL

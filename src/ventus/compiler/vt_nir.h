@@ -697,7 +697,8 @@ enum vt_nir_rt_descriptor_record {
    VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD = 72,
    VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE = 76,
    VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS = 80,
-   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 88,
+   VT_NIR_RT_DESCRIPTOR_RECORD_LAYER_COUNT = 88,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 96,
 };
 
 /* Finite sampler-bias profile, shared by Vulkan validation and limits. */

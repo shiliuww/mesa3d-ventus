@@ -88,6 +88,8 @@ struct vtvk_rt_descriptor_record {
    uint32_t sampler_mipmap_mode;
    float lod_bias;
    uint32_t reserved;
+   uint32_t layer_count;
+   uint32_t reserved_layer;
 };
 
 /* Dispatch-owned metadata indexed relative to the bound view. */

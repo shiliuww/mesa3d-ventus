@@ -1384,6 +1384,10 @@ private:
 
    Value *storageImageBinding(nir_intrinsic_instr *intrin)
    {
+      if (nir_intrinsic_image_array(intrin)) {
+         translationFailed = true;
+         return nullptr;
+      }
       if (intrin->intrinsic == nir_intrinsic_image_store)
          return asInt32(value(intrin->src[0]));
 
@@ -1657,6 +1661,7 @@ private:
 
       Value *texture_token = descriptorTokenForDeref(texture_deref, true);
       Value *sampler_token = descriptorTokenForDeref(sampler_deref, true);
+      const unsigned coordinate_count = tex->is_array ? 3 : 2;
       const bool fetch = tex->op == nir_texop_txf;
       const bool size_query = tex->op == nir_texop_txs;
       const bool levels_query = tex->op == nir_texop_query_levels;
@@ -1664,13 +1669,13 @@ private:
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
          const bool supported = sources_supported && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
-            tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+            tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
             !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
              (lod && lod->bit_size == 32 && lod->num_components == 1 &&
-              (size_query ? (!coord && integer_result && tex->def.num_components == 2) :
-               (coord && coord->bit_size == 32 && coord->num_components == 2 &&
-                tex->coord_components == 2 && tex->dest_type == nir_type_float32 &&
+              (size_query ? (!coord && integer_result && tex->def.num_components == coordinate_count) :
+               (coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
+                tex->coord_components == coordinate_count && tex->dest_type == nir_type_float32 &&
                 tex->def.num_components == 4))));
          if (!supported) {
             unsupportedDefs.insert(&tex->def);
@@ -1679,6 +1684,7 @@ private:
          }
          Value *binding = texture_token;
          Value *count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+         Value *layer_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_LAYER_COUNT);
          if (levels_query)
             return count;
 
@@ -1688,8 +1694,12 @@ private:
          Value *index = asInt32(value(nir_src_for_ssa(lod)));
          Value *valid_lod = builder.CreateICmpULT(index, count);
          Value *safe_index = builder.CreateSelect(valid_lod, index, ConstantInt::get(i32, 0));
+         Value *layer = fetch && tex->is_array ? asInt32(component(value(nir_src_for_ssa(coord)), 2)) : ConstantInt::get(i32, 0);
+         Value *valid_layer = builder.CreateICmpULT(layer, layer_count);
+         Value *safe_layer = builder.CreateSelect(valid_layer, layer, ConstantInt::get(i32, 0));
+         Value *table_index = builder.CreateAdd(builder.CreateMul(safe_layer, count), safe_index);
          Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
-         Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(safe_index),
+         Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(table_index),
             ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
          auto field = [&](unsigned offset) {
             return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
@@ -1698,14 +1708,14 @@ private:
          Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
          if (size_query)
             return intResult(&tex->def, [&](unsigned c) {
-               return builder.CreateSelect(valid_lod, c == 0 ? width : height,
+               return builder.CreateSelect(valid_lod, c == 0 ? width : c == 1 ? height : layer_count,
                                            ConstantInt::get(i32, 0));
             });
 
          Value *coordinates = value(nir_src_for_ssa(coord));
          Value *x = builder.CreateAdd(asInt32(component(coordinates, 0)), offset_x);
          Value *y = builder.CreateAdd(asInt32(component(coordinates, 1)), offset_y);
-         Value *valid = builder.CreateAnd(valid_lod, builder.CreateAnd(
+         Value *valid = builder.CreateAnd(builder.CreateAnd(valid_lod, valid_layer), builder.CreateAnd(
             builder.CreateICmpULT(x, width), builder.CreateICmpULT(y, height)));
          x = builder.CreateSelect(valid, x, ConstantInt::get(i32, 0));
          y = builder.CreateSelect(valid, y, ConstantInt::get(i32, 0));
@@ -1717,7 +1727,7 @@ private:
          }
          Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
          Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
-         Value *decode_table = builder.CreateAdd(table, builder.CreateMul(asAddress(count),
+         Value *decode_table = builder.CreateAdd(table, builder.CreateMul(asAddress(builder.CreateMul(count, layer_count)),
             ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
          Value *color = floatResult(&tex->def, [&](unsigned c) {
             Value *color = sampleTexelRGBA8Channel(base, stride, x, y, format, decode_table, c);
@@ -1736,9 +1746,9 @@ private:
           (tex->op == nir_texop_tex && !lod)));
       const bool supported = base_lod && sources_supported &&
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
-         tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
+         tex->coord_components == coordinate_count && !tex->is_shadow &&
          !tex->is_sparse &&
-         coord && coord->bit_size == 32 &&
+         coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
          tex->dest_type == nir_type_float32 &&
          tex->def.bit_size == 32 && tex->def.num_components == 4 &&
          coord && texture_token && sampler_token;
@@ -1758,6 +1768,7 @@ private:
       /* LOD is view-relative. Clamp before selecting levels. Preserve the
        * mip-nearest preferred tie rule; mip-linear uses floor and its successor. */
       Value *level_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+      Value *layer_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_LAYER_COUNT);
       Value *min_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
       Value *max_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
       Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
@@ -1796,8 +1807,7 @@ private:
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, last), last, level);
       /* The clamped value is nonnegative. Clear the sign of negative zero
        * before using binary32 bit ordering for half-level integer compares.
-       * This preserves exact ties without uniform floating subtraction, which
-       * the current Ventus backend incorrectly places in a vector register. */
+       * Keep the existing deterministic preferred lower-mip half tie. */
       Value *index = ConstantInt::get(i32, 0);
       Value *level_bits = builder.CreateAnd(asInt32(level), ConstantInt::get(i32, 0x7fffffff));
       for (unsigned mip = 0; mip < 14; ++mip) {
@@ -1823,12 +1833,29 @@ private:
       Value *address_mode_v = descriptorRecordI32(
          sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
       Value *coord_value = value(nir_src_for_ssa(coord));
+      Value *layer_index = ConstantInt::get(i32, 0);
+      if (tex->is_array) {
+         // RNE is relative to the view, before adding its base layer in the
+         // producer. Clamp finite coordinates before integer conversion.
+         Value *a = asFloat(component(coord_value, 2));
+         Value *last_layer = builder.CreateUIToFP(builder.CreateSub(layer_count, ConstantInt::get(i32, 1)), f32);
+         a = builder.CreateSelect(builder.CreateFCmpOLT(a, ConstantFP::get(f32, 0)), ConstantFP::get(f32, 0), a);
+         a = builder.CreateSelect(builder.CreateFCmpOGT(a, last_layer), last_layer, a);
+         Value *low = builder.CreateFPToUI(a, i32);
+         Value *part = builder.CreateFSub(a, builder.CreateUIToFP(low, f32));
+         Value *odd = builder.CreateICmpNE(builder.CreateAnd(low, ConstantInt::get(i32, 1)), ConstantInt::get(i32, 0));
+         Value *up = builder.CreateOr(builder.CreateFCmpOGT(part, ConstantFP::get(f32, 0.5)),
+            builder.CreateAnd(builder.CreateFCmpOEQ(part, ConstantFP::get(f32, 0.5)), odd));
+         layer_index = builder.CreateAdd(low, builder.CreateZExt(up, i32));
+      }
+
       Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u, offset_values[0] != 0);
       Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v, offset_values[1] != 0);
       Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
       Value *decode_table = builder.CreateAdd(table,
-         builder.CreateMul(asAddress(level_count), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
+         builder.CreateMul(asAddress(builder.CreateMul(level_count, layer_count)), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
       auto sample_level = [&](Value *mip_index) -> Value * {
+         mip_index = builder.CreateAdd(builder.CreateMul(layer_index, level_count), mip_index);
          Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(mip_index), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
          auto field = [&](unsigned offset) {
             return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
@@ -2486,6 +2513,11 @@ private:
       }
       case nir_intrinsic_image_deref_size:
       case nir_intrinsic_image_size: {
+         if (nir_intrinsic_image_array(intrin)) {
+            translationFailed = true;
+            unsupportedDefs.insert(&intrin->def);
+            return undefFor(&intrin->def);
+         }
          return buildVector(3, i32, [&](unsigned i) {
             switch (i) {
             case 0:
