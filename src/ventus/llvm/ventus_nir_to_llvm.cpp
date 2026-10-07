@@ -1755,7 +1755,10 @@ private:
       const bool gradients = !cube && !volume && tex->op == nir_texop_txd && !lod && ddx && ddy &&
          ddx->bit_size == 32 && ddy->bit_size == 32 &&
          ddx->num_components == 2 && ddy->num_components == 2;
-      const bool base_lod = gradients || (!ddx && !ddy &&
+      const bool gather = tex->op == nir_texop_tg4;
+      const bool gather_supported = gather && !cube && !volume && !lod && !ddx && !ddy && !offset &&
+         !tex->is_gather_implicit_lod && !nir_tex_instr_has_explicit_tg4_offsets(tex);
+      const bool base_lod = gather_supported || gradients || (!ddx && !ddy &&
          ((tex->op == nir_texop_txl && lod && lod->bit_size == 32 && lod->num_components == 1) ||
           (tex->op == nir_texop_tex && !lod)));
       const bool depth_compare = tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
@@ -1767,7 +1770,7 @@ private:
          !tex->is_sparse &&
          coord && coord->bit_size == 32 && coord->num_components == coordinate_count &&
          tex->dest_type == nir_type_float32 &&
-         tex->def.bit_size == 32 && tex->def.num_components == (depth_compare ? 1 : 4) &&
+         tex->def.bit_size == 32 && tex->def.num_components == (depth_compare && !gather ? 1 : 4) &&
          coord && texture_token && sampler_token;
       if (!supported) {
          if (debugLowering)
@@ -1844,6 +1847,7 @@ private:
       Value *first_index = builder.CreateSelect(mip_linear, floor_index, index);
       Value *second_index = builder.CreateSelect(mip_linear, next_index, index);
       Value *fraction = builder.CreateFSub(level, builder.CreateUIToFP(floor_index, f32));
+      if (gather) first_index = ConstantInt::get(i32, 0);
       Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *reference = depth_compare ? asFloat(value(nir_src_for_ssa(comparator))) : nullptr;
       Value *compare_op = depth_compare ? descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_COMPARE_OP) : nullptr;
@@ -2073,6 +2077,24 @@ private:
             Value *ordinary = builder.CreateSelect(outside_x, across_x, builder.CreateSelect(outside_y, across_y, current));
             return builder.CreateSelect(builder.CreateAnd(outside_x, outside_y), corner, ordinary);
          };
+         if (gather) {
+            auto gather_tap = [&](Value *x, Value *y, Value *outside) -> Value * {
+               Value *rgba = floatResult(&tex->def, [&](unsigned channel) {
+                  Value *replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+                     ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)), ConstantFP::get(f32, 1), ConstantFP::get(f32, 0));
+                  if (channel == 3)
+                     replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+                        ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)), ConstantFP::get(f32, 1), replacement);
+                  return builder.CreateSelect(outside, replacement, sampleTexelRGBA8Channel(base, stride, x, y, format, decode_table, channel));
+               });
+               if (depth_compare) return compare_depth(asFloat(component(rgba, 0)));
+               return asFloat(component(swizzleTextureResult(binding, rgba), tex->component));
+            };
+            // Gather returns neighbors, never an interpolated color.
+            const std::array<Value *,4> taps{gather_tap(x0,y1,border01), gather_tap(x1,y1,border11),
+               gather_tap(x1,y0,border10), gather_tap(x0,y0,border00)};
+            return floatResult(&tex->def, [&](unsigned channel) { return taps[channel]; });
+         }
          return floatResult(&tex->def, [&](unsigned channel) {
             Value *replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
                ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)), ConstantFP::get(f32, 1), ConstantFP::get(f32, 0));
@@ -2102,6 +2124,7 @@ private:
          });
       };
       Value *first = sample_level(first_index);
+      if (gather) return first;
       Value *second = sample_level(second_index);
       Value *filtered = floatResult(&tex->def, [&](unsigned channel) {
          Value *a = asFloat(component(first, channel));
