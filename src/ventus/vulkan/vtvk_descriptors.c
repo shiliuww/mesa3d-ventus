@@ -56,9 +56,13 @@ vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
    out->image_info = set->bindings[binding].image;
    out->buffer = set->bindings[binding].buffer;
 
-   struct vtvk_image_view *view =
-      vtvk_handle_to_ptr((uint64_t)out->image_info.imageView);
-   out->image = view ? view->image : VK_NULL_HANDLE;
+   if (out->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+       out->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+       out->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+      struct vtvk_image_view *view =
+         vtvk_handle_to_ptr((uint64_t)out->image_info.imageView);
+      out->image = view ? view->image : VK_NULL_HANDLE;
+   }
 
    if (out->buffer.range == VK_WHOLE_SIZE) {
       struct vtvk_buffer *buffer =
@@ -72,6 +76,10 @@ vtvk_descriptor_set_get_binding(VkDescriptorSet descriptorSet,
    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
       out->valid = out->acceleration_structure != VK_NULL_HANDLE;
       break;
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+      out->valid = out->image_info.sampler != VK_NULL_HANDLE;
+      break;
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       out->valid = out->image != VK_NULL_HANDLE;
       break;
@@ -235,6 +243,8 @@ vtvk_UpdateDescriptorSets(VkDevice device,
                as_info->pAccelerationStructures[0];
          break;
       }
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
          if (write->pImageInfo)

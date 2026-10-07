@@ -105,6 +105,10 @@ vtvk_collect_rt_descriptor(const struct vtvk_descriptor_binding_info *info,
    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
       desc.acceleration_structure = info->acceleration_structure;
       break;
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+      desc.sampler = info->image_info.sampler;
+      break;
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       desc.image = info->image;

@@ -1164,6 +1164,33 @@ vtvk_driver_sampled_format_supported(VkFormat format)
 }
 
 static bool
+vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
+                         struct vtvk_rt_descriptor_record *record)
+{
+   auto *sampler = (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
+   if (!sampler ||
+       !vtvk_driver_sampler_filter_supported(sampler->mag_filter) ||
+       !vtvk_driver_sampler_filter_supported(sampler->min_filter) ||
+       !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
+       !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
+       sampler->compare_enable || sampler->unnormalized_coordinates ||
+       (sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+        sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_LINEAR)) {
+      mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
+      return false;
+   }
+   record->min_lod = sampler->min_lod;
+   record->max_lod = sampler->max_lod;
+   record->sampler_mipmap_mode = (uint32_t)sampler->mipmap_mode |
+      ((uint32_t)sampler->border_color << VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT);
+   record->sampler_mag_filter = sampler->mag_filter;
+   record->sampler_min_filter = sampler->min_filter;
+   record->sampler_address_mode_u = sampler->address_mode_u;
+   record->sampler_address_mode_v = sampler->address_mode_v;
+   return true;
+}
+
+static bool
 vtvk_driver_upload_descriptor(
    struct vtvk_driver_api *api,
    const struct vtvk_rt_descriptor_source *src,
@@ -1191,6 +1218,11 @@ vtvk_driver_upload_descriptor(
       break;
    }
 
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+      if (!vtvk_driver_fill_sampler(src, record))
+         return false;
+      break;
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
       auto *image = (struct vtvk_image *)(uintptr_t)(uint64_t)src->image;
@@ -1217,19 +1249,12 @@ vtvk_driver_upload_descriptor(
       if (api->vt_copy_to_dev(api->device, image->device_address, image->map,
                               image->size, 0, 0) != 0)
          return false;
-      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-         auto *sampler = (struct vtvk_sampler *)(uintptr_t)(uint64_t)src->sampler;
-         if (!vtvk_driver_sampled_format_supported(view->format) || !sampler ||
-             !vtvk_driver_sampler_filter_supported(sampler->mag_filter) ||
-             !vtvk_driver_sampler_filter_supported(sampler->min_filter) ||
-             !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
-             !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
-             sampler->compare_enable || sampler->unnormalized_coordinates ||
-             (sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
-              sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_LINEAR)) {
-            mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
+      if (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          src->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+         if (!vtvk_driver_sampled_format_supported(view->format) ||
+             (src->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+              !vtvk_driver_fill_sampler(src, record)))
             return false;
-         }
          std::vector<vtvk_rt_mip_record> levels(view->level_count);
          const uint32_t mapping = (uint32_t)view->components.r |
             ((uint32_t)view->components.g << 4) |
@@ -1255,14 +1280,6 @@ vtvk_driver_upload_descriptor(
                                      &record->mip_table_addr))
             return false;
          record->mip_level_count = view->level_count;
-         record->min_lod = sampler->min_lod;
-         record->max_lod = sampler->max_lod;
-         record->sampler_mipmap_mode = (uint32_t)sampler->mipmap_mode |
-            ((uint32_t)sampler->border_color << VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT);
-         record->sampler_mag_filter = sampler->mag_filter;
-         record->sampler_min_filter = sampler->min_filter;
-         record->sampler_address_mode_u = sampler->address_mode_u;
-         record->sampler_address_mode_v = sampler->address_mode_v;
       }
       break;
    }

@@ -1654,10 +1654,7 @@ private:
          vt_rt_descriptor_location_valid(
             texture_var->data.descriptor_set, texture_var->data.binding) &&
          vt_rt_descriptor_location_valid(
-            sampler_var->data.descriptor_set, sampler_var->data.binding) &&
-         texture_var->data.descriptor_set ==
-            sampler_var->data.descriptor_set &&
-         texture_var->data.binding == sampler_var->data.binding;
+            sampler_var->data.descriptor_set, sampler_var->data.binding);
       if (!supported) {
          if (debugLowering)
             fprintf(stderr, "ventus-nir-to-llvm: unsupported texture op=%u\n",
@@ -1667,28 +1664,28 @@ private:
          return undefFor(&tex->def, true);
       }
 
-      /* This mirrors RADV's texture/sampler-deref resolution at the level
-       * appropriate to the Ventus RT software descriptor ABI.  The supported
-       * subset is a normalized RGBA8/BGRA8 2D mip lookup.  Texture and
-       * sampler derefs resolve through one software descriptor record, just
-       * as RADV first resolves them to its hardware descriptor pair. */
+      /* Combined descriptors resolve both derefs to one slot; separate
+       * descriptors resolve image/view and sampling state independently. */
       Value *binding = ConstantInt::get(
          i32, vt_rt_descriptor_table_slot(texture_var->data.descriptor_set,
                                           texture_var->data.binding));
+      Value *sampler_binding = ConstantInt::get(
+         i32, vt_rt_descriptor_table_slot(sampler_var->data.descriptor_set,
+                                          sampler_var->data.binding));
       /* LOD is view-relative. Clamp before selecting levels. Preserve the
        * mip-nearest preferred tie rule; mip-linear uses floor and its successor. */
       Value *level_count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
-      Value *min_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
-      Value *max_lod = asFloat(descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
+      Value *min_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
+      Value *max_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
       Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
       level = builder.CreateSelect(builder.CreateFCmpOLT(level, min_lod), min_lod, level);
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, max_lod), max_lod, level);
       /* Filter selection uses sampler-clamped lambda, not the view-clamped
        * level or rounded mip. A single-level view may still be minified. */
       Value *mag_filter = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
+         sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MAG_FILTER);
       Value *min_filter = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIN_FILTER);
+         sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIN_FILTER);
       Value *filter = builder.CreateSelect(
          builder.CreateFCmpOGT(level, ConstantFP::get(f32, 0)), min_filter, mag_filter);
       Value *last = builder.CreateUIToFP(builder.CreateSub(level_count, ConstantInt::get(i32, 1)), f32);
@@ -1704,7 +1701,7 @@ private:
          index = builder.CreateSelect(builder.CreateICmpUGT(level_bits, threshold),
                                        ConstantInt::get(i32, mip + 1), index);
       }
-      Value *sampler_word = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
+      Value *sampler_word = descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
       Value *mip_mode = builder.CreateAnd(sampler_word, ConstantInt::get(i32, VT_NIR_RT_SAMPLER_MIPMAP_MODE_MASK));
       Value *border = builder.CreateAnd(builder.CreateLShr(sampler_word,
          ConstantInt::get(i32, VT_NIR_RT_SAMPLER_BORDER_COLOR_SHIFT)), ConstantInt::get(i32, 255));
@@ -1718,9 +1715,9 @@ private:
       Value *fraction = builder.CreateFSub(level, builder.CreateUIToFP(floor_index, f32));
       Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
       Value *address_mode_u = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
+         sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
       Value *address_mode_v = descriptorRecordI32(
-         binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
+         sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
       Value *coord_value = value(nir_src_for_ssa(coord));
       Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u);
       Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v);
