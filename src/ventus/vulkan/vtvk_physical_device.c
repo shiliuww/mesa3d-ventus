@@ -32,6 +32,8 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    memcpy(p->driverUUID, uuid, VK_UUID_SIZE);
 
    p->maxSamplerLodBias = VT_NIR_RT_MAX_SAMPLER_LOD_BIAS;
+   p->minTexelOffset = VT_NIR_RT_MIN_TEXEL_OFFSET;
+   p->maxTexelOffset = VT_NIR_RT_MAX_TEXEL_OFFSET;
    p->maxImageDimension1D = 16384;
    p->maxImageDimension2D = 16384;
    p->maxImageDimension3D = 2048;

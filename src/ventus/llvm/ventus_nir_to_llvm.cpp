@@ -1444,7 +1444,7 @@ private:
          builder.CreateSub(truncated, ConstantInt::get(i32, 1)), truncated);
    }
 
-   Value *reduceTextureCoord(Value *coord, Value *mode)
+   Value *reduceTextureCoord(Value *coord, Value *mode, bool offset = false)
    {
       Value *mirror = builder.CreateICmpEQ(mode, ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT));
       Value *period = builder.CreateSelect(mirror, ConstantFP::get(f32, 2), ConstantFP::get(f32, 1));
@@ -1462,10 +1462,10 @@ private:
       Value *small = builder.CreateAnd(builder.CreateFCmpOGT(coord, ConstantFP::get(f32, -2)),
                                       builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 2)));
       reduced = builder.CreateSelect(small, coord, reduced);
-      Value *clamped = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, 0)), ConstantFP::get(f32, 0), coord);
-      clamped = builder.CreateSelect(builder.CreateFCmpOGT(clamped, ConstantFP::get(f32, 1)), ConstantFP::get(f32, 1), clamped);
-      Value *bounded = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, -1)), ConstantFP::get(f32, -1), coord);
-      bounded = builder.CreateSelect(builder.CreateFCmpOGT(bounded, ConstantFP::get(f32, 2)), ConstantFP::get(f32, 2), bounded);
+      Value *clamped = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, offset ? -9 : 0)), ConstantFP::get(f32, offset ? -9 : 0), coord);
+      clamped = builder.CreateSelect(builder.CreateFCmpOGT(clamped, ConstantFP::get(f32, offset ? 10 : 1)), ConstantFP::get(f32, offset ? 10 : 1), clamped);
+      Value *bounded = builder.CreateSelect(builder.CreateFCmpOLT(coord, ConstantFP::get(f32, offset ? -9 : -1)), ConstantFP::get(f32, offset ? -9 : -1), coord);
+      bounded = builder.CreateSelect(builder.CreateFCmpOGT(bounded, ConstantFP::get(f32, offset ? 10 : 2)), ConstantFP::get(f32, offset ? 10 : 2), bounded);
       Value *ordinary = builder.CreateSelect(builder.CreateICmpEQ(mode,
          ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)), clamped, reduced);
       return builder.CreateSelect(builder.CreateICmpEQ(mode,
@@ -1602,6 +1602,7 @@ private:
       nir_def *lod = nullptr;
       nir_def *ddx = nullptr;
       nir_def *ddy = nullptr;
+      nir_def *offset = nullptr;
       bool sources_supported = true;
       for (unsigned i = 0; i < tex->num_srcs; ++i) {
          switch (tex->src[i].src_type) {
@@ -1614,6 +1615,9 @@ private:
          case nir_tex_src_coord:
             coord = tex->src[i].src.ssa;
             break;
+         case nir_tex_src_offset:
+            offset = tex->src[i].src.ssa;
+            break;
          case nir_tex_src_ddx:
             ddx = tex->src[i].src.ssa;
             break;
@@ -1624,12 +1628,32 @@ private:
             lod = tex->src[i].src.ssa;
             break;
          default:
-            /* No projected coordinates, offsets, min-LOD or
+            /* No projected coordinates, min-LOD or
              * descriptor indices are implemented in this sampling profile. */
             sources_supported = false;
             break;
          }
       }
+
+      int32_t offset_values[2] = {0, 0};
+      if (offset) {
+         // E03 accepts the core constant [-8,7] profile. Runtime Offset and
+         // gather/projector operands remain outside this software slice.
+         if (offset->bit_size != 32 || offset->num_components != 2 ||
+             !nir_src_is_const(nir_src_for_ssa(offset))) {
+            sources_supported = false;
+         } else {
+            nir_const_value *values = nir_src_as_const_value(nir_src_for_ssa(offset));
+            for (unsigned c = 0; c < 2; ++c) {
+               offset_values[c] = values[c].i32;
+               if (offset_values[c] < VT_NIR_RT_MIN_TEXEL_OFFSET ||
+                   offset_values[c] > VT_NIR_RT_MAX_TEXEL_OFFSET)
+                  sources_supported = false;
+            }
+         }
+      }
+      Value *offset_x = ConstantInt::getSigned(i32, offset_values[0]);
+      Value *offset_y = ConstantInt::getSigned(i32, offset_values[1]);
 
       Value *texture_token = descriptorTokenForDeref(texture_deref, true);
       Value *sampler_token = descriptorTokenForDeref(sampler_deref, true);
@@ -1639,7 +1663,7 @@ private:
       if (fetch || size_query || levels_query) {
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
-         const bool supported = sources_supported && !ddx && !ddy && texture_token && !sampler_deref &&
+         const bool supported = sources_supported && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
             tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
             !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
@@ -1679,8 +1703,8 @@ private:
             });
 
          Value *coordinates = value(nir_src_for_ssa(coord));
-         Value *x = asInt32(component(coordinates, 0));
-         Value *y = asInt32(component(coordinates, 1));
+         Value *x = builder.CreateAdd(asInt32(component(coordinates, 0)), offset_x);
+         Value *y = builder.CreateAdd(asInt32(component(coordinates, 1)), offset_y);
          Value *valid = builder.CreateAnd(valid_lod, builder.CreateAnd(
             builder.CreateICmpULT(x, width), builder.CreateICmpULT(y, height)));
          x = builder.CreateSelect(valid, x, ConstantInt::get(i32, 0));
@@ -1799,8 +1823,8 @@ private:
       Value *address_mode_v = descriptorRecordI32(
          sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
       Value *coord_value = value(nir_src_for_ssa(coord));
-      Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u);
-      Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v);
+      Value *u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u, offset_values[0] != 0);
+      Value *v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v, offset_values[1] != 0);
       Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
       Value *decode_table = builder.CreateAdd(table,
          builder.CreateMul(asAddress(level_count), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
@@ -1821,8 +1845,8 @@ private:
          Value *scaled_u = builder.CreateFMul(u, builder.CreateUIToFP(width, f32));
          Value *scaled_v = builder.CreateFMul(v, builder.CreateUIToFP(height, f32));
 
-         Value *nearest_raw_x = floorToI32(scaled_u);
-         Value *nearest_raw_y = floorToI32(scaled_v);
+         Value *nearest_raw_x = builder.CreateAdd(floorToI32(scaled_u), offset_x);
+         Value *nearest_raw_y = builder.CreateAdd(floorToI32(scaled_v), offset_y);
          Value *nearest_x = wrapTexelCoord(nearest_raw_x, width,
                                            address_mode_u);
          Value *nearest_y = wrapTexelCoord(nearest_raw_y, height,
@@ -1836,6 +1860,10 @@ private:
             builder.CreateSIToFP(linear_x0, f32));
          Value *frac_v = builder.CreateFSub(linear_v,
             builder.CreateSIToFP(linear_y0, f32));
+         // Integer translation preserves interpolation fractions and tiny UV
+         // boundaries; every accessed mip uses the same texel-unit offset.
+         linear_x0 = builder.CreateAdd(linear_x0, offset_x);
+         linear_y0 = builder.CreateAdd(linear_y0, offset_y);
          Value *linear_x1 = builder.CreateAdd(linear_x0, ConstantInt::get(i32, 1));
          Value *linear_y1 = builder.CreateAdd(linear_y0, ConstantInt::get(i32, 1));
          Value *x0 = wrapTexelCoord(linear_x0, width, address_mode_u);

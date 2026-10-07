@@ -702,6 +702,8 @@ enum vt_nir_rt_descriptor_record {
 
 /* Finite sampler-bias profile, shared by Vulkan validation and limits. */
 #define VT_NIR_RT_MAX_SAMPLER_LOD_BIAS 16.0f
+#define VT_NIR_RT_MIN_TEXEL_OFFSET (-8)
+#define VT_NIR_RT_MAX_TEXEL_OFFSET 7
 
 /* Private software sampler word at offset76, not a frozen TMU interface. */
 enum vt_nir_rt_sampler_word {
