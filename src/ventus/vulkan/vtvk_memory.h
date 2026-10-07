@@ -23,6 +23,15 @@ vtvk_srgb_usage_supported(VkImageUsageFlags usage)
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT));
 }
 
+static inline bool
+vtvk_components_identity(VkComponentMapping mapping)
+{
+   return (mapping.r == VK_COMPONENT_SWIZZLE_IDENTITY || mapping.r == VK_COMPONENT_SWIZZLE_R) &&
+          (mapping.g == VK_COMPONENT_SWIZZLE_IDENTITY || mapping.g == VK_COMPONENT_SWIZZLE_G) &&
+          (mapping.b == VK_COMPONENT_SWIZZLE_IDENTITY || mapping.b == VK_COMPONENT_SWIZZLE_B) &&
+          (mapping.a == VK_COMPONENT_SWIZZLE_IDENTITY || mapping.a == VK_COMPONENT_SWIZZLE_A);
+}
+
 struct vtvk_memory {
    struct vtvk_device *device;
    VkDeviceSize size;
@@ -66,6 +75,7 @@ struct vtvk_image_view {
    VkImage image;
    VkFormat format;
    uint32_t base_mip, level_count;
+   VkComponentMapping components;
 };
 
 #endif

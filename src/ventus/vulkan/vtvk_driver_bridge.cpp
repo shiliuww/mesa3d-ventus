@@ -53,6 +53,7 @@ static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPT
 static_assert(offsetof(vtvk_rt_descriptor_record, max_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD);
 static_assert(offsetof(vtvk_rt_descriptor_record, sampler_mipmap_mode) == VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
 static_assert(offsetof(vtvk_rt_mip_record, row_pitch) == VT_NIR_RT_MIP_RECORD_ROW_PITCH);
+static_assert(offsetof(vtvk_rt_mip_record, component_mapping) == VT_NIR_RT_MIP_RECORD_COMPONENT_MAPPING);
 static_assert(offsetof(struct vtvk_rt_dispatch_args, abi_tag) ==
               VT_NIR_RT_DISPATCH_ARG_ABI_TAG,
               "legacy RT ABI tag dispatch argument mismatch");
@@ -1200,6 +1201,7 @@ vtvk_driver_upload_descriptor(
          return false;
       if (src->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
           (view->base_mip != 0 || view->level_count != 1 ||
+           !vtvk_components_identity(view->components) ||
            view->format == VK_FORMAT_R8G8B8A8_SRGB ||
            view->format == VK_FORMAT_B8G8R8A8_SRGB)) {
          mesa_loge("ventus-vk: storage image requires a supported single mip-0 view");
@@ -1228,10 +1230,14 @@ vtvk_driver_upload_descriptor(
             return false;
          }
          std::vector<vtvk_rt_mip_record> levels(view->level_count);
+         const uint32_t mapping = (uint32_t)view->components.r |
+            ((uint32_t)view->components.g << 4) |
+            ((uint32_t)view->components.b << 8) |
+            ((uint32_t)view->components.a << 12);
          for (uint32_t level = 0; level < view->level_count; ++level) {
             const auto &mip = image->levels[view->base_mip + level];
             levels[level] = {image->device_address + mip.offset, mip.width,
-                             mip.height, mip.row_pitch, 0};
+                             mip.height, mip.row_pitch, mapping};
          }
          /* Dispatch metadata: unchanged mip records followed by the 256-entry
           * float decoder. Even UNORM views get a valid table so speculative

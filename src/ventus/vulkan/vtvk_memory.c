@@ -407,10 +407,11 @@ vtvk_CreateImageView(VkDevice _device,
        range->baseMipLevel >= image->mip_levels || !count ||
        count > image->mip_levels - range->baseMipLevel ||
        (color && range->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) ||
-       (pCreateInfo->components.r != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.r != VK_COMPONENT_SWIZZLE_R) ||
-       (pCreateInfo->components.g != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.g != VK_COMPONENT_SWIZZLE_G) ||
-       (pCreateInfo->components.b != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.b != VK_COMPONENT_SWIZZLE_B) ||
-       (pCreateInfo->components.a != VK_COMPONENT_SWIZZLE_IDENTITY && pCreateInfo->components.a != VK_COMPONENT_SWIZZLE_A))
+       (unsigned)pCreateInfo->components.r > VK_COMPONENT_SWIZZLE_A ||
+       (unsigned)pCreateInfo->components.g > VK_COMPONENT_SWIZZLE_A ||
+       (unsigned)pCreateInfo->components.b > VK_COMPONENT_SWIZZLE_A ||
+       (unsigned)pCreateInfo->components.a > VK_COMPONENT_SWIZZLE_A ||
+       (!color && !vtvk_components_identity(pCreateInfo->components)))
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    struct vtvk_image_view *view =
       vk_zalloc(alloc, sizeof(*view), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -421,6 +422,7 @@ vtvk_CreateImageView(VkDevice _device,
    view->format = pCreateInfo->format;
    view->base_mip = range->baseMipLevel;
    view->level_count = count;
+   view->components = pCreateInfo->components;
    *pView = (VkImageView)vtvk_ptr_to_handle(view);
    return VK_SUCCESS;
 }

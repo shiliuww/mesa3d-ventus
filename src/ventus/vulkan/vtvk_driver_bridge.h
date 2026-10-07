@@ -85,7 +85,7 @@ struct vtvk_rt_descriptor_record {
 /* Dispatch-owned metadata indexed relative to the bound view. */
 struct vtvk_rt_mip_record {
    uint64_t device_addr;
-   uint32_t width, height, row_pitch, reserved;
+   uint32_t width, height, row_pitch, component_mapping;
 };
 
 struct vtvk_rt_descriptor_source {

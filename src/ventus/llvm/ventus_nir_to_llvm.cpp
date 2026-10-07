@@ -1500,6 +1500,27 @@ private:
       return builder.CreateSelect(is_srgb, linear, unorm);
    }
 
+   Value *swizzleTextureResult(Value *binding, Value *color)
+   {
+      Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+      Value *mapping = loadI32At(builder.CreateAdd(table,
+         ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_COMPONENT_MAPPING)));
+      return buildVector(4, i32, [&](unsigned c) {
+         Value *selector = builder.CreateAnd(builder.CreateLShr(mapping,
+            ConstantInt::get(i32, c * 4)), ConstantInt::get(i32, 15));
+         Value *result = asInt32(component(color, c));
+         for (unsigned source = 0; source < 4; ++source)
+            result = builder.CreateSelect(builder.CreateICmpEQ(selector,
+               ConstantInt::get(i32, VK_COMPONENT_SWIZZLE_R + source)),
+               asInt32(component(color, source)), result);
+         result = builder.CreateSelect(builder.CreateICmpEQ(selector,
+            ConstantInt::get(i32, VK_COMPONENT_SWIZZLE_ZERO)), ConstantInt::get(i32, 0), result);
+         return builder.CreateSelect(builder.CreateICmpEQ(selector,
+            ConstantInt::get(i32, VK_COMPONENT_SWIZZLE_ONE)),
+            ConstantInt::get(i32, 0x3f800000), result);
+      });
+   }
+
    Value *lowerTex(nir_tex_instr *tex)
    {
       nir_deref_instr *texture_deref = nullptr;
@@ -1601,9 +1622,13 @@ private:
          Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
          Value *decode_table = builder.CreateAdd(table, builder.CreateMul(asAddress(count),
             ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
-         return floatResult(&tex->def, [&](unsigned c) {
+         Value *color = floatResult(&tex->def, [&](unsigned c) {
             Value *color = sampleTexelRGBA8Channel(base, stride, x, y, format, decode_table, c);
-            return builder.CreateSelect(valid, color, ConstantFP::get(f32, 0));
+            return color;
+         });
+         color = swizzleTextureResult(binding, color);
+         return floatResult(&tex->def, [&](unsigned c) {
+            return builder.CreateSelect(valid, asFloat(component(color, c)), ConstantFP::get(f32, 0));
          });
       }
       const bool base_lod = (tex->op == nir_texop_txl && lod &&
@@ -1754,12 +1779,15 @@ private:
       };
       Value *first = sample_level(first_index);
       Value *second = sample_level(second_index);
-      return floatResult(&tex->def, [&](unsigned channel) {
+      Value *filtered = floatResult(&tex->def, [&](unsigned channel) {
          Value *a = asFloat(component(first, channel));
          Value *b = asFloat(component(second, channel));
          Value *mixed = builder.CreateFAdd(a, builder.CreateFMul(fraction, builder.CreateFSub(b, a)));
          return builder.CreateSelect(mip_linear, mixed, a);
       });
+      /* Permutation/repetition and float 0/1 commute with these normalized
+       * nearest/linear filters. Decode always precedes component mapping. */
+      return swizzleTextureResult(binding, filtered);
    }
 
    Value *lowerLoadConst(nir_load_const_instr *instr)
