@@ -1565,12 +1565,43 @@ private:
       });
    }
 
+   Value *gradientLodF32(Value *squared)
+   {
+      // Bias is limited to +/-16 and the largest 2D view has 15 levels.
+      // Saturating base lambda to [-16,30] gives identical observable mip
+      // and min/mag selection for zero/tiny/overflowing finite gradients.
+      squared = builder.CreateSelect(builder.CreateFCmpOLT(squared,
+         ConstantFP::get(f32, 0x1p-32)), ConstantFP::get(f32, 0x1p-32), squared);
+      squared = builder.CreateSelect(builder.CreateFCmpOGT(squared,
+         ConstantFP::get(f32, 0x1p60)), ConstantFP::get(f32, 0x1p60), squared);
+      Value *bits = asInt32(squared);
+      Value *exponent = builder.CreateSub(builder.CreateLShr(bits,
+         ConstantInt::get(i32, 23)), ConstantInt::get(i32, 127));
+      Value *mantissa = asFloat(builder.CreateOr(builder.CreateAnd(bits,
+         ConstantInt::get(i32, 0x7fffff)), ConstantInt::get(i32, 0x3f800000)));
+      // ln(m)=2*(z+z^3/3+...+z^13/13), z=(m-1)/(m+1), |z|<=1/3.
+      // Analytic log2 truncation error is <1.6e-8; binary32 rounding is
+      // covered separately by the gradient-only numeric acceptance bound.
+      Value *z = builder.CreateFDiv(builder.CreateFSub(mantissa, ConstantFP::get(f32, 1)),
+                                    builder.CreateFAdd(mantissa, ConstantFP::get(f32, 1)));
+      Value *z2 = builder.CreateFMul(z, z);
+      Value *poly = ConstantFP::get(f32, 1.0/13);
+      for (int divisor=11; divisor>=1; divisor-=2)
+         poly = builder.CreateFAdd(ConstantFP::get(f32, 1.0/divisor), builder.CreateFMul(z2, poly));
+      Value *fraction = builder.CreateFMul(builder.CreateFMul(z, poly),
+                                           ConstantFP::get(f32, 2.8853900817779268));
+      return builder.CreateFMul(builder.CreateFAdd(builder.CreateSIToFP(exponent, f32), fraction),
+                                ConstantFP::get(f32, 0.5));
+   }
+
    Value *lowerTex(nir_tex_instr *tex)
    {
       nir_deref_instr *texture_deref = nullptr;
       nir_deref_instr *sampler_deref = nullptr;
       nir_def *coord = nullptr;
       nir_def *lod = nullptr;
+      nir_def *ddx = nullptr;
+      nir_def *ddy = nullptr;
       bool sources_supported = true;
       for (unsigned i = 0; i < tex->num_srcs; ++i) {
          switch (tex->src[i].src_type) {
@@ -1583,11 +1614,17 @@ private:
          case nir_tex_src_coord:
             coord = tex->src[i].src.ssa;
             break;
+         case nir_tex_src_ddx:
+            ddx = tex->src[i].src.ssa;
+            break;
+         case nir_tex_src_ddy:
+            ddy = tex->src[i].src.ssa;
+            break;
          case nir_tex_src_lod:
             lod = tex->src[i].src.ssa;
             break;
          default:
-            /* No projected coordinates, offsets, gradients, min-LOD or
+            /* No projected coordinates, offsets, min-LOD or
              * descriptor indices are implemented in this sampling profile. */
             sources_supported = false;
             break;
@@ -1602,7 +1639,7 @@ private:
       if (fetch || size_query || levels_query) {
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
-         const bool supported = sources_supported && texture_token && !sampler_deref &&
+         const bool supported = sources_supported && !ddx && !ddy && texture_token && !sampler_deref &&
             tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
             !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
@@ -1667,9 +1704,12 @@ private:
             return builder.CreateSelect(valid, asFloat(component(color, c)), ConstantFP::get(f32, 0));
          });
       }
-      const bool base_lod = (tex->op == nir_texop_txl && lod &&
-                             lod->bit_size == 32 && lod->num_components == 1) ||
-         (tex->op == nir_texop_tex && !lod);
+      const bool gradients = tex->op == nir_texop_txd && !lod && ddx && ddy &&
+         ddx->bit_size == 32 && ddy->bit_size == 32 &&
+         ddx->num_components == 2 && ddy->num_components == 2;
+      const bool base_lod = gradients || (!ddx && !ddy &&
+         ((tex->op == nir_texop_txl && lod && lod->bit_size == 32 && lod->num_components == 1) ||
+          (tex->op == nir_texop_tex && !lod)));
       const bool supported = base_lod && sources_supported &&
          tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
          tex->coord_components == 2 && !tex->is_array && !tex->is_shadow &&
@@ -1697,6 +1737,22 @@ private:
       Value *min_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
       Value *max_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
       Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
+      if (gradients) {
+         // Derivatives scale by view base dimensions, before selecting a mip.
+         Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+         Value *width = builder.CreateUIToFP(loadI32At(builder.CreateAdd(table,
+            ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_WIDTH))), f32);
+         Value *height = builder.CreateUIToFP(loadI32At(builder.CreateAdd(table,
+            ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_HEIGHT))), f32);
+         auto footprint = [&](nir_def *derivative) {
+            Value *v = value(nir_src_for_ssa(derivative));
+            Value *x = builder.CreateFMul(asFloat(component(v, 0)), width);
+            Value *y = builder.CreateFMul(asFloat(component(v, 1)), height);
+            return builder.CreateFAdd(builder.CreateFMul(x, x), builder.CreateFMul(y, y));
+         };
+         Value *x2 = footprint(ddx), *y2 = footprint(ddy);
+         level = gradientLodF32(builder.CreateSelect(builder.CreateFCmpOGT(x2, y2), x2, y2));
+      }
       /* Vulkan sampler bias also applies to explicit Lod. Integer fetch and
        * queries return above and never read this sampling state. */
       Value *bias = asFloat(descriptorRecordI32(
