@@ -1533,6 +1533,79 @@ private:
          nir_deref_instr_get_variable(texture_deref) : nullptr;
       nir_variable *sampler_var = sampler_deref ?
          nir_deref_instr_get_variable(sampler_deref) : nullptr;
+      const bool fetch = tex->op == nir_texop_txf;
+      const bool size_query = tex->op == nir_texop_txs;
+      const bool levels_query = tex->op == nir_texop_query_levels;
+      if (fetch || size_query || levels_query) {
+         const bool integer_result = tex->dest_type == nir_type_int32 ||
+                                     tex->dest_type == nir_type_uint32;
+         const bool supported = sources_supported && texture_var &&
+            texture_deref->deref_type == nir_deref_type_var &&
+            !glsl_type_is_array(texture_var->type) && !sampler_deref &&
+            vt_rt_descriptor_location_valid(texture_var->data.descriptor_set,
+                                             texture_var->data.binding) &&
+            tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+            !tex->is_shadow && !tex->is_sparse && !tex->texture_non_uniform &&
+            !tex->sampler_non_uniform && tex->def.bit_size == 32 &&
+            (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
+             (lod && lod->bit_size == 32 && lod->num_components == 1 &&
+              (size_query ? (!coord && integer_result && tex->def.num_components == 2) :
+               (coord && coord->bit_size == 32 && coord->num_components == 2 &&
+                tex->coord_components == 2 && tex->dest_type == nir_type_float32 &&
+                tex->def.num_components == 4))));
+         if (!supported) {
+            unsupportedDefs.insert(&tex->def);
+            translationFailed = true;
+            return undefFor(&tex->def, true);
+         }
+         Value *binding = ConstantInt::get(i32, vt_rt_descriptor_table_slot(
+            texture_var->data.descriptor_set, texture_var->data.binding));
+         Value *count = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+         if (levels_query)
+            return count;
+
+         /* Integer LOD is view-relative. No sampler state participates.
+          * Undefined out-of-range inputs are contained before any loads;
+          * zero output here is not a robustness feature declaration. */
+         Value *index = asInt32(value(nir_src_for_ssa(lod)));
+         Value *valid_lod = builder.CreateICmpULT(index, count);
+         Value *safe_index = builder.CreateSelect(valid_lod, index, ConstantInt::get(i32, 0));
+         Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
+         Value *entry = builder.CreateAdd(table, builder.CreateMul(asAddress(safe_index),
+            ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
+         auto field = [&](unsigned offset) {
+            return loadI32At(builder.CreateAdd(entry, ConstantInt::get(entry->getType(), offset)));
+         };
+         Value *width = field(VT_NIR_RT_MIP_RECORD_WIDTH);
+         Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
+         if (size_query)
+            return intResult(&tex->def, [&](unsigned c) {
+               return builder.CreateSelect(valid_lod, c == 0 ? width : height,
+                                           ConstantInt::get(i32, 0));
+            });
+
+         Value *coordinates = value(nir_src_for_ssa(coord));
+         Value *x = asInt32(component(coordinates, 0));
+         Value *y = asInt32(component(coordinates, 1));
+         Value *valid = builder.CreateAnd(valid_lod, builder.CreateAnd(
+            builder.CreateICmpULT(x, width), builder.CreateICmpULT(y, height)));
+         x = builder.CreateSelect(valid, x, ConstantInt::get(i32, 0));
+         y = builder.CreateSelect(valid, y, ConstantInt::get(i32, 0));
+         Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
+         if (addressBits() == 64) {
+            LoadInst *address = builder.CreateLoad(i64, globalPtr(entry));
+            address->setAlignment(Align(8));
+            base = address;
+         }
+         Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
+         Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
+         Value *decode_table = builder.CreateAdd(table, builder.CreateMul(asAddress(count),
+            ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
+         return floatResult(&tex->def, [&](unsigned c) {
+            Value *color = sampleTexelRGBA8Channel(base, stride, x, y, format, decode_table, c);
+            return builder.CreateSelect(valid, color, ConstantFP::get(f32, 0));
+         });
+      }
       const bool base_lod = (tex->op == nir_texop_txl && lod &&
                              lod->bit_size == 32 && lod->num_components == 1) ||
          (tex->op == nir_texop_tex && !lod);
