@@ -90,12 +90,15 @@ struct vtvk_rt_descriptor_record {
    uint32_t reserved;
    uint32_t layer_count;
    uint32_t reserved_layer;
+   uint32_t sampler_address_mode_w;
+   uint32_t reserved_volume;
 };
 
 /* Dispatch-owned metadata indexed relative to the bound view. */
 struct vtvk_rt_mip_record {
    uint64_t device_addr;
    uint32_t width, height, row_pitch, component_mapping;
+   uint32_t depth, slice_pitch;
 };
 
 struct vtvk_rt_descriptor_source {

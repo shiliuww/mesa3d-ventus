@@ -49,6 +49,9 @@ static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
 static_assert(sizeof(vtvk_rt_mip_record) == VT_NIR_RT_MIP_RECORD_SIZE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+static_assert(offsetof(vtvk_rt_descriptor_record, sampler_address_mode_w) == VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_W);
+static_assert(offsetof(vtvk_rt_mip_record, depth) == VT_NIR_RT_MIP_RECORD_DEPTH);
+static_assert(offsetof(vtvk_rt_mip_record, slice_pitch) == VT_NIR_RT_MIP_RECORD_SLICE_PITCH);
 static_assert(offsetof(vtvk_rt_descriptor_record, layer_count) == VT_NIR_RT_DESCRIPTOR_RECORD_LAYER_COUNT);
 static_assert(offsetof(vtvk_rt_descriptor_record, lod_bias) == VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS);
 static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD);
@@ -1175,6 +1178,7 @@ vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
        !vtvk_driver_sampler_filter_supported(sampler->min_filter) ||
        !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_u) ||
        !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_v) ||
+       !vtvk_driver_sampler_address_mode_supported(sampler->address_mode_w) ||
        sampler->compare_enable || sampler->unnormalized_coordinates ||
        (sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_NEAREST &&
         sampler->mipmap_mode != VK_SAMPLER_MIPMAP_MODE_LINEAR)) {
@@ -1190,6 +1194,7 @@ vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
    record->sampler_min_filter = sampler->min_filter;
    record->sampler_address_mode_u = sampler->address_mode_u;
    record->sampler_address_mode_v = sampler->address_mode_v;
+   record->sampler_address_mode_w = sampler->address_mode_w;
    return true;
 }
 
@@ -1271,9 +1276,9 @@ vtvk_driver_upload_descriptor(
                const auto &mip = image->levels[view->base_mip + level];
                levels[layer * view->level_count + level] = {
                   image->device_address + mip.offset + (view->base_layer + layer) * mip.size,
-                  mip.width, mip.height, mip.row_pitch, mapping};
+                  mip.width, mip.height, mip.row_pitch, mapping, mip.depth, mip.slice_pitch};
             }
-         /* Dispatch metadata: unchanged mip records followed by the 256-entry
+         /* Dispatch metadata: view-relative records followed by the 256-entry
           * float decoder. Even UNORM views get a valid table so speculative
           * reads remain bounded; their results still use the original UNORM
           * arithmetic. Texture bytes and per-level pitches stay unchanged. */

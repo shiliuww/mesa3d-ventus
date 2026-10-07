@@ -44,7 +44,7 @@ vtvk_CreateSampler(VkDevice _device,
                    VkSampler *pSampler)
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
-   /* Normalized 2D nearest/bilinear with independent min/mag and mip filters;
+   /* Normalized color textures with independent min/mag and mip filters;
     * finite sampler bias; no comparison or anisotropy. */
    if (pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->magFilter != VK_FILTER_NEAREST &&
@@ -67,8 +67,13 @@ vtvk_CreateSampler(VkDevice _device,
         pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
         pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
         pCreateInfo->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) ||
+       (pCreateInfo->addressModeW != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+        pCreateInfo->addressModeW != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
+        pCreateInfo->addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
+        pCreateInfo->addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) ||
        ((pCreateInfo->addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
-         pCreateInfo->addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) &&
+         pCreateInfo->addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+         pCreateInfo->addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) &&
         pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK &&
         pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK &&
         pCreateInfo->borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE))
@@ -83,6 +88,7 @@ vtvk_CreateSampler(VkDevice _device,
    sampler->min_filter = pCreateInfo->minFilter;
    sampler->address_mode_u = pCreateInfo->addressModeU;
    sampler->address_mode_v = pCreateInfo->addressModeV;
+   sampler->address_mode_w = pCreateInfo->addressModeW;
    sampler->compare_enable = pCreateInfo->compareEnable;
    sampler->unnormalized_coordinates = pCreateInfo->unnormalizedCoordinates;
    sampler->lod_bias = pCreateInfo->mipLodBias;
@@ -632,7 +638,8 @@ vtvk_execute_copy_buffer_image(struct vtvk_cmd_buffer *cmd,
           region->imageSubresource.baseArrayLayer >= dst->array_layers ||
           region->imageSubresource.layerCount > dst->array_layers - region->imageSubresource.baseArrayLayer ||
           region->imageOffset.x < 0 || region->imageOffset.y < 0 ||
-          region->imageOffset.z != 0 || region->imageExtent.depth != 1)
+          region->imageOffset.z < 0 || !region->imageExtent.depth ||
+          (dst->type != VK_IMAGE_TYPE_3D && (region->imageOffset.z != 0 || region->imageExtent.depth != 1)))
          return VK_ERROR_FEATURE_NOT_PRESENT;
       const struct vtvk_image_level *mip = &dst->levels[region->imageSubresource.mipLevel];
       const uint32_t width = region->imageExtent.width, height = region->imageExtent.height;
@@ -642,11 +649,13 @@ vtvk_execute_copy_buffer_image(struct vtvk_cmd_buffer *cmd,
       if (!width || !height || row < width || rows < height ||
           x > mip->width || width > mip->width - x ||
           y > mip->height || height > mip->height - y ||
+          (uint32_t)region->imageOffset.z > mip->depth ||
+          region->imageExtent.depth > mip->depth - (uint32_t)region->imageOffset.z ||
           region->bufferOffset % bpp)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       const VkDeviceSize row_stride = (VkDeviceSize)row * bpp;
       VkDeviceSize bytes = (VkDeviceSize)(height - 1) * row_stride + (VkDeviceSize)width * bpp;
-      const uint32_t layers = region->imageSubresource.layerCount;
+      const uint32_t layers = dst->type == VK_IMAGE_TYPE_3D ? region->imageExtent.depth : region->imageSubresource.layerCount;
       if (layers > 1) {
          if (rows > UINT64_MAX / row_stride)
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -663,7 +672,7 @@ vtvk_execute_copy_buffer_image(struct vtvk_cmd_buffer *cmd,
       const struct vtvk_image_level *mip = &dst->levels[region->imageSubresource.mipLevel];
       const uint32_t row = region->bufferRowLength ? region->bufferRowLength : region->imageExtent.width;
       const VkDeviceSize bytes = (VkDeviceSize)region->imageExtent.width * bpp;
-      const uint32_t layers = region->imageSubresource.layerCount;
+      const uint32_t layers = dst->type == VK_IMAGE_TYPE_3D ? region->imageExtent.depth : region->imageSubresource.layerCount;
       const uint32_t rows = region->bufferImageHeight ? region->bufferImageHeight : region->imageExtent.height;
       const VkDeviceSize source_layer_pitch = layers > 1 ? (VkDeviceSize)rows * row * bpp : 0;
       for (uint32_t layer = 0; layer < layers; ++layer)
@@ -671,7 +680,9 @@ vtvk_execute_copy_buffer_image(struct vtvk_cmd_buffer *cmd,
             const VkDeviceSize source_offset = region->bufferOffset +
                layer * source_layer_pitch + (VkDeviceSize)y * row * bpp;
             const VkDeviceSize destination_offset = mip->offset +
-               (VkDeviceSize)(region->imageSubresource.baseArrayLayer + layer) * mip->size +
+               (dst->type == VK_IMAGE_TYPE_3D ?
+                (VkDeviceSize)(region->imageOffset.z + layer) * mip->slice_pitch :
+                (VkDeviceSize)(region->imageSubresource.baseArrayLayer + layer) * mip->size) +
                (VkDeviceSize)(region->imageOffset.y + y) * mip->row_pitch +
                (VkDeviceSize)region->imageOffset.x * bpp;
             memcpy((uint8_t *)dst->map + destination_offset,

@@ -1662,8 +1662,9 @@ private:
       Value *texture_token = descriptorTokenForDeref(texture_deref, true);
       Value *sampler_token = descriptorTokenForDeref(sampler_deref, true);
       const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array;
-      const bool texture_dimension = tex->sampler_dim == GLSL_SAMPLER_DIM_2D || cube;
-      const unsigned coordinate_count = cube || tex->is_array ? 3 : 2;
+      const bool volume = tex->sampler_dim == GLSL_SAMPLER_DIM_3D && !tex->is_array;
+      const bool texture_dimension = tex->sampler_dim == GLSL_SAMPLER_DIM_2D || cube || volume;
+      const unsigned coordinate_count = cube || volume || tex->is_array ? 3 : 2;
       const unsigned query_components = cube ? 2 : coordinate_count;
       const bool fetch = tex->op == nir_texop_txf;
       const bool size_query = tex->op == nir_texop_txs;
@@ -1671,7 +1672,7 @@ private:
       if (fetch || size_query || levels_query) {
          const bool integer_result = tex->dest_type == nir_type_int32 ||
                                      tex->dest_type == nir_type_uint32;
-         const bool supported = sources_supported && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
+         const bool supported = sources_supported && (!volume || !offset) && (!offset || fetch) && !ddx && !ddy && texture_token && !sampler_deref &&
             texture_dimension && (!cube || !fetch) &&
             !tex->is_shadow && !tex->is_sparse && tex->def.bit_size == 32 &&
             (levels_query ? (!coord && !lod && integer_result && tex->def.num_components == 1) :
@@ -1711,7 +1712,7 @@ private:
          Value *height = field(VT_NIR_RT_MIP_RECORD_HEIGHT);
          if (size_query)
             return intResult(&tex->def, [&](unsigned c) {
-               return builder.CreateSelect(valid_lod, c == 0 ? width : c == 1 ? height : layer_count,
+               return builder.CreateSelect(valid_lod, c == 0 ? width : c == 1 ? height : volume ? field(VT_NIR_RT_MIP_RECORD_DEPTH) : layer_count,
                                            ConstantInt::get(i32, 0));
             });
 
@@ -1720,6 +1721,9 @@ private:
          Value *y = builder.CreateAdd(asInt32(component(coordinates, 1)), offset_y);
          Value *valid = builder.CreateAnd(builder.CreateAnd(valid_lod, valid_layer), builder.CreateAnd(
             builder.CreateICmpULT(x, width), builder.CreateICmpULT(y, height)));
+         Value *z = volume ? asInt32(component(coordinates, 2)) : ConstantInt::get(i32, 0);
+         if (volume) valid = builder.CreateAnd(valid, builder.CreateICmpULT(z, field(VT_NIR_RT_MIP_RECORD_DEPTH)));
+         z = builder.CreateSelect(valid, z, ConstantInt::get(i32, 0));
          x = builder.CreateSelect(valid, x, ConstantInt::get(i32, 0));
          y = builder.CreateSelect(valid, y, ConstantInt::get(i32, 0));
          Value *base = field(VT_NIR_RT_MIP_RECORD_DEVICE_ADDR);
@@ -1728,6 +1732,7 @@ private:
             address->setAlignment(Align(8));
             base = address;
          }
+         if (volume) base = builder.CreateAdd(asAddress(base), asAddress(builder.CreateMul(z, field(VT_NIR_RT_MIP_RECORD_SLICE_PITCH))));
          Value *stride = field(VT_NIR_RT_MIP_RECORD_ROW_PITCH);
          Value *format = descriptorRecordI32(binding, VT_NIR_RT_DESCRIPTOR_RECORD_FORMAT);
          Value *decode_table = builder.CreateAdd(table, builder.CreateMul(asAddress(builder.CreateMul(count, layer_count)),
@@ -1741,13 +1746,13 @@ private:
             return builder.CreateSelect(valid, asFloat(component(color, c)), ConstantFP::get(f32, 0));
          });
       }
-      const bool gradients = !cube && tex->op == nir_texop_txd && !lod && ddx && ddy &&
+      const bool gradients = !cube && !volume && tex->op == nir_texop_txd && !lod && ddx && ddy &&
          ddx->bit_size == 32 && ddy->bit_size == 32 &&
          ddx->num_components == 2 && ddy->num_components == 2;
       const bool base_lod = gradients || (!ddx && !ddy &&
          ((tex->op == nir_texop_txl && lod && lod->bit_size == 32 && lod->num_components == 1) ||
           (tex->op == nir_texop_tex && !lod)));
-      const bool supported = base_lod && sources_supported && (!cube || !offset) &&
+      const bool supported = base_lod && sources_supported && (!(cube || volume) || !offset) &&
          texture_dimension &&
          tex->coord_components == coordinate_count && !tex->is_shadow &&
          !tex->is_sparse &&
@@ -1835,6 +1840,8 @@ private:
          sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_U);
       Value *address_mode_v = descriptorRecordI32(
          sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_V);
+      Value *address_mode_w = volume ? descriptorRecordI32(sampler_binding,
+         VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_ADDRESS_MODE_W) : nullptr;
       Value *coord_value = value(nir_src_for_ssa(coord));
       Value *layer_index = ConstantInt::get(i32, 0);
       if (tex->is_array) {
@@ -1883,6 +1890,7 @@ private:
          u = reduceTextureCoord(asFloat(component(coord_value, 0)), address_mode_u, offset_values[0] != 0);
          v = reduceTextureCoord(asFloat(component(coord_value, 1)), address_mode_v, offset_values[1] != 0);
       }
+      Value *w = volume ? reduceTextureCoord(asFloat(component(coord_value, 2)), address_mode_w) : nullptr;
       Value *table = descriptorRecordAddress(binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
       Value *decode_table = builder.CreateAdd(table,
          builder.CreateMul(asAddress(builder.CreateMul(level_count, layer_count)), ConstantInt::get(table->getType(), VT_NIR_RT_MIP_RECORD_SIZE)));
@@ -1944,6 +1952,41 @@ private:
          Value *border10 = outside(linear_x1, linear_y0);
          Value *border01 = outside(linear_x0, linear_y1);
          Value *border11 = outside(linear_x1, linear_y1);
+         if (volume) {
+            Value *depth = field(VT_NIR_RT_MIP_RECORD_DEPTH);
+            Value *slice_pitch = field(VT_NIR_RT_MIP_RECORD_SLICE_PITCH);
+            Value *scaled_w = builder.CreateFMul(w, builder.CreateUIToFP(depth, f32));
+            Value *nearest_z = floorToI32(scaled_w);
+            Value *linear_w = builder.CreateFSub(scaled_w, ConstantFP::get(f32, 0.5));
+            Value *z0 = floorToI32(linear_w);
+            Value *z1 = builder.CreateAdd(z0, ConstantInt::get(i32, 1));
+            Value *frac_w = builder.CreateFSub(linear_w, builder.CreateSIToFP(z0, f32));
+            return floatResult(&tex->def, [&](unsigned channel) {
+               Value *replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+                  ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)), ConstantFP::get(f32, 1), ConstantFP::get(f32, 0));
+               if (channel == 3) replacement = builder.CreateSelect(builder.CreateICmpEQ(border,
+                  ConstantInt::get(i32, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)), ConstantFP::get(f32, 1), replacement);
+               auto tap = [&](Value *x, Value *y, Value *z) {
+                  Value *outside_z = builder.CreateAnd(builder.CreateICmpEQ(address_mode_w,
+                     ConstantInt::get(i32, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)), builder.CreateICmpUGE(z, depth));
+                  Value *zi = wrapTexelCoord(z, depth, address_mode_w);
+                  Value *slice = builder.CreateAdd(asAddress(base), asAddress(builder.CreateMul(zi, slice_pitch)));
+                  Value *loaded = sampleTexelRGBA8Channel(slice, stride,
+                     wrapTexelCoord(x, width, address_mode_u), wrapTexelCoord(y, height, address_mode_v), format, decode_table, channel);
+                  return builder.CreateSelect(builder.CreateOr(outside(x,y), outside_z), replacement, loaded);
+               };
+               auto plane = [&](Value *z) {
+                  Value *a = tap(linear_x0,linear_y0,z), *b = tap(linear_x1,linear_y0,z);
+                  Value *c = tap(linear_x0,linear_y1,z), *d = tap(linear_x1,linear_y1,z);
+                  Value *top = builder.CreateFAdd(a,builder.CreateFMul(frac_u,builder.CreateFSub(b,a)));
+                  Value *bottom = builder.CreateFAdd(c,builder.CreateFMul(frac_u,builder.CreateFSub(d,c)));
+                  return builder.CreateFAdd(top,builder.CreateFMul(frac_v,builder.CreateFSub(bottom,top)));
+               };
+               Value *lower = plane(z0), *upper = plane(z1);
+               Value *linear = builder.CreateFAdd(lower,builder.CreateFMul(frac_w,builder.CreateFSub(upper,lower)));
+               return builder.CreateSelect(is_linear, linear, tap(nearest_raw_x,nearest_raw_y,nearest_z));
+            });
+         }
          // Each edge entry is {neighbor face, x mode, y mode}; modes are
          // 0, last, varying coordinate, or last-varying. No projected rounding.
          static const unsigned cube_edges[6][4][3] = {

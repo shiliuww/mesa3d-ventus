@@ -409,7 +409,11 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
-   if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D ||
+   const bool volume = pImageFormatInfo->type == VK_IMAGE_TYPE_3D;
+   if ((pImageFormatInfo->type != VK_IMAGE_TYPE_2D && !volume) ||
+       (volume && (pImageFormatInfo->flags ||
+        !vtvk_format_is_texture_color(pImageFormatInfo->format) ||
+        !vtvk_array_usage_supported(pImageFormatInfo->usage))) ||
        (pImageFormatInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
        ((pImageFormatInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
         (!vtvk_format_is_texture_color(pImageFormatInfo->format) ||
@@ -428,9 +432,9 @@ vtvk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
-      .maxExtent = {16384, 16384, 1},
-      .maxMipLevels = vtvk_format_is_texture_color(pImageFormatInfo->format) ? 15 : 1,
-      .maxArrayLayers = vtvk_format_is_texture_color(pImageFormatInfo->format) &&
+      .maxExtent = {volume ? 2048 : 16384, volume ? 2048 : 16384, volume ? 2048 : 1},
+      .maxMipLevels = volume ? 12 : vtvk_format_is_texture_color(pImageFormatInfo->format) ? 15 : 1,
+      .maxArrayLayers = !volume && vtvk_format_is_texture_color(pImageFormatInfo->format) &&
          vtvk_array_usage_supported(pImageFormatInfo->usage) ? 2048 : 1,
       .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxResourceSize = 1ull << 32,

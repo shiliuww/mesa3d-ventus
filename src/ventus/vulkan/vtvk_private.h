@@ -60,6 +60,7 @@ struct vtvk_sampler {
    VkFilter min_filter;
    VkSamplerAddressMode address_mode_u;
    VkSamplerAddressMode address_mode_v;
+   VkSamplerAddressMode address_mode_w;
    VkBool32 compare_enable;
    VkBool32 unnormalized_coordinates;
    float min_lod;

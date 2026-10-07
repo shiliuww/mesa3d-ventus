@@ -335,21 +335,26 @@ vtvk_CreateImage(VkDevice _device,
    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &device->vk.alloc;
 
    const bool color = vtvk_format_is_texture_color(pCreateInfo->format);
+   const bool volume = pCreateInfo->imageType == VK_IMAGE_TYPE_3D;
+   const uint32_t max_dimension = volume ? 2048 : 16384;
    uint32_t max_levels = 1;
-   uint32_t dimension = MAX2(pCreateInfo->extent.width, pCreateInfo->extent.height);
+   uint32_t dimension = MAX3(pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->extent.depth);
    while (dimension > 1) { dimension >>= 1; ++max_levels; }
    if (pCreateInfo->pNext || (pCreateInfo->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
        ((pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-        (!color || pCreateInfo->extent.width != pCreateInfo->extent.height ||
+        (volume || !color || pCreateInfo->extent.width != pCreateInfo->extent.height ||
          pCreateInfo->arrayLayers < 6 || !vtvk_array_usage_supported(pCreateInfo->usage))) ||
-       pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
+       (pCreateInfo->imageType != VK_IMAGE_TYPE_2D && !volume) ||
+       (volume && (!color || pCreateInfo->arrayLayers != 1 ||
+                   !vtvk_array_usage_supported(pCreateInfo->usage))) ||
        !pCreateInfo->arrayLayers || pCreateInfo->arrayLayers > 2048 ||
        (pCreateInfo->arrayLayers > 1 &&
         (!color || !vtvk_array_usage_supported(pCreateInfo->usage))) ||
        pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
        !pCreateInfo->extent.width || !pCreateInfo->extent.height ||
-       pCreateInfo->extent.width > 16384 || pCreateInfo->extent.height > 16384 ||
-       pCreateInfo->extent.depth != 1 || !pCreateInfo->mipLevels ||
+       pCreateInfo->extent.width > max_dimension || pCreateInfo->extent.height > max_dimension ||
+       !pCreateInfo->extent.depth || pCreateInfo->extent.depth > max_dimension ||
+       (!volume && pCreateInfo->extent.depth != 1) || !pCreateInfo->mipLevels ||
        pCreateInfo->mipLevels > max_levels ||
        pCreateInfo->mipLevels > VTVK_MAX_MIP_LEVELS ||
        (!color && pCreateInfo->mipLevels != 1) ||
@@ -367,19 +372,23 @@ vtvk_CreateImage(VkDevice _device,
    image->mip_levels = pCreateInfo->mipLevels;
    image->array_layers = pCreateInfo->arrayLayers;
    image->flags = pCreateInfo->flags;
-   uint32_t width = image->extent.width, height = image->extent.height;
+   image->type = pCreateInfo->imageType;
+   uint32_t width = image->extent.width, height = image->extent.height, depth = image->extent.depth;
    for (uint32_t level = 0; level < image->mip_levels; ++level) {
       struct vtvk_image_level *mip = &image->levels[level];
       mip->width = width;
       mip->height = height;
       mip->row_pitch = width * vtvk_format_bytes_per_pixel(image->format);
       mip->offset = image->size;
-      mip->size = (VkDeviceSize)mip->row_pitch * height;
+      mip->depth = depth;
+      mip->slice_pitch = mip->row_pitch * height;
+      mip->size = (VkDeviceSize)mip->slice_pitch * depth;
       image->size += mip->size * image->array_layers;
       width = MAX2(1, width >> 1);
       height = MAX2(1, height >> 1);
+      depth = MAX2(1, depth >> 1);
    }
-   if (image->array_layers > 1 && image->size > UINT32_MAX) {
+   if ((volume || image->array_layers > 1) && image->size > UINT32_MAX) {
       vk_free(alloc, image);
       return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    }
@@ -416,7 +425,9 @@ vtvk_CreateImageView(VkDevice _device,
    if (!image || pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D &&
         pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
-        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_CUBE) ||
+        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_CUBE &&
+        pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_3D) ||
+       ((pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_3D) != (image->type == VK_IMAGE_TYPE_3D)) ||
        pCreateInfo->format != image->format ||
        range->baseArrayLayer >= image->array_layers || !layers ||
        layers > image->array_layers - range->baseArrayLayer ||
@@ -477,7 +488,7 @@ vtvk_GetImageSubresourceLayout(VkDevice device, VkImage _image,
       .size = mip->size,
       .rowPitch = mip->row_pitch,
       .arrayPitch = mip->size,
-      .depthPitch = mip->size,
+      .depthPitch = mip->slice_pitch,
    };
 }
 

@@ -55,7 +55,7 @@ struct vtvk_buffer {
 
 #define VTVK_MAX_MIP_LEVELS 15
 struct vtvk_image_level {
-   uint32_t width, height, row_pitch;
+   uint32_t width, height, row_pitch, depth, slice_pitch;
    VkDeviceSize offset, size;
 };
 
@@ -68,6 +68,7 @@ struct vtvk_image {
    void *map;
    VkDeviceAddress device_address;
    VkImageCreateFlags flags;
+   VkImageType type;
    uint32_t mip_levels, array_layers;
    struct vtvk_image_level levels[VTVK_MAX_MIP_LEVELS];
 };
