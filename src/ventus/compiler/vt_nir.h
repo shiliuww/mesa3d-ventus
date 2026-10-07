@@ -696,8 +696,12 @@ enum vt_nir_rt_descriptor_record {
    VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD = 68,
    VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD = 72,
    VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE = 76,
-   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 80,
+   VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS = 80,
+   VT_NIR_RT_DESCRIPTOR_RECORD_SIZE = 88,
 };
+
+/* Finite sampler-bias profile, shared by Vulkan validation and limits. */
+#define VT_NIR_RT_MAX_SAMPLER_LOD_BIAS 16.0f
 
 /* Private software sampler word at offset76, not a frozen TMU interface. */
 enum vt_nir_rt_sampler_word {

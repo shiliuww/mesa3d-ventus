@@ -1697,6 +1697,11 @@ private:
       Value *min_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD));
       Value *max_lod = asFloat(descriptorRecordI32(sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD));
       Value *level = lod ? asFloat(value(nir_src_for_ssa(lod))) : ConstantFP::get(f32, 0);
+      /* Vulkan sampler bias also applies to explicit Lod. Integer fetch and
+       * queries return above and never read this sampling state. */
+      Value *bias = asFloat(descriptorRecordI32(
+         sampler_binding, VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS));
+      level = builder.CreateFAdd(level, bias);
       level = builder.CreateSelect(builder.CreateFCmpOLT(level, min_lod), min_lod, level);
       level = builder.CreateSelect(builder.CreateFCmpOGT(level, max_lod), max_lod, level);
       /* Filter selection uses sampler-clamped lambda, not the view-clamped

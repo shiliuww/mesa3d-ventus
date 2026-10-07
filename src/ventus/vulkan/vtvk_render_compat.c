@@ -1,5 +1,6 @@
 #include "vtvk_private.h"
 #include "vtvk_memory.h"
+#include "ventus/compiler/vt_nir.h"
 
 #include <string.h>
 #include <math.h>
@@ -44,7 +45,7 @@ vtvk_CreateSampler(VkDevice _device,
 {
    VK_FROM_HANDLE(vtvk_device, device, _device);
    /* Normalized 2D nearest/bilinear with independent min/mag and mip filters;
-    * no bias, comparison, or anisotropy. */
+    * finite sampler bias; no comparison or anisotropy. */
    if (pCreateInfo->pNext || pCreateInfo->flags ||
        (pCreateInfo->magFilter != VK_FILTER_NEAREST &&
         pCreateInfo->magFilter != VK_FILTER_LINEAR) ||
@@ -54,7 +55,8 @@ vtvk_CreateSampler(VkDevice _device,
         pCreateInfo->mipmapMode != VK_SAMPLER_MIPMAP_MODE_LINEAR) ||
        pCreateInfo->anisotropyEnable || pCreateInfo->compareEnable ||
        pCreateInfo->unnormalizedCoordinates ||
-       pCreateInfo->mipLodBias != 0.0f ||
+       !isfinite(pCreateInfo->mipLodBias) ||
+       fabsf(pCreateInfo->mipLodBias) > VT_NIR_RT_MAX_SAMPLER_LOD_BIAS ||
        !isfinite(pCreateInfo->minLod) || !isfinite(pCreateInfo->maxLod) ||
        pCreateInfo->minLod < 0.0f || pCreateInfo->maxLod < pCreateInfo->minLod ||
        (pCreateInfo->addressModeU != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
@@ -83,6 +85,7 @@ vtvk_CreateSampler(VkDevice _device,
    sampler->address_mode_v = pCreateInfo->addressModeV;
    sampler->compare_enable = pCreateInfo->compareEnable;
    sampler->unnormalized_coordinates = pCreateInfo->unnormalizedCoordinates;
+   sampler->lod_bias = pCreateInfo->mipLodBias;
    sampler->min_lod = pCreateInfo->minLod;
    sampler->max_lod = pCreateInfo->maxLod;
    sampler->mipmap_mode = pCreateInfo->mipmapMode;

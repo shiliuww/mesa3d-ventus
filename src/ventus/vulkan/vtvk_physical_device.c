@@ -1,5 +1,6 @@
 #include "vtvk_private.h"
 #include "vtvk_memory.h"
+#include "ventus/compiler/vt_nir.h"
 
 #include <stdlib.h>
 
@@ -30,6 +31,7 @@ vtvk_init_properties(struct vtvk_physical_device *pdev)
    memcpy(p->deviceUUID, uuid, VK_UUID_SIZE);
    memcpy(p->driverUUID, uuid, VK_UUID_SIZE);
 
+   p->maxSamplerLodBias = VT_NIR_RT_MAX_SAMPLER_LOD_BIAS;
    p->maxImageDimension1D = 16384;
    p->maxImageDimension2D = 16384;
    p->maxImageDimension3D = 2048;

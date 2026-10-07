@@ -49,6 +49,7 @@ static_assert(sizeof(struct vtvk_rt_descriptor_record) ==
 static_assert(sizeof(vtvk_rt_mip_record) == VT_NIR_RT_MIP_RECORD_SIZE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_table_addr) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_TABLE);
 static_assert(offsetof(vtvk_rt_descriptor_record, mip_level_count) == VT_NIR_RT_DESCRIPTOR_RECORD_MIP_COUNT);
+static_assert(offsetof(vtvk_rt_descriptor_record, lod_bias) == VT_NIR_RT_DESCRIPTOR_RECORD_LOD_BIAS);
 static_assert(offsetof(vtvk_rt_descriptor_record, min_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MIN_LOD);
 static_assert(offsetof(vtvk_rt_descriptor_record, max_lod) == VT_NIR_RT_DESCRIPTOR_RECORD_MAX_LOD);
 static_assert(offsetof(vtvk_rt_descriptor_record, sampler_mipmap_mode) == VT_NIR_RT_DESCRIPTOR_RECORD_SAMPLER_MIPMAP_MODE);
@@ -1179,6 +1180,7 @@ vtvk_driver_fill_sampler(const struct vtvk_rt_descriptor_source *src,
       mesa_loge("ventus-vk: unsupported RT 2D mip sampler binding=%u", src->binding);
       return false;
    }
+   record->lod_bias = sampler->lod_bias;
    record->min_lod = sampler->min_lod;
    record->max_lod = sampler->max_lod;
    record->sampler_mipmap_mode = (uint32_t)sampler->mipmap_mode |
