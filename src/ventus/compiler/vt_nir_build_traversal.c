@@ -454,13 +454,15 @@ vt_nir_build_traversal(nir_builder *b,
 
    nir_def *base = NULL;
 
-   store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
    /* A private helper may mark this particular trace as a collective.  Keep
     * that control bit out of the standard trace-flags ABI consumed by RTcore.
     */
    nir_def *software_group_collective = nir_ine_imm(
       b, nir_iand_imm(b, params->flags,
                        VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE), 0);
+   nir_if *initialize_ray = params->resume ?
+      nir_push_if(b, nir_inot(b, params->resume)) : NULL;
+   store_u64_words(b, base, VT_RT_SLOT_ACCEL_LO, params->accel_struct);
    nir_def *trace_flags = nir_iand_imm(b, params->flags,
                                        ~VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE);
    vt_nir_store_trace_meta_field(
@@ -490,10 +492,11 @@ vt_nir_build_traversal(nir_builder *b,
     * all three lanes before the RTcore consumes this ray state. */
    nir_def *inv_direction = nir_frcp(b, params->direction);
    store_vec3(b, base, VT_RT_SLOT_INV_X, inv_direction);
-   store_u64_words(b, base, VT_RT_SLOT_PAYLOAD_PTR_LO, params->payload);
    /* Publish the slot only after its complete ray header is visible. */
    store_word(b, base, VT_RT_SLOT_STATUS,
               nir_imm_int(b, VT_RT_SLOT_STATUS_TRACE_REQUEST));
+   if (initialize_ray)
+      nir_pop_if(b, initialize_ray);
 
    /* The fixed header is RT Local SRAM.  The RTcore receives the issuing
     * warp's first thread ID and derives its SRAM bank; lane selects the
@@ -508,15 +511,18 @@ vt_nir_build_traversal(nir_builder *b,
                                      nir_ventus_rt_lane_id(b));
    nir_def *status;
    if (config->enable_group_reorder) {
-      /* A global pipeline setting cannot make every recursive trace a
-       * collective: closest-hit/raygen-loop children may be issued by only a
-       * subset of the workgroup.  Level zero is uniform.  A later round is
-       * collective only when VentusGroupTraceRay marked this trace and software
-       * has arranged a full-group rendezvous. */
+      /* Primary rays never reorder. Secondary FIRST rounds are collective
+       * only after software arranged a full-group rendezvous; a recursive
+       * trace issued by a subset cannot become a collective merely because
+       * the pipeline enables grouping. Candidate resumes never reorder. */
       nir_def *is_primary_round = nir_ieq_imm(
-         b, vt_nir_load_active_level(b, config, VT_RT_LAYOUT_RAYGEN), 0);
-      nir_def *is_group_collective = nir_ior(b, is_primary_round,
-                                             software_group_collective);
+         b, params->trace_level ? params->trace_level :
+            vt_nir_load_active_level(b, config, VT_RT_LAYOUT_RAYGEN), 0);
+      nir_def *is_group_collective = nir_iand(b, nir_inot(b, is_primary_round),
+                                               software_group_collective);
+      if (params->resume)
+         is_group_collective = nir_iand(b, is_group_collective,
+                                         nir_inot(b, params->resume));
       nir_if *primary_if = nir_push_if(b, is_group_collective);
       nir_def *group_status = nir_ventus_rt_group_traverse(b, group_locator);
       nir_if *child_else = nir_push_else(b, primary_if);
@@ -567,11 +573,13 @@ vt_nir_build_traversal(nir_builder *b,
          instance_sbt_record_offset, geometry_index);
    nir_def *miss_shader_record_ptr = build_miss_shader_record_ptr(b, config, params);
    nir_def *complete_hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT);
+   nir_def *has_committed_hit = nir_ior(
+      b, complete_hit, nir_ieq_imm(b, status, VT_RT_TRAVERSAL_TERMINATED));
    nir_def *complete_miss = nir_ieq_imm(b, status,
                                         VT_RT_TRAVERSAL_COMPLETE_MISS);
    nir_def *shader_record_ptr =
       nir_bcsel(b, is_candidate, hit_shader_record_ptr,
-                nir_bcsel(b, complete_hit, hit_shader_record_ptr,
+                nir_bcsel(b, has_committed_hit, hit_shader_record_ptr,
                           nir_bcsel(b, complete_miss, miss_shader_record_ptr,
                                     nir_imm_int64(b, 0))));
    nir_def *hit_record_valid = nir_ior(b, complete_hit, is_candidate);
@@ -615,7 +623,7 @@ vt_nir_build_traversal(nir_builder *b,
    struct vt_nir_rt_result result = {
       .slot_base = base,
       .status = status,
-      .hit = nir_ieq_imm(b, status, VT_RT_TRAVERSAL_COMPLETE_HIT),
+      .hit = has_committed_hit,
       .hit_t = hit_t,
       .instance_sbt_record_offset = instance_sbt_record_offset,
       .geometry_index = geometry_index,

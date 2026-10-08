@@ -532,8 +532,6 @@ trace_field_for_slot(enum vt_rt_slot_word word)
       [VT_RT_SLOT_DIRECTION_Y] = VT_RT_GLOBAL_TRACE_DIRECTION_Y,
       [VT_RT_SLOT_DIRECTION_Z] = VT_RT_GLOBAL_TRACE_DIRECTION_Z,
       [VT_RT_SLOT_TMAX] = VT_RT_GLOBAL_TRACE_TMAX,
-      [VT_RT_SLOT_PAYLOAD_PTR_LO] = VT_RT_GLOBAL_TRACE_PAYLOAD_LO,
-      [VT_RT_SLOT_PAYLOAD_PTR_HI] = VT_RT_GLOBAL_TRACE_PAYLOAD_HI,
    };
    return word < VT_RT_SLOT_WORD_COUNT ? fields[word] :
                                          VT_RT_GLOBAL_TRACE_READY;

@@ -324,6 +324,179 @@ count_variables(nir_shader *shader, nir_variable_mode mode)
    return count;
 }
 
+static void
+emit_closest_hit_marker(nir_builder *b,
+                        const struct vt_nir_rt_trace_params *params,
+                        const struct vt_nir_rt_result *result, void *data)
+{
+   (void)params;
+   (void)result;
+   (void)data;
+   nir_store_global(b, nir_imm_int(b, 0xc105e57), nir_imm_int64(b, 0x8000), 1);
+}
+
+static void
+check_callback_early_return(const nir_shader_compiler_options *options)
+{
+   for (unsigned round = 0; round < 4; round++) {
+      const bool exit_early = round & 1;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_ANY_HIT, options, "callback_early_return");
+      nir_def *condition = nir_ine_imm(&b, nir_load_primitive_id(&b), 0);
+      nir_push_if(&b, condition);
+      nir_jump(&b, round < 2 ? nir_jump_halt : nir_jump_return);
+      nir_pop_if(&b, NULL);
+      nir_store_global(&b, nir_imm_int(&b, 1), nir_imm_int64(&b, 0x8000), 1);
+      vt_nir_lower_rt_callback_returns(b.shader);
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_builder inputs = nir_builder_create(impl);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+               if (intrin->intrinsic != nir_intrinsic_load_primitive_id)
+                  continue;
+               inputs.cursor = nir_before_instr(instr);
+               nir_def_rewrite_uses(&intrin->def, nir_imm_int(&inputs, exit_early));
+            }
+         }
+      }
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b.shader, nir_lower_vars_to_ssa);
+         NIR_PASS(progress, b.shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b.shader, nir_opt_algebraic);
+         NIR_PASS(progress, b.shader, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+         NIR_PASS(progress, b.shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b.shader, nir_opt_dce);
+      } while (progress);
+      nir_validate_shader(b.shader, "callback-local early exit");
+      VT_RT_CHECK(count_intrinsic(b.shader, nir_intrinsic_store_global) ==
+                  (exit_early ? 0 : 1));
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_jump) {
+                  nir_jump_type type = nir_instr_as_jump(instr)->type;
+                  VT_RT_CHECK(type != nir_jump_return && type != nir_jump_halt);
+               }
+            }
+         }
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+static void
+check_candidate_decision_paths(const nir_shader_compiler_options *options)
+{
+   /* Substitute protocol inputs, then fold the generated control flow. This
+    * checks executed commits, not just the presence of a dormant copy branch. */
+   const unsigned decisions[] = {
+      VT_RT_CALLBACK_ACCEPT, VT_RT_CALLBACK_IGNORE, VT_RT_CALLBACK_TERMINATE,
+   };
+   for (unsigned round = 0; round < 4; round++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_RAYGEN, options, "candidate_decision_paths");
+      struct vt_nir_rt_config config = vt_nir_rt_default_config();
+      config.enable_monolithic_shader_callbacks = true;
+      config.emit_closest_hit = emit_closest_hit_marker;
+      emit_test_trace_ray(&b);
+      VT_RT_CHECK(vt_nir_lower_rt_io_monolithic(b.shader, &config));
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      const bool cleanup = round == 3;
+      const unsigned decision = cleanup ? VT_RT_CALLBACK_TERMINATE : decisions[round];
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_builder inputs = nir_builder_create(impl);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+               unsigned value;
+               if (intrin->intrinsic == nir_intrinsic_ventus_rt_traverse) {
+                  value = cleanup ? VT_RT_TRAVERSAL_TERMINATED :
+                     VT_RT_TRAVERSAL_CANDIDATE_NON_OPAQUE_TRIANGLE;
+               } else if (intrin->intrinsic == nir_intrinsic_ventus_rt_local_load &&
+                          nir_src_is_const(intrin->src[0]) &&
+                          nir_src_as_uint(intrin->src[0]) ==
+                             VT_RT_LOCAL_CONTROL_BASE_BYTES / 4 +
+                                VT_RT_CONTROL_CALLBACK_DECISION) {
+                  value = decision;
+               } else {
+                  continue;
+               }
+               inputs.cursor = nir_before_instr(instr);
+               nir_def_rewrite_uses(&intrin->def, nir_imm_int(&inputs, value));
+            }
+         }
+      }
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b.shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b.shader, nir_opt_algebraic);
+         NIR_PASS(progress, b.shader, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+         NIR_PASS(progress, b.shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b.shader, nir_opt_dce);
+      } while (progress);
+      nir_validate_shader(b.shader, "candidate decision and cleanup paths");
+      for (unsigned word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++)
+         VT_RT_CHECK(has_candidate_commit(b.shader, word) ==
+                     (!cleanup && decision != VT_RT_CALLBACK_IGNORE));
+      VT_RT_CHECK(count_intrinsic(b.shader, nir_intrinsic_store_global) ==
+                  (cleanup ? 1 : 0));
+      ralloc_free(b.shader);
+   }
+}
+
+static void
+check_candidate_resume_prologue(const nir_shader_compiler_options *options)
+{
+   for (unsigned round = 0; round < 6; round++) {
+      const unsigned depth = round / 2;
+      const unsigned resume = round % 2;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_RAYGEN, options, "vt_rt_resume_prologue");
+      struct vt_nir_rt_config config = vt_nir_rt_default_config();
+      config.enable_group_reorder = true;
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *zero64 = nir_imm_int64(&b, 0);
+      nir_def *zero_vec = nir_imm_vec3(&b, 0, 0, 0);
+      struct vt_nir_rt_trace_params params = {
+         .accel_struct = zero64,
+         .flags = nir_imm_int(&b, VT_NIR_RT_TRACE_FLAG_GROUP_COLLECTIVE),
+         .cull_mask = zero, .sbt_base = zero64, .sbt_stride_bytes = zero64,
+         .miss_sbt_base = zero64, .miss_sbt_stride_bytes = zero64,
+         .sbt_offset = zero, .sbt_stride = zero, .miss_index = zero,
+         .origin = zero_vec, .tmin = zero, .direction = zero_vec,
+         .tmax = zero, .payload = zero64, .resume = nir_imm_bool(&b, resume),
+         .trace_level = nir_imm_int(&b, depth),
+      };
+      vt_nir_build_traversal(&b, &params, &config);
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b.shader, nir_opt_constant_folding);
+         NIR_PASS(progress, b.shader, nir_opt_algebraic);
+         NIR_PASS(progress, b.shader, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+         NIR_PASS(progress, b.shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b.shader, nir_opt_dce);
+      } while (progress);
+      nir_validate_shader(b.shader, "candidate resume prologue separation");
+      VT_RT_CHECK(count_store_slot_to_const_addr(
+         b.shader, VT_RT_SLOT_ACCEL_LO * VT_RT_ABI_WORD_BYTES) == (resume ? 0 : 1));
+      VT_RT_CHECK(count_store_slot_to_const_addr(
+         b.shader, VT_RT_SLOT_INV_X * VT_RT_ABI_WORD_BYTES) == (resume ? 0 : 1));
+      const bool grouped = depth > 0 && !resume;
+      VT_RT_CHECK(count_intrinsic(b.shader, nir_intrinsic_ventus_rt_group_traverse) == (grouped ? 1 : 0));
+      VT_RT_CHECK(count_intrinsic(b.shader, nir_intrinsic_ventus_rt_traverse) == (grouped ? 0 : 1));
+      ralloc_free(b.shader);
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -331,6 +504,9 @@ main(int argc, char **argv)
    glsl_type_singleton_init_or_ref();
 
    const nir_shader_compiler_options options = {0};
+   check_candidate_resume_prologue(&options);
+   check_candidate_decision_paths(&options);
+   check_callback_early_return(&options);
    struct vt_nir_rt_config config = vt_nir_rt_default_config();
    config.hit_sbt_base_addr = 0x100000000ull;
    config.hit_sbt_record_stride = 96;
@@ -431,7 +607,7 @@ main(int argc, char **argv)
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_X * 4 == 72);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Y * 4 == 76);
    VT_RT_CHECK(VT_RT_SLOT_LAUNCH_ID_Z * 4 == 80);
-   VT_RT_CHECK(VT_RT_ABI_VERSION == 12);
+   VT_RT_CHECK(VT_RT_ABI_VERSION == 13);
    VT_RT_CHECK(VT_RT_LOCAL_FIELD_MAJOR_FIXED_HEADER_WORD_COUNT == 40);
    VT_RT_CHECK(abi.control_base_bytes == 84);
    VT_RT_CHECK(abi.control_size_bytes == 4);
@@ -546,6 +722,10 @@ main(int argc, char **argv)
       raygen, VT_RT_SLOT_INV_Y * VT_RT_ABI_WORD_BYTES) > 0);
    VT_RT_CHECK(count_store_slot_to_const_addr(
       raygen, VT_RT_SLOT_INV_Z * VT_RT_ABI_WORD_BYTES) > 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      raygen, VT_RT_SLOT_RESERVED_LO * VT_RT_ABI_WORD_BYTES) == 0);
+   VT_RT_CHECK(count_store_slot_to_const_addr(
+      raygen, VT_RT_SLOT_RESERVED_HI * VT_RT_ABI_WORD_BYTES) == 0);
    VT_RT_CHECK(vt_rt_shader_has_imul_any(raygen));
 
    VT_RT_CHECK(count_intrinsic(push_constant_probe,

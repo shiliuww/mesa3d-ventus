@@ -1127,7 +1127,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const bool legacy_wavefront = staged_dispatch_profile;
    const bool legacy_cps_mirror = false;
    uint64_t pds_size = 0;
-   uint64_t pds_resident_warps = vtvk_rt_resident_warps;
+   uint64_t pds_resident_wg_slots = vtvk_rt_resident_warps;
    if (!wavefront_global && driver.vt_dev_caps) {
       uint64_t num_cores = 0;
       uint64_t wg_slots_per_core = 0;
@@ -1137,21 +1137,25 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
                              &wg_slots_per_core) == 0 &&
           num_cores && wg_slots_per_core &&
           num_cores <= UINT64_MAX / wg_slots_per_core) {
-         pds_resident_warps = num_cores * wg_slots_per_core;
+         pds_resident_wg_slots = num_cores * wg_slots_per_core;
       } else {
          mesa_logw("ventus-vk: could not query total resident PDS slots; "
                    "using configured fallback=%" PRIu64,
-                   pds_resident_warps);
+                   pds_resident_wg_slots);
       }
    }
-   if (pds_resident_warps > UINT64_MAX / vtvk_rt_lanes_per_warp) {
+   /* RTL advances CSR_PDS by a complete workgroup frame per resident WG
+    * slot, not by one warp frame. Keep the allocation and slot count distinct. */
+   const uint64_t pds_lanes_per_wg = vtvk_rt_lanes_per_warp *
+      (wavefront_global ? 1 : effective_rt_group_warps);
+   if (pds_resident_wg_slots > UINT64_MAX / pds_lanes_per_wg) {
       mesa_loge("ventus-vk: resident PDS lane count overflows");
       vtvk_driver_close(&driver);
       bridge_failed = true;
       return false;
    }
    const uint64_t pds_resident_lanes =
-      pds_resident_warps * vtvk_rt_lanes_per_warp;
+      pds_resident_wg_slots * pds_lanes_per_wg;
    uint64_t pds_per_lane = 0;
    uint64_t sgpr_per_wf = 0;
    uint64_t vgpr_per_wf = 0;
@@ -1692,7 +1696,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    kernel.num_thread_local[1] = 1;
    kernel.num_thread_local[2] = 1;
    kernel.kernel_name = "ventus_vk_raygen";
-   kernel.pdsResidentWgCount = pds_resident_warps;
+   kernel.pdsResidentWgCount = pds_resident_wg_slots;
 
    if (driver.vt_start(driver.device, &kernel, 0) != 0 ||
        driver.vt_ready_wait(driver.device, 60 * 60 * 1000) != 0) {

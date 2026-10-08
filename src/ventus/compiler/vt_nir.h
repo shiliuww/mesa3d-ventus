@@ -127,6 +127,10 @@ struct vt_nir_rt_trace_params {
    nir_def *direction;
    nir_def *tmax;
    nir_def *payload;
+   /* Optional loop-round predicate. Resume reuses the persistent ray header
+    * and issues only the candidate lanes, never a new TraceRay prologue. */
+   nir_def *resume;
+   nir_def *trace_level;
 };
 
 struct vt_nir_rt_result {
@@ -392,6 +396,7 @@ vt_nir_build_traversal(nir_builder *b,
                        const struct vt_nir_rt_trace_params *params,
                        const struct vt_nir_rt_config *config);
 
+void vt_nir_lower_rt_callback_returns(nir_shader *shader);
 bool vt_nir_lower_rt_io_monolithic(nir_shader *shader,
                                    const struct vt_nir_rt_config *config);
 

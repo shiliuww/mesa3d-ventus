@@ -90,10 +90,9 @@ static void
 vtvk_configure_rt_group(struct vt_nir_rt_config *config)
 {
    config->rt_group_warps = vtvk_rt_group_warps();
-   /* Keep primary traversal on the locator-based group ISA even for a
-    * one-warp cohort.  Besides making group size a pure launch policy, this
-    * gives the compatibility configuration the same physical-completion
-    * hand-off path as larger groups. */
+   /* Enable the secondary collective entry. Lowering keeps primary rays
+    * and candidate resumes on ordinary traversal; software must arrange
+    * the secondary cohort before setting the per-trace collective marker. */
    config->enable_group_reorder = true;
 }
 
@@ -1152,25 +1151,7 @@ vtvk_inline_rt_callback_shader(nir_builder *b, nir_shader *shader)
       return;
 
    nir_opt_dead_cf(shader);
-   /* Callback entry points are inlined into the trace loop.  Their terminal
-    * return is therefore a return from the callback, not from raygen.  Drop
-    * the synthetic entry-point return terminator before cloning the body;
-    * nir_inline_function_impl then falls through to the caller continuation.
-    * Keeping it would make the later raygen return lowering insert rt.release
-    * at every any-hit/closest-hit return. */
-   nir_foreach_block(block, impl) {
-      /* A return is not guaranteed to be the block's final instruction after
-       * dead-CF cleanup (metadata/debug instructions may follow it).  Remove
-       * every callback-local terminator before cloning; leaving one behind
-       * makes lower_returns synthesize setrpc/ret for the enclosing raygen. */
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type != nir_instr_type_jump)
-            continue;
-         nir_jump_instr *jump = nir_instr_as_jump(instr);
-         if (jump->type == nir_jump_return || jump->type == nir_jump_halt)
-            nir_instr_remove(instr);
-      }
-   }
+   vt_nir_lower_rt_callback_returns(shader);
    nir_opt_dce(shader);
 
    struct hash_table *var_remap = _mesa_pointer_hash_table_create(b->shader);
@@ -1333,10 +1314,11 @@ vtvk_lower_rt_intersection_report(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_pop_if(b, NULL);
    }
 
-   nir_def *accepted = nir_ieq_imm(
-      b, vt_nir_load_control_word(
-            b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32),
-      VT_RT_CALLBACK_ACCEPT);
+   nir_def *decision = vt_nir_load_control_word(
+      b, config, layout, VT_RT_CONTROL_CALLBACK_DECISION, 32);
+   nir_def *accepted = nir_iand(b, eligible, nir_ior(
+      b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
+      nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE)));
 
    nir_push_if(b, accepted);
    for (uint32_t word = 0;

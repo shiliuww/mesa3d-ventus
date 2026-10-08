@@ -14,7 +14,7 @@
  * regions must remain stable for a given ABI version.
  */
 
-#define VT_RT_ABI_VERSION 12
+#define VT_RT_ABI_VERSION 13
 #define VT_RT_ABI_WORD_BYTES 4
 #define VT_RT_ABI_ALIGNMENT_BYTES 16
 
@@ -37,9 +37,10 @@ enum vt_rt_slot_word {
    VT_RT_SLOT_INV_X = 13,
    VT_RT_SLOT_INV_Y = 14,
    VT_RT_SLOT_INV_Z = 15,
-   /* Retained for the legacy wavefront mailbox path. */
-   VT_RT_SLOT_PAYLOAD_PTR_LO = 16,
-   VT_RT_SLOT_PAYLOAD_PTR_HI = 17,
+   /* RTcore-private continuation pointer. Shader header lowering must not
+    * consume or overwrite these words; payload remains shader-owned PDS. */
+   VT_RT_SLOT_RESERVED_LO = 16,
+   VT_RT_SLOT_RESERVED_HI = 17,
    VT_RT_SLOT_LAUNCH_ID_X = 18,
    VT_RT_SLOT_LAUNCH_ID_Y = 19,
    VT_RT_SLOT_LAUNCH_ID_Z = 20,

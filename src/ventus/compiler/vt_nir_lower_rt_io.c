@@ -11,6 +11,27 @@
 
 #define VT_SPV_RAY_FLAGS_SKIP_CLOSEST_HIT 0x8u
 
+void
+vt_nir_lower_rt_callback_returns(nir_shader *shader)
+{
+   /* SPIR-V ignore/terminate ends an any-hit invocation, not the enclosing
+    * raygen invocation after inlining. Preserve early-exit control flow by
+    * lowering callback-local returns before cloning its body. */
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_jump) {
+               nir_jump_instr *jump = nir_instr_as_jump(instr);
+               if (jump->type == nir_jump_halt)
+                  jump->type = nir_jump_return;
+            }
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   nir_lower_returns(shader);
+}
+
 struct lower_rt_io_state {
    const struct vt_nir_rt_config *config;
    uint32_t trace_depth;
@@ -72,8 +93,8 @@ trace_payload_binding(const nir_intrinsic_instr *intrin,
    return true;
 }
 
-/* This is a scalar PDS ABI offset passed to the RTcore as PAYLOAD_PTR, not an
- * AS5/private-memory pointer consumed by the ordinary LLVM stack lowering. */
+/* This is a scalar PDS ABI offset used by payload-variable lowering, not an
+ * RT Local header value or an ordinary LLVM private-memory pointer. */
 static nir_def *
 trace_payload_frame_addr(nir_builder *b,
                          const struct vt_nir_rt_config *config,
@@ -368,13 +389,14 @@ ignore_candidate_hit(nir_builder *b, const struct vt_nir_rt_config *config)
    store_raygen_callback_decision(b, config, VT_RT_CALLBACK_IGNORE);
 }
 
-/* Callback commits are shader-owned. RTcore resume only consumes the
- * committed distance on ACCEPT and must not copy a retained candidate. */
+/* Callback commits are shader-owned. TERMINATE accepts the current hit too;
+ * RTcore consumes the continuation without copying the retained candidate. */
 static void
 commit_accepted_candidate(nir_builder *b, const struct vt_nir_rt_config *config)
 {
-   nir_push_if(b, nir_ieq_imm(b, load_raygen_callback_decision(b, config),
-                              VT_RT_CALLBACK_ACCEPT));
+   nir_def *decision = load_raygen_callback_decision(b, config);
+   nir_push_if(b, nir_ior(b, nir_ieq_imm(b, decision, VT_RT_CALLBACK_ACCEPT),
+                           nir_ieq_imm(b, decision, VT_RT_CALLBACK_TERMINATE)));
    for (unsigned word = 0; word < VT_RT_HIT_RECORD_WORD_COUNT; word++) {
       vt_nir_store_hit_record_word(
          b, config, VT_RT_LAYOUT_RAYGEN, word,
@@ -531,6 +553,7 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       .direction = intrin->src[8].ssa,
       .tmax = intrin->src[9].ssa,
       .payload = payload,
+      .trace_level = nir_imm_int(b, state->trace_depth),
    };
    /* The root ray already owns frame zero.  A nested trace receives the
     * caller's inout payload in its distinct depth frame, so no stale private
@@ -574,8 +597,12 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
                                          mailbox.generation, nir_imm_int(b, 0));
    }
 
+   nir_variable *resume_round = nir_local_variable_create(
+      b->impl, glsl_bool_type(), "rt_candidate_resume_round");
+   nir_store_var(b, resume_round, nir_imm_false(b), 1);
    nir_loop *loop = nir_push_loop(b);
    {
+      params.resume = nir_load_var(b, resume_round);
       struct vt_nir_rt_result result = vt_nir_build_traversal(b, &params, config);
       nir_def *complete_hit =
          nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_HIT);
@@ -583,6 +610,8 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_COMPLETE_MISS);
       nir_def *terminated =
          nir_ieq_imm(b, result.status, VT_RT_TRAVERSAL_TERMINATED);
+      /* Cleanup resume has finished traversal with the shader-committed hit. */
+      complete_hit = nir_ior(b, complete_hit, terminated);
       nir_def *terminal = nir_ior(b, nir_ior(b, complete_hit, complete_miss),
                                   terminated);
       nir_def *candidate_non_opaque =
@@ -606,6 +635,10 @@ lower_trace_ray(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       nir_pop_if(b, NULL);
 
       nir_pop_if(b, NULL);
+      /* Structured loop breaks remove terminal/noncandidate lanes from the
+       * next active mask. TERMINATE callbacks still issue one resume so
+       * RTcore consumes their continuation and returns TERMINATED. */
+      nir_store_var(b, resume_round, nir_imm_true(b), 1);
    }
    nir_pop_loop(b, loop);
 
