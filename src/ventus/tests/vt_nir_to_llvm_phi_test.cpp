@@ -177,6 +177,28 @@ build_external_store_shader(const nir_shader_compiler_options *options,
    return b.shader;
 }
 
+static nir_shader *
+build_quad_shader(const nir_shader_compiler_options *options,
+                  nir_intrinsic_op operation, unsigned target = 0,
+                  bool dynamic = false, mesa_shader_stage stage = MESA_SHADER_RAYGEN,
+                  unsigned bits = 32)
+{
+   nir_builder b = nir_builder_init_simple_shader(stage, options, "vt_explicit_quad");
+   nir_def *x = nir_channel(&b, nir_load_ray_launch_id(&b), 0);
+   nir_def *source = nir_vec2(&b, x, nir_iadd_imm(&b, x, 7));
+   if (bits == 16)
+      source = nir_u2u16(&b, source);
+   nir_intrinsic_instr *quad = nir_intrinsic_instr_create(b.shader, operation);
+   quad->num_components = 2;
+   quad->src[0] = nir_src_for_ssa(source);
+   if (operation == nir_intrinsic_quad_broadcast)
+      quad->src[1] = nir_src_for_ssa(dynamic ? x : nir_imm_int(&b, target));
+   nir_def_init(&quad->instr, &quad->def, 2, bits);
+   nir_builder_instr_insert(&b, &quad->instr);
+   nir_ventus_rt_store_slot(&b, &quad->def, nir_imm_int(&b, 0));
+   return b.shader;
+}
+
 int
 main()
 {
@@ -537,6 +559,66 @@ main()
          VT_RT_CHECK(stores == (bits == 32 ? 2u : 1u));
          delete module;
       }
+      ralloc_free(shader);
+   }
+
+   vt_nir_to_llvm_options quad_options = llvm_options;
+   for (nir_intrinsic_op op : {nir_intrinsic_quad_swap_horizontal,
+                              nir_intrinsic_quad_swap_vertical,
+                              nir_intrinsic_quad_swap_diagonal,
+                              nir_intrinsic_quad_broadcast}) {
+      for (bool enabled : {false, true}) {
+         quad_options.texture_explicit_quad = enabled;
+         shader = build_quad_shader(&nir_options, op);
+         shaders[0] = shader;
+         module = vt_nir_to_llvm_translate(shaders, 1, &quad_options);
+         VT_RT_CHECK((module != nullptr) == enabled);
+         if (module) {
+            VT_RT_CHECK(!llvm::verifyModule(*module));
+            unsigned shuffles = 0;
+            for (llvm::Function &function : *module)
+               for (llvm::BasicBlock &block : function)
+                  for (llvm::Instruction &instruction : block) {
+                     auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+                     if (!call || !call->getCalledFunction() ||
+                         call->getCalledFunction()->getName() !=
+                            "llvm.riscv.ventus.shuffle.bfly.i32")
+                        continue;
+                     auto *mask = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+                     VT_RT_CHECK(mask && mask->getZExtValue() >= 1 && mask->getZExtValue() <= 3);
+                     VT_RT_CHECK(call->isConvergent());
+                     ++shuffles;
+                  }
+            VT_RT_CHECK(shuffles == (op == nir_intrinsic_quad_broadcast ? 4u : 2u));
+            delete module;
+         }
+         ralloc_free(shader);
+      }
+   }
+   quad_options.texture_explicit_quad = true;
+   for (unsigned target : {1u,2u,3u,4u}) {
+      shader = build_quad_shader(&nir_options, nir_intrinsic_quad_broadcast, target);
+      shaders[0] = shader;
+      module = vt_nir_to_llvm_translate(shaders, 1, &quad_options);
+      VT_RT_CHECK((module != nullptr) == (target < 4));
+      delete module;ralloc_free(shader);
+   }
+   for (unsigned bad : {0u,1u,2u}) {
+      shader = build_quad_shader(&nir_options, nir_intrinsic_quad_broadcast, 0,
+          bad == 0, bad == 1 ? MESA_SHADER_COMPUTE : MESA_SHADER_RAYGEN,
+          bad == 2 ? 16 : 32);
+      shaders[0] = shader;
+      module = vt_nir_to_llvm_translate(shaders, 1, &quad_options);
+      VT_RT_CHECK(module == nullptr);
+      ralloc_free(shader);
+   }
+   for (nir_intrinsic_op op : {nir_intrinsic_ddx,nir_intrinsic_ddy,
+          nir_intrinsic_ddx_fine,nir_intrinsic_ddy_fine,
+          nir_intrinsic_ddx_coarse,nir_intrinsic_ddy_coarse}) {
+      shader = build_quad_shader(&nir_options, op);
+      shaders[0] = shader;
+      module = vt_nir_to_llvm_translate(shaders, 1, &quad_options);
+      VT_RT_CHECK(module == nullptr);
       ralloc_free(shader);
    }
 

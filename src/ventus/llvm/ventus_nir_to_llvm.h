@@ -26,6 +26,9 @@ struct vt_nir_to_llvm_options {
    const char *entry_point_name;
    bool entry_point_is_kernel;
    bool require_ssa_function_temps;
+   /* Private complete-quad experiment only. Caller supplies four live slots,
+    * same-warp uniform control/resources; no Vulkan subgroup/derivative claim. */
+   bool texture_explicit_quad;
    /* Global RT has no PDS-visible launch-id slots. */
    bool global_rt_wavefront;
    /* A global CPS resume uses a compact physical dispatch and restores its

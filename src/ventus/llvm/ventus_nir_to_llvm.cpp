@@ -116,6 +116,7 @@ public:
         noopRtIntrinsics(envEnabled("VENTUS_VK_NOOP_RTU")),
         earlyExit(envEnabled("VENTUS_VK_EARLY_EXIT")),
         debugLowering(envEnabled("VENTUS_VK_DEBUG_NIR_LLVM")),
+        explicitQuad(options && options->texture_explicit_quad),
         globalRtWavefront(options && options->global_rt_wavefront),
         globalRtCompactResume(options && options->global_rt_compact_resume),
         privateBaseBytes(options ? options->private_base_bytes : 0),
@@ -172,6 +173,8 @@ public:
       }
 
       resetFunctionState();
+      explicitQuadStage = shader->info.stage == MESA_SHADER_RAYGEN &&
+                         !globalRtCompactResume;
 
       Function *fn = createEntry(shader, shaderIndex);
       BasicBlock *entry = BasicBlock::Create(context, "entry", fn);
@@ -231,6 +234,8 @@ private:
    bool noopRtIntrinsics;
    bool earlyExit;
    bool debugLowering;
+   bool explicitQuad;
+   bool explicitQuadStage = false;
    bool globalRtWavefront;
    bool globalRtCompactResume;
    uint32_t privateBaseBytes;
@@ -2580,9 +2585,78 @@ private:
       }
    }
 
+   Value *lowerExplicitQuad(nir_intrinsic_instr *intrin)
+   {
+      auto reject = [&]() -> Value * {
+         fprintf(stderr, "ventus-nir-to-llvm: %s requires the private complete "
+                         "same-warp quad experiment (32-bit raygen inputs)\n",
+                 nir_intrinsic_infos[intrin->intrinsic].name);
+         translationFailed = true;
+         unsupportedDefs.insert(&intrin->def);
+         return undefFor(&intrin->def);
+      };
+      if (!explicitQuad || !explicitQuadStage || intrin->def.bit_size != 32)
+         return reject();
+      unsigned target = 0;
+      if (intrin->intrinsic == nir_intrinsic_quad_broadcast) {
+         if (!nir_src_is_const(intrin->src[1]))
+            return reject();
+         target = nir_src_as_uint(intrin->src[1]);
+         if (target >= 4)
+            return reject();
+      }
+      Function *shuffle = declare("llvm.riscv.ventus.shuffle.bfly.i32", i32,
+                                   {i32, i32});
+      shuffle->addParamAttr(1, Attribute::ImmArg);
+      auto swap = [&](Value *bits, unsigned mask) -> Value * {
+         auto *call = builder.CreateCall(shuffle, {bits, ConstantInt::get(i32, mask)});
+         // Express convergence intent; full uniform quads are still required.
+         // This alone does not solve the audited divergent-CFG merge problem.
+         call->setConvergent();
+         return call;
+      };
+      Value *lane = nullptr;
+      if (intrin->intrinsic == nir_intrinsic_quad_broadcast)
+         lane = callI32Intrinsic("llvm.riscv.ventus.rt.dispatch.id.x");
+      return buildVector(intrin->def.num_components, i32, [&](unsigned c) -> Value * {
+         Value *bits = asInt32(component(value(intrin->src[0]), c));
+         switch (intrin->intrinsic) {
+         case nir_intrinsic_quad_swap_horizontal: return swap(bits, 1);
+         case nir_intrinsic_quad_swap_vertical: return swap(bits, 2);
+         case nir_intrinsic_quad_swap_diagonal: return swap(bits, 3);
+         default: break;
+         }
+         // Immediate XOR partners stay within each four-slot group. Select
+         // a target column, then its target row; never broadcast warp lane 0.
+         Value *column = builder.CreateAnd(lane, ConstantInt::get(i32, 1));
+         bits = builder.CreateSelect(builder.CreateICmpEQ(column,
+                    ConstantInt::get(i32, target & 1)), bits, swap(bits, 1));
+         Value *row = builder.CreateAnd(lane, ConstantInt::get(i32, 2));
+         return builder.CreateSelect(builder.CreateICmpEQ(row,
+                    ConstantInt::get(i32, target & 2)), bits, swap(bits, 2));
+      });
+   }
+
    Value *lowerIntrinsic(nir_intrinsic_instr *intrin)
    {
       switch (intrin->intrinsic) {
+      case nir_intrinsic_quad_broadcast:
+      case nir_intrinsic_quad_swap_horizontal:
+      case nir_intrinsic_quad_swap_vertical:
+      case nir_intrinsic_quad_swap_diagonal:
+         return lowerExplicitQuad(intrin);
+      case nir_intrinsic_ddx:
+      case nir_intrinsic_ddy:
+      case nir_intrinsic_ddx_fine:
+      case nir_intrinsic_ddy_fine:
+      case nir_intrinsic_ddx_coarse:
+      case nir_intrinsic_ddy_coarse:
+         fprintf(stderr, "ventus-nir-to-llvm: %s needs a supported derivative "
+                         "execution environment; explicit quad is not implicit derivatives\n",
+                 nir_intrinsic_infos[intrin->intrinsic].name);
+         translationFailed = true;
+         unsupportedDefs.insert(&intrin->def);
+         return undefFor(&intrin->def);
       case nir_intrinsic_load_ray_launch_id: {
          return rayLaunchId();
       }

@@ -3821,6 +3821,7 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
          "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128-A5-G1" :
          "e-m:e-p:32:32-i64:64-n32-S128-A5-G1",
       .require_ssa_function_temps = true,
+      .texture_explicit_quad = vtvk_env_enabled("VENTUS_VK_TEXTURE_EXPLICIT_QUAD"),
       .global_rt_wavefront = global_wavefront,
       .private_base_bytes = global_wavefront ? 0 :
          (v5_megakernel ? VENTUS_RT_V5_PDS_SIZE_BYTES +
