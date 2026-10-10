@@ -23,7 +23,8 @@ enum ventus_kernel_metadata_rv32_offset {
    VENTUS_KNL32_GL_OFFSET_Y = 40,
    VENTUS_KNL32_GL_OFFSET_Z = 44,
    VENTUS_KNL32_PDS_SIZE_PER_THREAD = 64,
-   VENTUS_KNL32_MAX_SIZE = 68,
+   VENTUS_KNL32_PDS_STACK_BASE_PER_THREAD = 68,
+   VENTUS_KNL32_MAX_SIZE = 72,
 };
 
 /* RV64 keeps launch dimensions as u32, but aligns each device address to
@@ -47,7 +48,8 @@ enum ventus_kernel_metadata_rv64_offset {
    VENTUS_KNL64_LDS_STACK_SIZE_PER_WF = 68,
    VENTUS_KNL64_LDS_NON_STACK_SIZE = 72,
    VENTUS_KNL64_PDS_SIZE_PER_THREAD = 80,
-   VENTUS_KNL64_MAX_SIZE = 88,
+   VENTUS_KNL64_PDS_STACK_BASE_PER_THREAD = 88,
+   VENTUS_KNL64_MAX_SIZE = 96,
 };
 
 #endif

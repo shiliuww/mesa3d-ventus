@@ -755,9 +755,9 @@ private:
       foreach_list_typed(nir_variable, var, node, &impl->locals)
          collectVar(var);
 
-      /* The backend reserves the RT prefix for every AS5 frame object,
-       * including post-IR register spills.  Keep normal NIR variables in one
-       * backing alloca, but do not duplicate that prefix here. */
+      /* The runtime starts the private stack above the RT static prefix.
+       * Keep normal NIR variables in one backing alloca; the function frame
+       * includes them and register spills, but not the static prefix. */
       if (privateBaseBytes) {
          uint64_t words = 0;
          for (nir_variable *var : vars)

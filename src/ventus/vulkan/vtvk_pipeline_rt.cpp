@@ -2031,6 +2031,8 @@ vtvk_create_one_rt_pipeline(VkDevice _device,
    pipeline->per_lane_scratch_size =
       MAX2(pipeline->per_lane_scratch_size, rt_abi.private_base_bytes);
    pipeline->hit_attribute_size_bytes = rt_abi.hit_attrib_size_bytes;
+   pipeline->private_stack_base_bytes =
+      global_wavefront ? 0 : rt_abi.private_base_bytes;
 
    struct vt_nir_to_llvm_options llvm_options = {
       .module_name = "ventus_rt_pipeline",

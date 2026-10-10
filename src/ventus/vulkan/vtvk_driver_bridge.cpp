@@ -39,6 +39,7 @@ static constexpr uint64_t vtvk_rt_lanes_per_warp = 32;
  * driver headers, and resolves the C driver interface with dlsym(). */
 static constexpr uint64_t vtvk_driver_cap_max_cores = 0x1;
 static constexpr uint64_t vtvk_driver_cap_max_wg_slots = 0x8;
+static constexpr int vtvk_driver_buffer_type_pds = 0x40000000;
 static constexpr uint64_t vtvk_ventus_resource_alignment = 128;
 /* Register-file allocation is in complete rows of four banks, as in POCL.
  * ELF usage remains an exact count; only launch allocations are padded. */
@@ -578,11 +579,11 @@ vtvk_driver_close(struct vtvk_driver_api *api)
 
 static bool
 vtvk_driver_alloc_copy(struct vtvk_driver_api *api, const void *src,
-                       uint64_t size, uint64_t *dev_addr)
+                       uint64_t size, uint64_t *dev_addr, int buffer_type = 0)
 {
    if (!size)
       size = 1;
-   if (api->vt_buf_alloc(api->device, size, dev_addr, 0, 0, 0) != 0)
+   if (api->vt_buf_alloc(api->device, size, dev_addr, buffer_type, 0, 0) != 0)
       return false;
    return !src ||
           api->vt_copy_to_dev(api->device, *dev_addr, src, size, 0, 0) == 0;
@@ -1157,6 +1158,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    const uint64_t pds_resident_lanes =
       pds_resident_wg_slots * pds_lanes_per_wg;
    uint64_t pds_per_lane = 0;
+   uint64_t pds_stack_base = 0;
    uint64_t sgpr_per_wf = 0;
    uint64_t vgpr_per_wf = 0;
    uint64_t continuation_size = 0;
@@ -1188,16 +1190,25 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
          if (!vtvk_bridge_read_kernel_resource(kernel_path, &llvm_resource,
                                                 &llvm_private_frame,
                                                 &resource_error)) {
-            /* Older delivered ELFs contain the object-local .ventus.resobj
-             * section rather than LLD's final .ventus.resource.main summary.
-             * Keep those kernels runnable with the pre-existing NIR ABI
-             * frame, but make the missing post-RA spill bound unambiguous. */
-            mesa_logw("ventus-vk: RT private frame metadata unavailable for "
-                      "%s: %s; using unverified NIR ABI frame=%u",
-                      kernel_path, resource_error.c_str(),
-                      info->per_lane_scratch_size);
-            llvm_private_frame = 0;
+            /* The split static/stack launch ABI requires a finalized bound;
+             * a NIR scratch size cannot safely stand in for a post-RA frame. */
+            mesa_loge("ventus-vk: RT private frame metadata unavailable for "
+                      "%s: %s; rebuild the kernel with the current compiler",
+                      kernel_path, resource_error.c_str());
+            goto out;
          } else {
+            pds_stack_base = vtvk_bridge_align_u64(
+               std::max<uint64_t>(llvm_resource.pds_static_bytes,
+                                  info->private_stack_base_bytes),
+               vtvk_ventus_resource_alignment);
+            const uint64_t stack_bytes = vtvk_bridge_align_u64(
+               llvm_resource.pds_stack_peak_bytes,
+               vtvk_ventus_resource_alignment);
+            if (pds_stack_base > UINT64_MAX - stack_bytes) {
+               mesa_loge("ventus-vk: RT static prefix plus stack overflows");
+               goto out;
+            }
+            llvm_private_frame = pds_stack_base + stack_bytes;
             /* RT Local SRAM owns the fixed header.  The resource metadata
              * describes the complete PDS payload/private frame after register
             * allocation, so there is no fixed-header PDS prefix. */
@@ -1460,16 +1471,21 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL64_LC_SIZE_X, &local_size_x,
              sizeof(local_size_x));
-      /* crt0 seeds LLVM's per-lane private-memory base from this field. */
+      /* Capacity and initial stack offset are independent launch fields. */
       memcpy(metadata.data() + VENTUS_KNL64_PDS_SIZE_PER_THREAD,
              &pds_per_lane, sizeof(pds_per_lane));
+      memcpy(metadata.data() + VENTUS_KNL64_PDS_STACK_BASE_PER_THREAD,
+             &pds_stack_base, sizeof(pds_stack_base));
    } else {
       uint32_t entry32 = 0;
       uint32_t args32 = 0;
       uint32_t pds32 = 0;
+      uint32_t stack_base32 = 0;
       if (!vtvk_bridge_checked_u32("kernel entry", kernel_entry, &entry32) ||
           !vtvk_bridge_checked_u32("dispatch args", args_dev_addr, &args32) ||
-          !vtvk_bridge_checked_u32("per-lane PDS", pds_per_lane, &pds32))
+          !vtvk_bridge_checked_u32("per-lane PDS", pds_per_lane, &pds32) ||
+          !vtvk_bridge_checked_u32("PDS stack base", pds_stack_base,
+                                   &stack_base32))
          goto out;
       const uint32_t local_size_x = 32;
       memcpy(metadata.data() + VENTUS_KNL32_ENTRY, &entry32, sizeof(entry32));
@@ -1485,6 +1501,8 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
       /* Keep the crt0 ABI in sync with kernel.pdsSize passed to the driver. */
       memcpy(metadata.data() + VENTUS_KNL32_PDS_SIZE_PER_THREAD, &pds32,
              sizeof(pds32));
+      memcpy(metadata.data() + VENTUS_KNL32_PDS_STACK_BASE_PER_THREAD,
+             &stack_base32, sizeof(stack_base32));
    }
 
    if (!vtvk_driver_alloc_copy(&driver, metadata.data(), metadata.size(),
@@ -1645,7 +1663,7 @@ vtvk_driver_trace_rays(const struct vtvk_driver_trace_rays_info *info)
    if (!wavefront_global) {
       pds_image.assign(pds_size, 0);
       if (!vtvk_driver_alloc_copy(&driver, pds_image.data(), pds_image.size(),
-                                  &pds_dev_addr)) {
+                                  &pds_dev_addr, vtvk_driver_buffer_type_pds)) {
          mesa_loge("ventus-vk: driver bridge failed to allocate PDS");
          goto out;
       }

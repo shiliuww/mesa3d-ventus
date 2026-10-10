@@ -81,6 +81,7 @@ vtvk_execute_trace_rays(const struct vtvk_recorded_trace_rays *record)
    trace.height = record->height;
    trace.depth = record->depth;
    trace.per_lane_scratch_size = pipeline->per_lane_scratch_size;
+   trace.private_stack_base_bytes = pipeline->private_stack_base_bytes;
    trace.hit_attribute_size_bytes = pipeline->hit_attribute_size_bytes;
    trace.continuation_frame_size = pipeline->continuation_frame_size;
    trace.max_ray_recursion_depth = pipeline->max_ray_recursion_depth;
