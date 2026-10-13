@@ -3,8 +3,8 @@
 The builder changes host-side topology only. VTAS version, Box4/Triangle/AABB/
 Instance layouts, primitive IDs, instance IDs, masks and SBT data are unchanged.
 Application BLAS/TLAS partitioning is not rewritten. Existing geometry support
-limits still apply; this is not an implementation of update/refit or multi-geometry
-BLAS support.
+limits still apply; the topology builder does not itself implement update/refit
+or change geometry support.
 
 ## Build and select
 
@@ -35,11 +35,15 @@ the referenced BLAS requirement. An internal node with k children requires
 assumes arbitrary ray-dependent visitation order and all children intersecting;
 it is an upper bound, not a measured ray stack high-water mark.
 
-BLAS construction has a 24-entry budget, reserving eight of the hardware's 32
-entries for TLAS siblings before future TLAS users are known. TLAS construction
-checks its actual combination against 32. This is conservative and may reject
-scenes that particular rays would traverse safely; it does not guarantee arbitrary
-scene sizes fit. No RTL overflow/spill support is added.
+BLAS and TLAS construction use the shared 64-entry traversal stack budget,
+matching a lane's 32 base and up to 32 overflow entries. Hardware has only
+four shared overflow stacks per physical session, not one per lane; deeper
+lanes must wait for an available overflow stack. TLAS instance leaves carry the
+referenced BLAS requirement, so the composed tree is checked against the same
+budget; no fixed TLAS quota is reserved in each BLAS. This is conservative and
+may reject scenes that particular rays would traverse safely; it does not
+guarantee arbitrary scene sizes fit. Candidate spill/resume is a separate
+hardware lifecycle mechanism, not a change to host BVH construction.
 
 If four-way Embree output exceeds the budget, build a binary SAH tree. If that
 fits, widen it selectively: expand the largest-area internal child while the
